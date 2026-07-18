@@ -20,5 +20,5 @@ Schema lives in `src-tauri/migrations/0001_init.sql` — that file is the source
 * All `id` columns are app-generated TEXT UUIDs, not autoincrement integers.
 * All foreign keys cascade on delete (`ON DELETE CASCADE`) — deleting a project deletes its videos, transcript segments, lessons, and exports. This is intentional; don't add app-level cascade logic that duplicates it.
 * Timestamps are ISO-8601 strings, not Unix epoch integers.
-* A new migration is a new `NNNN_description.sql` file plus a new entry in the `migrations()` vec in `src-tauri/src/lib.rs` — never edit `0001_init.sql` in place once it's shipped to a user.
+* A new migration is a new `NNNN_description.sql` file plus a new `if version < N` block in `migrate()` in `src-tauri/src/db.rs` — never edit `0001_init.sql` in place once it's shipped to a user.
 * Multi-lesson reordering uses `lessons.sort_order`, not implicit row order.
