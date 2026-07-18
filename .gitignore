@@ -23,3 +23,6 @@ src-tauri/.cargo/
 
 # Logs
 npm-debug.log*
+
+# Tauri generated schemas
+src-tauri/gen/schemas/

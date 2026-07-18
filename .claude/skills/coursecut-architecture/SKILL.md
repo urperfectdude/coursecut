@@ -9,7 +9,7 @@ Source of truth for scope and requirements is `docs/PRD.md`. This skill covers i
 
 ## Process boundary
 
-* **Rust (`src-tauri/`)** owns: filesystem access, FFmpeg invocation, SQLite (via `tauri-plugin-sql`), and any OpenAI network calls (so API keys never touch the renderer's JS context). Expose functionality to the frontend as `#[tauri::command]` functions, invoked from React via `@tauri-apps/api/core`'s `invoke()`.
+* **Rust (`src-tauri/`)** owns: filesystem access, FFmpeg invocation, SQLite (via a Rust-owned `rusqlite` connection — see `src-tauri/src/db.rs`), and any OpenAI network calls (so API keys never touch the renderer's JS context). Expose functionality to the frontend as `#[tauri::command]` functions, invoked from React via `@tauri-apps/api/core`'s `invoke()`.
 * **React (`src/`)** owns: UI, transcript editing state, and lightweight in-browser video preview/probing via **MediaBunny** — used for scrubbing/waveform/preview without a round-trip through FFmpeg. MediaBunny never touches the source file on disk directly for anything destructive; it's a preview layer only.
 
 ## FFmpeg

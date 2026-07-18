@@ -4,7 +4,9 @@ Local-first AI desktop app that turns long lecture recordings into structured le
 
 ## Stack
 
-Tauri v2 (Rust) + React + TypeScript + Vite, frontend-only dev server on port 1420. SQLite via `tauri-plugin-sql`, migrations in `src-tauri/migrations/`. AI: OpenAI Whisper (transcription) + GPT-5.5 (lesson analysis) — see the `coursecut-privacy-invariants` skill before touching anything that calls out to OpenAI or exports a file.
+Tauri v2 (Rust) + React + TypeScript + Vite, frontend-only dev server on port 1420. SQLite via a Rust-owned `rusqlite` connection (see `src-tauri/src/db.rs`) — no direct SQL surface on the frontend. Migrations live in `src-tauri/migrations/` and are applied at startup, tracked via `PRAGMA user_version`. AI: OpenAI Whisper (transcription) + GPT-5.5 (lesson analysis) — see the `coursecut-privacy-invariants` skill before touching anything that calls out to OpenAI or exports a file.
+
+Target platforms: macOS & Windows only (PRD §"Platform"). Linux is out of scope — don't add Linux-specific build config, CI targets, or path handling on its account, and don't burn time on Linux-only bugs unless asked.
 
 ## Layout
 
