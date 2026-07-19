@@ -27,10 +27,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/configure-pages@v5
-        with:
-          # Create the Pages site on first run. Without this the step 404s
-          # until someone flips Settings -> Pages -> Source to GitHub Actions.
-          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
