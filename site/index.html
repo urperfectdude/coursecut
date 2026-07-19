@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CourseCut — lecture recordings into lessons</title>
+<meta name="description" content="CourseCut transcribes your lecture recording, finds where each topic begins and ends, and exports clean lesson videos. Local-first, for macOS and Windows.">
+<meta name="theme-color" content="#ffffff">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23101114'/%3E%3Crect x='7' y='3' width='2' height='10' fill='%231B3CF0'/%3E%3C/svg%3E">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="CourseCut — lecture recordings into lessons">
+<meta property="og:description" content="Turn a three-hour lecture into the lessons it was always made of. Local-first, for macOS and Windows.">
+
+<style>
+  /* ---- reset ----------------------------------------------------------- */
+  *, *::before, *::after { box-sizing: border-box; }
+  body, h1, p, dl, dd, ol, figure { margin: 0; }
+  ol { list-style: none; padding: 0; }
+  img, svg { display: block; max-width: 100%; }
+
+  /* ---- tokens ---------------------------------------------------------- */
+  :root {
+    color-scheme: light;
+
+    --ground:   #FFFFFF;
+    --paper:    #F7F8F9;
+    --ink:      #101114;
+    --muted:    #6B7076;
+    --hairline: #E4E6E8;
+    --accent:   #1B3CF0;
+
+    --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+               "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    --font-data: ui-monospace, "SF Mono", "Cascadia Code", "Consolas", monospace;
+
+    --measure: 660px;
+
+    --step--1: 0.8125rem;  /* 13 */
+    --step-0:  0.9375rem;  /* 15 */
+    --step-1:  1.0625rem;  /* 17 */
+    --step-2:  1.3125rem;  /* 21 */
+    --step-3:  2.125rem;   /* 34 */
+  }
+
+  /* Single white theme, by design — both signals are pinned to it so a
+     viewer's dark preference can't produce a half-built dark mode. */
+  @media (prefers-color-scheme: dark) { :root { color-scheme: light; } }
+
+  /* ---- base ------------------------------------------------------------ */
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: var(--step-0);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .page {
+    max-width: var(--measure);
+    margin-inline: auto;
+    padding: clamp(3.5rem, 10vw, 7rem) 1.5rem 4rem;
+    display: flex;
+    flex-direction: column;
+    gap: clamp(3.5rem, 8vw, 5.5rem);
+  }
+
+  a { color: inherit; }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  .eyebrow {
+    font-size: var(--step--1);
+    font-family: var(--font-data);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* ---- masthead -------------------------------------------------------- */
+  .masthead { display: flex; flex-direction: column; gap: 1.5rem; }
+
+  .wordmark {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    font-size: var(--step-1);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    text-decoration: none;
+  }
+  .wordmark .slash { color: var(--accent); font-weight: 400; }
+
+  h1 {
+    font-size: var(--step-3);
+    font-weight: 600;
+    line-height: 1.15;
+    letter-spacing: -0.03em;
+    text-wrap: balance;
+    max-width: 18ch;
+  }
+
+  .lede {
+    font-size: var(--step-2);
+    line-height: 1.5;
+    color: var(--muted);
+    letter-spacing: -0.01em;
+    max-width: 46ch;
+  }
+
+  /* ---- download -------------------------------------------------------- */
+  .download { display: flex; flex-direction: column; gap: 1rem; }
+
+  .buttons { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+
+  .btn {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    padding: 0.8125rem 1.375rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--ground);
+    color: var(--ink);
+    text-decoration: none;
+    transition: border-color 0.15s ease, background 0.15s ease,
+                transform 0.15s ease;
+  }
+  .btn:hover { border-color: var(--ink); transform: translateY(-1px); }
+
+  .btn strong { font-size: var(--step-0); font-weight: 550; letter-spacing: -0.01em; }
+  .btn span {
+    font-size: var(--step--1);
+    font-family: var(--font-data);
+    color: var(--muted);
+  }
+
+  .btn[data-primary="true"] {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--ground);
+  }
+  .btn[data-primary="true"] span { color: rgba(255, 255, 255, 0.62); }
+  .btn[data-primary="true"]:hover { background: #000; }
+
+  .fineprint { font-size: var(--step--1); color: var(--muted); }
+
+  /* ---- timeline flourish ----------------------------------------------- */
+  .timeline { display: flex; flex-direction: column; gap: 0.875rem; }
+
+  .strip {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 44px;
+    padding-bottom: 1px;
+    border-bottom: 1px solid var(--hairline);
+    overflow: hidden;
+  }
+
+  .tick {
+    flex: 1 1 auto;
+    background: var(--hairline);
+    border-radius: 1px;
+    transform-origin: bottom;
+    animation: rise 0.5s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+  }
+  .tick[data-cut="true"] { background: var(--accent); height: 100% !important; }
+
+  @keyframes rise { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+
+  .legend {
+    display: flex;
+    gap: 0;
+    font-family: var(--font-data);
+    font-size: var(--step--1);
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+  }
+  .legend li { flex: 1 1 0; padding-right: 0.75rem; }
+  .legend li b { display: block; font-weight: 400; color: var(--ink); }
+
+  /* ---- what it does ---------------------------------------------------- */
+  .stages { display: flex; flex-direction: column; gap: 0; }
+
+  .stage {
+    display: grid;
+    grid-template-columns: 7.5rem 1fr;
+    gap: 1.5rem;
+    padding: 1.25rem 0;
+    border-top: 1px solid var(--hairline);
+  }
+  .stage:last-child { border-bottom: 1px solid var(--hairline); }
+
+  .stage dt {
+    font-family: var(--font-data);
+    font-size: var(--step--1);
+    color: var(--muted);
+    padding-top: 0.1875rem;
+  }
+  .stage dd { color: var(--ink); max-width: 44ch; }
+
+  /* ---- privacy --------------------------------------------------------- */
+  .privacy {
+    background: var(--paper);
+    border-radius: 8px;
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.625rem;
+  }
+  .privacy p { color: var(--muted); max-width: 52ch; }
+  .privacy strong { color: var(--ink); font-weight: 550; }
+
+  /* ---- footer ---------------------------------------------------------- */
+  footer {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--hairline);
+    font-size: var(--step--1);
+    color: var(--muted);
+  }
+  footer nav { display: flex; gap: 1.25rem; }
+  footer a { text-decoration: none; }
+  footer a:hover { color: var(--ink); }
+
+  @media (max-width: 480px) {
+    .stage { grid-template-columns: 1fr; gap: 0.375rem; }
+    .btn { flex: 1 1 100%; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tick { animation: none; }
+    .btn { transition: none; }
+    .btn:hover { transform: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <header class="masthead">
+    <a class="wordmark" href="/">Course<span class="slash">/</span>Cut</a>
+    <p class="eyebrow">Desktop app · macOS &amp; Windows</p>
+    <h1>Turn a three-hour lecture into the lessons it was always made of.</h1>
+    <p class="lede">
+      CourseCut transcribes your recording, finds where each topic begins and
+      ends, and exports clean lesson videos you can publish.
+    </p>
+  </header>
+
+  <section class="download" aria-label="Download">
+    <div class="buttons">
+      <a class="btn" href="#" id="btn-mac">
+        <strong>Download for macOS</strong>
+        <span>Apple silicon &amp; Intel · 12.0+</span>
+      </a>
+      <a class="btn" href="#" id="btn-win">
+        <strong>Download for Windows</strong>
+        <span>64-bit · Windows 10 &amp; 11</span>
+      </a>
+    </div>
+    <p class="fineprint">Version 1.0 · 84 MB · Free while in early access</p>
+  </section>
+
+  <section class="timeline" aria-label="How a recording gets cut">
+    <div class="strip" id="strip" role="img"
+         aria-label="A single long recording divided into four lessons at topic boundaries."></div>
+    <ol class="legend">
+      <li><b>Frames</b>00:00</li>
+      <li><b>Diffusion</b>41:12</li>
+      <li><b>Sampling</b>1:22:40</li>
+      <li><b>Q&amp;A</b>2:07:55</li>
+    </ol>
+  </section>
+
+  <dl class="stages">
+    <div class="stage">
+      <dt>Import</dt>
+      <dd>Drag in a file, a folder, or a semester's worth of recordings. MP4, MOV, MKV.</dd>
+    </div>
+    <div class="stage">
+      <dt>Transcribe</dt>
+      <dd>Audio is extracted and transcribed with timestamps. Transcripts are cached, so you only pay for a recording once.</dd>
+    </div>
+    <div class="stage">
+      <dt>Cut</dt>
+      <dd>Lesson boundaries are proposed from what was actually said, not from silence. Drag any boundary to correct it.</dd>
+    </div>
+    <div class="stage">
+      <dt>Export</dt>
+      <dd>One video per lesson, cut on keyframes, with titles and a chapter list ready to upload.</dd>
+    </div>
+  </dl>
+
+  <section class="privacy">
+    <p class="eyebrow">Local-first</p>
+    <p>
+      <strong>Your video never leaves your device.</strong> Editing, cutting,
+      and export all run on your machine. Only extracted audio and transcript
+      text are sent out, and only for transcription and lesson analysis.
+    </p>
+  </section>
+
+  <footer>
+    <p>© 2026 CourseCut</p>
+    <nav>
+      <a href="https://github.com/urperfectdude/coursecut">GitHub</a>
+      <a href="https://github.com/urperfectdude/coursecut/releases">Releases</a>
+      <a href="https://github.com/urperfectdude/coursecut/blob/main/docs/PRD.md">Docs</a>
+    </nav>
+  </footer>
+
+</div>
+
+<script>
+  // The strip: a long recording, cut into four lessons at topic boundaries.
+  (function drawStrip() {
+    const strip = document.getElementById("strip");
+    const TICKS = 96;
+    const cuts = new Set([0, 24, 48, 72]);
+    const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    for (let i = 0; i < TICKS; i++) {
+      const tick = document.createElement("i");
+      tick.className = "tick";
+      // Speech-shaped density: a slow swell within each lesson, plus grain.
+      const withinLesson = (i % 24) / 24;
+      const swell = Math.sin(withinLesson * Math.PI) * 0.55;
+      tick.style.height = (26 + swell * 100 * (0.6 + Math.random() * 0.4)) + "%";
+      if (cuts.has(i)) tick.dataset.cut = "true";
+      if (!reduced) tick.style.animationDelay = (i * 8) + "ms";
+      strip.appendChild(tick);
+    }
+  })();
+
+  // Lead with the platform the visitor is actually on.
+  (function pickPlatform() {
+    const ua = navigator.userAgent;
+    const isWindows = /Windows|Win32|Win64/i.test(ua);
+    const target = isWindows ? "btn-win" : "btn-mac";
+    document.getElementById(target).dataset.primary = "true";
+  })();
+</script>
+
+</body>
+</html>
