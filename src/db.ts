@@ -21,6 +21,10 @@ export interface Video {
   transcript_status: string;
   created_at: string;
   updated_at: string;
+  // Path to the cached extracted audio, set once extraction succeeds (see
+  // `src-tauri/src/ffmpeg.rs`). Lets a retry tell whether extraction has
+  // already completed and skip straight to transcription.
+  audio_path: string | null;
 }
 
 // Keep in sync with `SUPPORTED_EXTENSIONS` in `src-tauri/src/db.rs` —
@@ -52,8 +56,243 @@ export async function listVideos(projectId: string): Promise<Video[]> {
   return invoke<Video[]>("list_videos", { projectId });
 }
 
+// Looks up a single video by id (used by `LessonEditorView`, which is only
+// handed a `videoId` — not its parent `projectId` — and needs `file_path`
+// to build a playback URL via `convertFileSrc`). Rust resolves to `null`
+// when no video matches `id`, mirroring `getProject`.
+export async function getVideo(id: string): Promise<Video | null> {
+  return invoke<Video | null>("get_video", { id });
+}
+
+// Runs ffmpeg/ffprobe (Rust-owned sidecars, see `src-tauri/src/ffmpeg.rs`)
+// to probe the video's real duration and extract local audio, caching the
+// result by content hash so re-importing an unchanged file skips the work.
+// Never uploads video — see `coursecut-privacy-invariants`.
+export async function extractAudioForVideo(videoId: string): Promise<Video> {
+  return invoke<Video>("extract_audio_for_video", { videoId });
+}
+
+export interface TranscriptSegment {
+  id: string;
+  video_id: string;
+  start: number;
+  end: number;
+  text: string;
+  keep: boolean;
+}
+
+// Sends only the video's already-extracted local audio file (see
+// `src-tauri/src/ffmpeg.rs`'s `audio_path`) to OpenAI's Whisper API — never
+// the source video, never SQLite content beyond what locates that audio
+// file. See `coursecut-privacy-invariants`. Skips the API call and copies
+// cached segments instead if another video shares this one's content hash
+// and already has a transcript (PRD §7.4).
+export async function transcribeVideo(videoId: string): Promise<Video> {
+  return invoke<Video>("transcribe_video", { videoId });
+}
+
+export async function listTranscriptSegments(videoId: string): Promise<TranscriptSegment[]> {
+  return invoke<TranscriptSegment[]>("list_transcript_segments", { videoId });
+}
+
+// Transcript Mode editing (PRD §8.1) — pure local SQLite mutations, no
+// OpenAI/network involvement. See `src-tauri/src/db.rs`.
+
+export async function updateTranscriptSegment(id: string, keep: boolean): Promise<TranscriptSegment> {
+  return invoke<TranscriptSegment>("update_transcript_segment", { id, keep });
+}
+
+export interface Lesson {
+  id: string;
+  video_id: string;
+  title: string;
+  summary: string | null;
+  start: number;
+  end: number;
+  sort_order: number;
+  // Nullable: unset for any future manually-created lesson that never went
+  // through AI analysis.
+  confidence: number | null;
+  // One of "lesson" | "qna" | "discussion" | "break" | "silence" |
+  // "duplicate" (PRD §7.5).
+  kind: string;
+  // "ai" for AI-suggested rows; reserved for future manual/edited rows.
+  source: string;
+}
+
+// Sends only this video's transcript **text** (never audio, never video) to
+// GPT-5.5 chat completions for lesson-boundary analysis (PRD §7.5). See
+// `coursecut-privacy-invariants`. Replaces the video's AI-sourced lesson
+// rows with the fresh suggestions (re-running is a clean replace, not an
+// accumulation) and returns the full updated set.
+export async function analyzeVideo(videoId: string): Promise<Lesson[]> {
+  return invoke<Lesson[]>("analyze_video", { videoId });
+}
+
+export async function listLessons(videoId: string): Promise<Lesson[]> {
+  return invoke<Lesson[]>("list_lessons", { videoId });
+}
+
+// Lesson editing (PRD §8.1/§9) — patch/split/merge/delete/reorder, all pure
+// local SQLite mutations (see `src-tauri/src/db.rs`). `updateLesson` uses
+// patch semantics: omit (or pass `undefined` for) a field to leave it
+// unchanged.
+export async function updateLesson(
+  id: string,
+  patch: { title?: string; summary?: string; start?: number; end?: number },
+): Promise<Lesson> {
+  return invoke<Lesson>("update_lesson", {
+    id,
+    title: patch.title ?? null,
+    summary: patch.summary ?? null,
+    start: patch.start ?? null,
+    end: patch.end ?? null,
+  });
+}
+
+// Splits a lesson into two at `atTime` (must be strictly inside the
+// lesson's current `[start, end)`); returns both resulting rows.
+export async function splitLesson(lessonId: string, atTime: number): Promise<Lesson[]> {
+  return invoke<Lesson[]>("split_lesson", { lessonId, atTime });
+}
+
+// Merges `secondId` into `firstId` (both must belong to the same video);
+// returns the merged row. `secondId`'s row is deleted.
+export async function mergeLessons(firstId: string, secondId: string): Promise<Lesson> {
+  return invoke<Lesson>("merge_lessons", { firstId, secondId });
+}
+
+export async function deleteLesson(id: string): Promise<void> {
+  await invoke("delete_lesson", { id });
+}
+
+// Sets `sort_order` to each id's position in `orderedIds` — must be exactly
+// the video's current set of lesson ids (Rust rejects a partial/mismatched
+// list rather than silently applying it).
+export async function reorderLessons(videoId: string, orderedIds: string[]): Promise<void> {
+  await invoke("reorder_lessons", { videoId, orderedIds });
+}
+
 export async function deleteProject(id: string): Promise<void> {
   // Cascade delete of videos/lessons/etc. is handled by the schema's
   // ON DELETE CASCADE (see 0001_init.sql) — no app-level cascade needed.
   await invoke("delete_project", { id });
+}
+
+export async function deleteVideo(id: string): Promise<void> {
+  // Cascade delete of transcript segments/lessons is handled by the
+  // schema's ON DELETE CASCADE (see 0001_init.sql) — no app-level cascade
+  // needed. Note: this does not remove the cached extracted-audio WAV file
+  // from disk, since it's content-hash-keyed and may be shared with other
+  // videos.
+  await invoke("delete_video", { id });
+}
+
+// The OpenAI API key is BYOK (bring your own key) and lives in the OS
+// keychain, never in SQLite — see `src-tauri/src/settings.rs`.
+
+export interface KeyStatus {
+  present: boolean;
+  last_four: string | null;
+}
+
+export interface KeyTestResult {
+  valid: boolean;
+  message: string;
+}
+
+export async function saveOpenAiKey(key: string): Promise<void> {
+  await invoke("save_openai_key", { key });
+}
+
+export async function getOpenAiKeyStatus(): Promise<KeyStatus> {
+  return invoke<KeyStatus>("get_openai_key_status");
+}
+
+export async function testOpenAiKey(): Promise<KeyTestResult> {
+  return invoke<KeyTestResult>("test_openai_key");
+}
+
+// Free-text user preferences (PRD §7.5) appended to the GPT-5.5 analysis
+// prompt in `analyze_video` — not a secret, so this lives in SQLite's
+// `app_settings` table (see `src-tauri/src/app_settings.rs`), unlike the
+// API key above.
+export async function saveAnalysisInstructions(instructions: string): Promise<void> {
+  await invoke("save_analysis_instructions", { instructions });
+}
+
+export async function getAnalysisInstructions(): Promise<string | null> {
+  return invoke<string | null>("get_analysis_instructions");
+}
+
+// Export queue (PRD §10-11, Milestone 7) — see `src-tauri/src/export.rs`.
+// Purely local: trims a lesson's `[start, end)` from its already-imported
+// source video into a frame-accurately re-encoded MP4 plus a paired SRT
+// (from that lesson's kept transcript segments), run one at a time by a
+// single app-wide background worker. Never uploads anything — see
+// `coursecut-privacy-invariants`.
+
+export interface ExportRow {
+  id: string;
+  lesson_id: string;
+  output_path: string;
+  // One of "queued" | "paused" | "running" | "done" | "failed" | "cancelled".
+  status: string;
+  created_at: string;
+  // Fraction in [0, 1] of the lesson's own duration, updated while running.
+  progress: number;
+  // Set only when status === "failed".
+  error: string | null;
+  // Lesson/video ancestry, joined in by `list_exports` (see
+  // `src-tauri/src/export.rs`) for Export History (PRD §11). Present on
+  // every row `listExports` returns; other export commands (queue/pause/
+  // resume/cancel/retry) return these as empty-string/zero placeholders
+  // since their callers always re-fetch via `listExports` afterward rather
+  // than rendering their return value directly — don't rely on these four
+  // fields outside of a `listExports` result.
+  lesson_title: string;
+  lesson_start: number;
+  lesson_end: number;
+  video_file_path: string;
+}
+
+// Inserts one `queued` export row per lesson id, with an output filename
+// derived from each lesson's title under `outputDir` (collision-checked so
+// two lessons with the same/similar titles don't clobber each other).
+// Actual encoding happens later, one at a time, in Rust's background
+// worker — this only queues the work.
+export async function queueExport(lessonIds: string[], outputDir: string): Promise<ExportRow[]> {
+  return invoke<ExportRow[]>("queue_export", { lessonIds, outputDir });
+}
+
+// Scoped semantics (see `src-tauri/src/export.rs`'s module docs): pause/
+// resume only ever apply to a job that hasn't started encoding yet
+// (`queued` <-> `paused`). Calling either on a `running` export is
+// rejected with a clear error rather than attempting to suspend a live
+// ffmpeg process — not realistically portable across macOS/Windows.
+export async function pauseExport(id: string): Promise<ExportRow> {
+  return invoke<ExportRow>("pause_export", { id });
+}
+
+export async function resumeExport(id: string): Promise<ExportRow> {
+  return invoke<ExportRow>("resume_export", { id });
+}
+
+// For a queued/paused job this just marks it cancelled. For a running job
+// this actually kills the in-flight ffmpeg process.
+export async function cancelExport(id: string): Promise<ExportRow> {
+  return invoke<ExportRow>("cancel_export", { id });
+}
+
+// Resets a failed/cancelled job back to `queued` (clearing progress/error)
+// so the background worker picks it up again.
+export async function retryExport(id: string): Promise<ExportRow> {
+  return invoke<ExportRow>("retry_export", { id });
+}
+
+// Read-only, project-scoped listing (joined through lessons -> videos),
+// newest first. The editor filters this down to just the current video's
+// lessons client-side.
+export async function listExports(projectId: string): Promise<ExportRow[]> {
+  return invoke<ExportRow[]>("list_exports", { projectId });
 }

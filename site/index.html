@@ -261,16 +261,22 @@
 
   <section class="download" aria-label="Download">
     <div class="buttons">
-      <a class="btn" href="#" id="btn-mac">
+      <a class="btn" href="https://github.com/urperfectdude/coursecut/releases/latest" id="btn-mac">
         <strong>Download for macOS</strong>
         <span>Apple silicon &amp; Intel · 12.0+</span>
       </a>
-      <a class="btn" href="#" id="btn-win">
+      <a class="btn" href="https://github.com/urperfectdude/coursecut/releases/latest" id="btn-win">
         <strong>Download for Windows</strong>
         <span>64-bit · Windows 10 &amp; 11</span>
       </a>
     </div>
-    <p class="fineprint">Version 1.0 · 84 MB · Free while in early access</p>
+    <p class="fineprint" id="fineprint">Version 1.0 · Free while in early access</p>
+    <p class="fineprint">
+      Unsigned build during early access: on macOS, right-click the app
+      and choose <strong>Open</strong>; on Windows, click
+      <strong>More info</strong> → <strong>Run anyway</strong> on the
+      SmartScreen prompt.
+    </p>
   </section>
 
   <section class="timeline" aria-label="How a recording gets cut">
@@ -350,6 +356,44 @@
     const isWindows = /Windows|Win32|Win64/i.test(ua);
     const target = isWindows ? "btn-win" : "btn-mac";
     document.getElementById(target).dataset.primary = "true";
+  })();
+
+  // Point the download buttons at the actual latest-release assets.
+  // Both links default to the releases page above; this only upgrades
+  // them to a direct asset download when the GitHub API call succeeds.
+  (function wireReleaseLinks() {
+    fetch("https://api.github.com/repos/urperfectdude/coursecut/releases/latest")
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+      .then((release) => {
+        const assets = release.assets || [];
+        const bytes = (n) => (n / (1024 * 1024)).toFixed(0) + " MB";
+
+        const dmg = assets.find((a) => a.name.endsWith(".dmg"));
+        const win = assets.find((a) => /\.(exe|msi)$/i.test(a.name));
+
+        if (dmg) {
+          const btn = document.getElementById("btn-mac");
+          btn.href = dmg.browser_download_url;
+          btn.querySelector("span").textContent =
+            "Apple silicon & Intel · 12.0+ · " + bytes(dmg.size);
+        }
+        if (win) {
+          const btn = document.getElementById("btn-win");
+          btn.href = win.browser_download_url;
+          btn.querySelector("span").textContent =
+            "64-bit · Windows 10 & 11 · " + bytes(win.size);
+        }
+
+        const version = (release.tag_name || "").replace(/^v/, "");
+        if (version) {
+          document.getElementById("fineprint").textContent =
+            "Version " + version + " · Free while in early access";
+        }
+      })
+      .catch(() => {
+        // Releases API unavailable (rate limit, offline) — the buttons
+        // already fall back to the releases page itself.
+      });
   })();
 </script>
 

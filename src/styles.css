@@ -96,12 +96,15 @@ body {
   margin: 0;
 }
 
+.video-list-entry {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #ccc3;
+}
+
 .video-list-item {
   display: flex;
   align-items: center;
   gap: 1rem;
-  padding: 0.5rem 0;
-  border-bottom: 1px solid #ccc3;
 }
 
 .video-info {
@@ -138,6 +141,540 @@ body {
   opacity: 0.85;
 }
 
+.status-badge.status-audio_ready {
+  border-color: #2a8a;
+  color: #2a8;
+}
+
+.status-badge.status-error {
+  border-color: #d33a;
+  color: #d33;
+}
+
+.status-badge.status-transcribed {
+  border-color: #2a8a;
+  color: #2a8;
+}
+
 .error {
   color: #d33;
+}
+
+.video-error {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+}
+
+.success {
+  color: #2a8;
+}
+
+.transcript-toggle,
+.retry-button,
+.analyze-button,
+.lessons-toggle {
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.transcript-panel {
+  margin-top: 0.5rem;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid #ccc5;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+}
+
+.transcript-segment-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.transcript-segment {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.transcript-segment-time {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+
+.lesson-panel {
+  margin-top: 0.5rem;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid #ccc5;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+}
+
+.lesson-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.lesson-item {
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid #ccc3;
+}
+
+.lesson-item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.lesson-item-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.lesson-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.lesson-item-time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+  font-size: 0.8rem;
+}
+
+.lesson-summary {
+  margin: 0.35rem 0 0;
+  font-size: 0.85rem;
+  opacity: 0.85;
+}
+
+.lesson-item-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.lesson-accept-button,
+.lesson-reject-button {
+  font-size: 0.75rem;
+}
+
+.confidence-badge {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid #ccc8;
+  opacity: 0.85;
+}
+
+.kind-badge {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid #ccc8;
+  opacity: 0.85;
+  text-transform: capitalize;
+}
+
+.kind-badge.kind-lesson {
+  border-color: #2a8a;
+  color: #2a8;
+}
+
+.kind-badge.kind-qna {
+  border-color: #46aa;
+  color: #46a;
+}
+
+.kind-badge.kind-discussion {
+  border-color: #a6aa;
+  color: #a6a;
+}
+
+.kind-badge.kind-break,
+.kind-badge.kind-silence {
+  border-color: #ccc8;
+  opacity: 0.7;
+}
+
+.kind-badge.kind-duplicate {
+  border-color: #d33a;
+  color: #d33;
+}
+
+.analysis-instructions-input {
+  display: block;
+  width: 100%;
+  max-width: 32rem;
+  margin: 0.5rem 0;
+  font: inherit;
+  resize: vertical;
+}
+
+.edit-button {
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+/* Lesson editor (Transcript Mode, PRD §8.1) */
+
+.editor-video {
+  display: block;
+  width: 100%;
+  max-height: 40vh;
+  margin: 0.75rem 0;
+  background: #000;
+}
+
+.editor-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.editor-panel {
+  min-width: 0;
+}
+
+.transcript-search-input {
+  display: block;
+  width: 100%;
+  margin: 0.5rem 0;
+  font: inherit;
+}
+
+.editor-transcript-list {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.editor-transcript-segment {
+  align-items: center;
+}
+
+.transcript-segment-text-button {
+  flex: 1;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  color: inherit;
+}
+
+.transcript-segment-deleted {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+
+.transcript-segment-active {
+  background: #46a2;
+  border-radius: 4px;
+}
+
+.transcript-segment-keep {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.undo-redo-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.undo-note {
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+
+.editor-lesson-list {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.editor-lesson-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+
+.lesson-title-input {
+  font-weight: 600;
+  font-size: 0.9rem;
+  font: inherit;
+  border: 1px solid transparent;
+  background: none;
+  padding: 0.1rem 0.25rem;
+  min-width: 8rem;
+  flex: 1;
+}
+
+.lesson-title-input:hover,
+.lesson-title-input:focus {
+  border-color: #ccc8;
+  border-radius: 3px;
+}
+
+.lesson-summary-input {
+  display: block;
+  width: 100%;
+  font: inherit;
+  font-size: 0.85rem;
+  border: 1px solid transparent;
+  background: none;
+  resize: vertical;
+  padding: 0.1rem 0.25rem;
+}
+
+.lesson-summary-input:hover,
+.lesson-summary-input:focus {
+  border-color: #ccc8;
+  border-radius: 3px;
+}
+
+/* Timestamp Mode (PRD §8.2, Milestone 6) */
+
+.mode-toggle {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.mode-toggle-button {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid #ccc8;
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+  color: inherit;
+}
+
+.mode-toggle-button-active {
+  border-color: #46a;
+  background: #46a2;
+}
+
+.editor-lesson-item-selected {
+  background: #46a1;
+  border-radius: 4px;
+}
+
+.timestamp-note {
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+
+.timestamp-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.timestamp-selected-title {
+  font-weight: 600;
+  margin: 0;
+}
+
+.timestamp-fields {
+  display: flex;
+  gap: 1rem;
+}
+
+.timestamp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+}
+
+.timestamp-field input {
+  font: inherit;
+  width: 8rem;
+}
+
+.timestamp-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.timestamp-scrubber {
+  width: 100%;
+}
+
+.timestamp-hint {
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+
+.timestamp-error {
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+/* Export queue (PRD §10-11, Milestone 7) */
+
+.lesson-export-checkbox {
+  flex-shrink: 0;
+}
+
+.export-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.export-panel {
+  margin-top: 1.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #ccc3;
+}
+
+.export-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.export-item {
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid #ccc3;
+}
+
+.export-item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.export-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.export-item-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.export-status-badge.status-queued,
+.export-status-badge.status-paused {
+  border-color: #ccc8;
+  opacity: 0.85;
+}
+
+.export-status-badge.status-running {
+  border-color: #46aa;
+  color: #46a;
+}
+
+.export-status-badge.status-done {
+  border-color: #2a8a;
+  color: #2a8;
+}
+
+.export-status-badge.status-failed {
+  border-color: #d33a;
+  color: #d33;
+}
+
+.export-status-badge.status-cancelled {
+  border-color: #ccc8;
+  opacity: 0.6;
+}
+
+.export-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+}
+
+.export-progress progress {
+  flex: 1;
+}
+
+.export-progress-label {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.export-error {
+  margin: 0.35rem 0 0;
+  font-size: 0.85rem;
+}
+
+.export-item-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+/* Export History (PRD §11, Milestone 8) */
+
+.project-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.export-history-button {
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.export-history-list {
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.export-history-item {
+  border-bottom: 1px solid #ccc3;
+}
+
+.export-history-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+  opacity: 0.75;
+  margin-top: 0.2rem;
+}
+
+.export-history-path {
+  overflow-wrap: anywhere;
 }

@@ -28,6 +28,12 @@ Before the first real build, generate app icons once (needed by `tauri build`, r
 npm run tauri icon path/to/source-logo.png
 ```
 
+Fetch the ffmpeg/ffprobe sidecars once (not committed to git — see `scripts/fetch-ffmpeg.sh`):
+
+```sh
+scripts/fetch-ffmpeg.sh
+```
+
 ## Development
 
 ```sh

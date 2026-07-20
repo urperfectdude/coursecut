@@ -3,9 +3,10 @@ import { createProject, deleteProject, listProjects, type Project } from "../db"
 
 interface HomeViewProps {
   onOpenProject: (id: string) => void;
+  onOpenSettings: () => void;
 }
 
-export default function HomeView({ onOpenProject }: HomeViewProps) {
+export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProps) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [newName, setNewName] = useState("");
   const [loading, setLoading] = useState(true);
@@ -66,6 +67,9 @@ export default function HomeView({ onOpenProject }: HomeViewProps) {
         />
         <button type="submit" disabled={!newName.trim()}>
           New Project
+        </button>
+        <button type="button" onClick={onOpenSettings}>
+          Settings
         </button>
       </form>
 
