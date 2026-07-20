@@ -27,10 +27,12 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 case "$TARGET" in
-  aarch64-apple-darwin|x86_64-apple-darwin)
+  aarch64-apple-darwin|x86_64-apple-darwin|universal-apple-darwin)
     # evermeet.cx ships a static x86_64 build (libx264/libx265/aac baked in,
     # no dylib deps beyond system frameworks); it runs on Apple Silicon
-    # under Rosetta 2, so the same pair covers both mac target triples.
+    # under Rosetta 2, so the same pair covers aarch64, x86_64, and the
+    # universal-apple-darwin sidecar name `cargo tauri build --target
+    # universal-apple-darwin` looks for.
     curl -sL -o "$TMP/ffmpeg.zip" https://evermeet.cx/ffmpeg/ffmpeg-8.1.2.zip
     curl -sL -o "$TMP/ffprobe.zip" https://evermeet.cx/ffmpeg/ffprobe-8.1.2.zip
     unzip -o -q "$TMP/ffmpeg.zip" -d "$TMP"
