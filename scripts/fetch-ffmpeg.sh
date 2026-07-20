@@ -41,7 +41,8 @@ case "$TARGET" in
     ;;
   x86_64-pc-windows-msvc)
     curl -sL -o "$TMP/win.zip" https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
-    ROOT="$(unzip -Z1 "$TMP/win.zip" | head -1 | cut -d/ -f1)"
+    LISTING="$(unzip -Z1 "$TMP/win.zip")"
+    ROOT="$(echo "$LISTING" | head -1 | cut -d/ -f1)"
     unzip -o -q "$TMP/win.zip" "$ROOT/bin/ffmpeg.exe" "$ROOT/bin/ffprobe.exe" -d "$TMP"
     cp "$TMP/$ROOT/bin/ffmpeg.exe" "$OUT/ffmpeg-$TARGET.exe"
     cp "$TMP/$ROOT/bin/ffprobe.exe" "$OUT/ffprobe-$TARGET.exe"
