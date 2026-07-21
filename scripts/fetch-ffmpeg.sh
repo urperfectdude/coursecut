@@ -16,7 +16,13 @@ mkdir -p "$OUT"
 
 detect_host_triple() {
   case "$(uname -s)" in
-    Darwin) echo "aarch64-apple-darwin" ;; # Rosetta 2 covers Intel via the same sidecar below
+    Darwin)
+      case "$(uname -m)" in
+        arm64) echo "aarch64-apple-darwin" ;;
+        x86_64) echo "x86_64-apple-darwin" ;;
+        *) echo "Unsupported macOS arch for local ffmpeg fetch: $(uname -m)" >&2; exit 1 ;;
+      esac
+      ;;
     MINGW*|MSYS*|CYGWIN*) echo "x86_64-pc-windows-msvc" ;;
     *) echo "Unsupported host OS for local ffmpeg fetch: $(uname -s)" >&2; exit 1 ;;
   esac
@@ -28,21 +34,42 @@ trap 'rm -rf "$TMP"' EXIT
 
 case "$TARGET" in
   aarch64-apple-darwin|x86_64-apple-darwin|universal-apple-darwin)
-    # evermeet.cx ships a static x86_64 build (libx264/libx265/aac baked in,
-    # no dylib deps beyond system frameworks); it runs on Apple Silicon
-    # under Rosetta 2, so the same pair covers aarch64 and x86_64. A
-    # `cargo tauri build --target universal-apple-darwin` builds each arch
+    # evermeet.cx (the previous source here) only ships x86_64 and
+    # explicitly states it won't build for Apple Silicon — its README
+    # expects Rosetta 2 to translate the x86_64 binary at runtime. That's a
+    # runtime dependency this app shouldn't assume its users have installed
+    # (Rosetta isn't preinstalled/auto-installed on every Apple Silicon Mac,
+    # and its absence surfaces to users as an opaque
+    # "could not spawn ffmpeg: Bad CPU type in executable" error). Fetch
+    # genuine native builds per architecture from martin-riedl.de instead —
+    # these are real arm64/x86_64 Mach-O binaries, no translation needed.
+    #
+    # A `cargo tauri build --target universal-apple-darwin` builds each arch
     # slice separately before merging, and looks up the sidecar under all
-    # three names along the way, so write all three from one download.
-    curl -sL -o "$TMP/ffmpeg.zip" https://evermeet.cx/ffmpeg/ffmpeg-8.1.2.zip
-    curl -sL -o "$TMP/ffprobe.zip" https://evermeet.cx/ffmpeg/ffprobe-8.1.2.zip
-    unzip -o -q "$TMP/ffmpeg.zip" -d "$TMP"
-    unzip -o -q "$TMP/ffprobe.zip" -d "$TMP"
-    chmod +x "$TMP/ffmpeg" "$TMP/ffprobe"
-    for t in aarch64-apple-darwin x86_64-apple-darwin universal-apple-darwin; do
-      cp "$TMP/ffmpeg" "$OUT/ffmpeg-$t"
-      cp "$TMP/ffprobe" "$OUT/ffprobe-$t"
-    done
+    # three names along the way (see the two prior fix commits in this
+    # file's history), so fetch both natives and write all three names:
+    # the two arch-specific ones as-is, and a real `lipo`-merged universal
+    # binary (not a copy of either single-arch build) under the third.
+    fetch_macos_native() {
+      local site_arch="$1" out_arch="$2" # e.g. "arm64" "aarch64"
+      curl -sL -A "Mozilla/5.0" -o "$TMP/ffmpeg-$out_arch.zip" \
+        "https://ffmpeg.martin-riedl.de/redirect/latest/macos/$site_arch/snapshot/ffmpeg.zip"
+      curl -sL -A "Mozilla/5.0" -o "$TMP/ffprobe-$out_arch.zip" \
+        "https://ffmpeg.martin-riedl.de/redirect/latest/macos/$site_arch/snapshot/ffprobe.zip"
+      unzip -o -q "$TMP/ffmpeg-$out_arch.zip" -d "$TMP" && mv "$TMP/ffmpeg" "$TMP/ffmpeg-$out_arch"
+      unzip -o -q "$TMP/ffprobe-$out_arch.zip" -d "$TMP" && mv "$TMP/ffprobe" "$TMP/ffprobe-$out_arch"
+      chmod +x "$TMP/ffmpeg-$out_arch" "$TMP/ffprobe-$out_arch"
+    }
+    fetch_macos_native arm64 aarch64
+    fetch_macos_native amd64 x86_64
+
+    cp "$TMP/ffmpeg-aarch64" "$OUT/ffmpeg-aarch64-apple-darwin"
+    cp "$TMP/ffprobe-aarch64" "$OUT/ffprobe-aarch64-apple-darwin"
+    cp "$TMP/ffmpeg-x86_64" "$OUT/ffmpeg-x86_64-apple-darwin"
+    cp "$TMP/ffprobe-x86_64" "$OUT/ffprobe-x86_64-apple-darwin"
+    lipo -create "$TMP/ffmpeg-aarch64" "$TMP/ffmpeg-x86_64" -output "$OUT/ffmpeg-universal-apple-darwin"
+    lipo -create "$TMP/ffprobe-aarch64" "$TMP/ffprobe-x86_64" -output "$OUT/ffprobe-universal-apple-darwin"
+    chmod +x "$OUT/ffmpeg-universal-apple-darwin" "$OUT/ffprobe-universal-apple-darwin"
     ;;
   x86_64-pc-windows-msvc)
     curl -sL -o "$TMP/win.zip" https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip

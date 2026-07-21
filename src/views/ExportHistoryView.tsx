@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listExports, queueExport, type ExportRow } from "../db";
+import {
+  cancelExport,
+  listExports,
+  pauseExport,
+  queueExport,
+  resumeExport,
+  retryExport,
+  revealInFolder,
+  type ExportRow,
+} from "../db";
 import { ACTIVE_EXPORT_STATUSES } from "./LessonEditorView";
 import { basename, dirname, formatDuration } from "./ProjectDetailView";
 
@@ -26,11 +35,13 @@ export default function ExportHistoryView({ projectId, onBack }: ExportHistoryVi
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Per-row in-flight guard for Re-export, same pattern as
-  // `LessonEditorView`'s `exportBusyRef`/`exportBusyIds` — stops a rapid
-  // double-click from queuing the same re-export twice.
-  const reExportBusyRef = useRef<Set<string>>(new Set());
-  const [reExportBusyIds, setReExportBusyIds] = useState<Set<string>>(new Set());
+  // Per-row in-flight guard, same pattern as `LessonEditorView`'s
+  // `exportBusyRef`/`exportBusyIds` — covers every row action below
+  // (Pause/Resume/Cancel/Retry/Re-export/Show in folder), keyed by export
+  // id, so a rapid double-click can't fire two concurrent actions against
+  // the same row.
+  const actionBusyRef = useRef<Set<string>>(new Set());
+  const [actionBusyIds, setActionBusyIds] = useState<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     try {
@@ -74,9 +85,9 @@ export default function ExportHistoryView({ projectId, onBack }: ExportHistoryVi
 
   const handleReExport = useCallback(
     async (row: ExportRow) => {
-      if (reExportBusyRef.current.has(row.id)) return;
-      reExportBusyRef.current.add(row.id);
-      setReExportBusyIds(new Set(reExportBusyRef.current));
+      if (actionBusyRef.current.has(row.id)) return;
+      actionBusyRef.current.add(row.id);
+      setActionBusyIds(new Set(actionBusyRef.current));
       try {
         const outputDir = dirname(row.output_path);
         // A new export row, preserving this one as history rather than
@@ -87,12 +98,41 @@ export default function ExportHistoryView({ projectId, onBack }: ExportHistoryVi
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
-        reExportBusyRef.current.delete(row.id);
-        setReExportBusyIds(new Set(reExportBusyRef.current));
+        actionBusyRef.current.delete(row.id);
+        setActionBusyIds(new Set(actionBusyRef.current));
       }
     },
     [refresh],
   );
+
+  /** Pause/Resume/Cancel/Retry all share this shape — same convention as
+   * `LessonEditorView`'s own `handleExportAction`, which this page's inline
+   * queue panel used to be (see the conversation that moved it here). */
+  const handleAction = useCallback(
+    async (id: string, action: (id: string) => Promise<ExportRow>) => {
+      if (actionBusyRef.current.has(id)) return;
+      actionBusyRef.current.add(id);
+      setActionBusyIds(new Set(actionBusyRef.current));
+      try {
+        await action(id);
+        await refresh();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        actionBusyRef.current.delete(id);
+        setActionBusyIds(new Set(actionBusyRef.current));
+      }
+    },
+    [refresh],
+  );
+
+  const handleRevealInFolder = useCallback(async (row: ExportRow) => {
+    try {
+      await revealInFolder(row.output_path);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
 
   return (
     <div>
@@ -110,7 +150,7 @@ export default function ExportHistoryView({ projectId, onBack }: ExportHistoryVi
       {exports.length > 0 && (
         <ul className="export-history-list">
           {exports.map((row) => {
-            const isBusy = reExportBusyIds.has(row.id);
+            const isBusy = actionBusyIds.has(row.id);
             const isActive = ACTIVE_EXPORT_STATUSES.has(row.status);
             const duration = row.lesson_end - row.lesson_start;
             return (
@@ -137,6 +177,47 @@ export default function ExportHistoryView({ projectId, onBack }: ExportHistoryVi
                   <p className="error export-error">{row.error}</p>
                 )}
                 <div className="export-item-actions">
+                  {row.status === "queued" && (
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void handleAction(row.id, pauseExport)}
+                    >
+                      Pause
+                    </button>
+                  )}
+                  {row.status === "paused" && (
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void handleAction(row.id, resumeExport)}
+                    >
+                      Resume
+                    </button>
+                  )}
+                  {(row.status === "queued" || row.status === "paused" || row.status === "running") && (
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void handleAction(row.id, cancelExport)}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                  {(row.status === "failed" || row.status === "cancelled") && (
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void handleAction(row.id, retryExport)}
+                    >
+                      Retry
+                    </button>
+                  )}
+                  {row.status === "done" && (
+                    <button type="button" onClick={() => void handleRevealInFolder(row)}>
+                      Show in folder
+                    </button>
+                  )}
                   <button
                     type="button"
                     disabled={isBusy || isActive}

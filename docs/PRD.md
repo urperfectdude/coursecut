@@ -267,7 +267,6 @@ User actions:
 ### Output
 
 * MP4
-* SRT subtitles
 
 ### Export Queue Features
 

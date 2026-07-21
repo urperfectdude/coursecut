@@ -15,10 +15,13 @@
 use std::path::Path;
 
 use rusqlite::{params, OptionalExtension};
+use tauri::AppHandle;
 
 use crate::app_settings;
 use crate::db::{self, DbConnection, LessonRow, TranscriptSegmentRow, Video};
+use crate::progress::{self, Stage};
 use crate::settings;
+use crate::wav;
 
 /// A single transcript segment as returned by Whisper — timestamps in
 /// seconds relative to the start of the audio.
@@ -42,15 +45,38 @@ struct WhisperSegment {
     text: String,
 }
 
+/// Whisper's documented upload cap is 25MB. This is kept comfortably under
+/// that (a ~1MB margin) so header overhead/rounding never pushes a
+/// "just under the limit" file over the real cap.
+const SAFE_UPLOAD_BYTES: u64 = 24_000_000;
+
+/// Target size for each chunk when splitting oversized audio. At
+/// `extract_audio`'s fixed mono/16kHz/16-bit output (32 KB/s), this is
+/// exactly 10 minutes of audio (~18.3MB) — comfortably under
+/// `SAFE_UPLOAD_BYTES` even after the silence-seeking boundary picker
+/// nudges a cut a few tens of seconds away from this target in either
+/// direction.
+const CHUNK_TARGET_BYTES: usize = 19_200_000;
+
 /// Uploads the local file at `audio_path` to OpenAI's Whisper API
 /// (`POST /v1/audio/transcriptions`, `model=whisper-1`,
 /// `response_format=verbose_json` for segment-level timestamps) and parses
 /// the response into `TranscriptSegment`s.
 ///
-/// Reads the whole file into memory to build the multipart body — audio
-/// extracted by `ffmpeg.rs` is mono 16kHz WAV, and Whisper itself caps
-/// uploads at 25MB, so this stays bounded. Never touches the source video.
+/// Whisper caps uploads at 25MB (`SAFE_UPLOAD_BYTES` is a safe margin
+/// under that). Audio extracted by `ffmpeg.rs` is mono 16kHz WAV; most
+/// recordings are short enough to stay under the cap and go up in a
+/// single request (unchanged from before chunking existed). Anything
+/// longer is split via `wav.rs` into sub-cap WAV chunks, each uploaded in
+/// its own sequential request, with every returned segment's timestamps
+/// offset back onto the full recording's timeline before merging — see
+/// `merge_chunk_segments`. Either way, only the already-extracted local
+/// audio bytes ever leave the process, now possibly in several pieces
+/// instead of one. Never touches the source video.
 pub async fn transcribe_audio(
+    app: &AppHandle,
+    video_id: &str,
+    attempt: u32,
     audio_path: &str,
     api_key: &str,
 ) -> Result<Vec<TranscriptSegment>, String> {
@@ -64,6 +90,47 @@ pub async fn transcribe_audio(
         .unwrap_or("audio.wav")
         .to_string();
 
+    if audio_bytes.len() as u64 <= SAFE_UPLOAD_BYTES {
+        progress::emit(app, video_id, Stage::Transcribing, None, None, attempt);
+        return upload_chunk(audio_bytes, file_name, api_key).await;
+    }
+
+    let chunks = wav::split_into_chunks(&audio_bytes, CHUNK_TARGET_BYTES)?;
+    let total = chunks.len();
+    progress::emit(app, video_id, Stage::Transcribing, None, None, attempt);
+
+    let mut chunk_results: Vec<(Vec<TranscriptSegment>, f64)> = Vec::with_capacity(total);
+    for (index, (chunk_bytes, start_offset_secs)) in chunks.into_iter().enumerate() {
+        progress::emit(
+            app,
+            video_id,
+            Stage::Transcribing,
+            Some((index + 1) as f64 / total as f64),
+            Some(format!("chunk {} of {}", index + 1, total)),
+            attempt,
+        );
+        // A chunk's own upload failing fails the whole transcription — the
+        // `?` here propagates up through `run_transcription`'s existing
+        // `mark_error` path, so no partial/ambiguous transcript is ever
+        // written.
+        let chunk_name = format!("chunk-{index:03}-{file_name}");
+        let segments = upload_chunk(chunk_bytes, chunk_name, api_key).await?;
+        chunk_results.push((segments, start_offset_secs));
+    }
+
+    Ok(merge_chunk_segments(chunk_results))
+}
+
+/// Uploads a single already-in-memory WAV file (a whole recording, or one
+/// chunk of one) to Whisper and parses the response into
+/// `TranscriptSegment`s, with timestamps relative to the start of
+/// `audio_bytes` (i.e. not yet offset for its position in a longer
+/// recording — see `merge_chunk_segments` for that).
+async fn upload_chunk(
+    audio_bytes: Vec<u8>,
+    file_name: String,
+    api_key: &str,
+) -> Result<Vec<TranscriptSegment>, String> {
     let file_part = reqwest::multipart::Part::bytes(audio_bytes)
         .file_name(file_name)
         .mime_str("audio/wav")
@@ -74,9 +141,9 @@ pub async fn transcribe_audio(
         .text("response_format", "verbose_json")
         .part("file", file_part);
 
-    // Transcription of a full lecture recording can take a while
-    // server-side; a generous timeout avoids failing long (but
-    // within-25MB-limit) audio prematurely.
+    // Transcription of a full lecture recording (or a ~10-minute chunk of
+    // one) can take a while server-side; a generous timeout avoids failing
+    // long (but within-limit) audio prematurely.
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
     let client = reqwest::Client::new();
@@ -115,6 +182,82 @@ pub async fn transcribe_audio(
         .collect())
 }
 
+/// Offsets each chunk's Whisper-returned segment timestamps by that
+/// chunk's `start_offset_secs` (its position in the full recording) and
+/// concatenates them, in chunk order, into one merged timeline. Pure/no
+/// network — exercised directly in `chunk_merge_tests`, below.
+fn merge_chunk_segments(chunks: Vec<(Vec<TranscriptSegment>, f64)>) -> Vec<TranscriptSegment> {
+    chunks
+        .into_iter()
+        .flat_map(|(segments, offset)| {
+            segments.into_iter().map(move |segment| TranscriptSegment {
+                start: segment.start + offset,
+                end: segment.end + offset,
+                text: segment.text,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod chunk_merge_tests {
+    use super::{merge_chunk_segments, TranscriptSegment};
+
+    fn seg(start: f64, end: f64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start,
+            end,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn offsets_and_concatenates_chunks_in_order() {
+        let chunks = vec![
+            (vec![seg(0.0, 5.0, "hello"), seg(5.0, 9.5, "world")], 0.0),
+            (vec![seg(0.0, 3.0, "second"), seg(3.0, 7.2, "chunk")], 600.0),
+            (vec![seg(0.0, 2.0, "third")], 1180.0),
+        ];
+
+        let merged = merge_chunk_segments(chunks);
+
+        assert_eq!(merged.len(), 5);
+        assert_eq!(merged[0].start, 0.0);
+        assert_eq!(merged[0].end, 5.0);
+        assert_eq!(merged[1].start, 5.0);
+        assert_eq!(
+            merged[2].start, 600.0,
+            "second chunk's segments should be offset by its start_offset_secs"
+        );
+        assert_eq!(merged[2].end, 603.0);
+        assert_eq!(merged[2].text, "second");
+        assert_eq!(merged[3].text, "chunk");
+        assert_eq!(merged[3].start, 603.0);
+        assert_eq!(merged[3].end, 607.2);
+        assert_eq!(merged[4].start, 1180.0);
+        assert_eq!(merged[4].end, 1182.0);
+    }
+
+    #[test]
+    fn empty_chunk_list_produces_no_segments() {
+        assert!(merge_chunk_segments(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_chunk_with_no_segments_contributes_nothing_but_others_still_merge() {
+        let chunks = vec![
+            (vec![seg(0.0, 1.0, "a")], 0.0),
+            (Vec::new(), 60.0),
+            (vec![seg(0.0, 1.0, "b")], 120.0),
+        ];
+        let merged = merge_chunk_segments(chunks);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].start, 0.0);
+        assert_eq!(merged[1].start, 120.0);
+        assert_eq!(merged[1].text, "b");
+    }
+}
+
 /// Sets `transcript_status = 'error'` on a video row after a failed
 /// transcription attempt. Mirrors `ffmpeg.rs`'s `mark_error` (same
 /// best-effort pattern: if this update itself fails, the original error is
@@ -137,10 +280,12 @@ fn mark_error(conn: &DbConnection, video_id: &str) -> Result<(), String> {
 /// `transcript_segments` and updating `transcript_status`.
 #[tauri::command(async)]
 pub async fn transcribe_video(
+    app: AppHandle,
     conn: tauri::State<'_, DbConnection>,
     video_id: String,
+    attempt: u32,
 ) -> Result<Video, String> {
-    match run_transcription(&conn, &video_id).await {
+    match run_transcription(&app, &conn, &video_id, attempt).await {
         Ok(video) => Ok(video),
         Err(message) => {
             let _ = mark_error(&conn, &video_id);
@@ -150,8 +295,10 @@ pub async fn transcribe_video(
 }
 
 async fn run_transcription(
+    app: &AppHandle,
     conn: &tauri::State<'_, DbConnection>,
     video_id: &str,
+    attempt: u32,
 ) -> Result<Video, String> {
     let (audio_path, content_hash): (Option<String>, Option<String>) = {
         let guard = conn.0.lock().map_err(|err| err.to_string())?;
@@ -230,7 +377,7 @@ async fn run_transcription(
     } else {
         let api_key = settings::read_stored_key()?
             .ok_or_else(|| "No OpenAI API key saved — add one in Settings".to_string())?;
-        transcribe_audio(&audio_path, &api_key).await?
+        transcribe_audio(app, video_id, attempt, &audio_path, &api_key).await?
     };
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -281,15 +428,18 @@ async fn run_transcription(
 // GPT-5.5 lesson analysis (PRD §7.5)
 // ---------------------------------------------------------------------
 
-/// A single lesson-boundary suggestion returned by GPT-5.5's analysis of a
-/// video's transcript. `kind` is always one of `ALLOWED_KINDS`;
-/// `confidence` is always within `[0, 1]` — both are validated/clamped in
+/// A single lesson suggestion returned by GPT-5.5's analysis of a video's
+/// transcript. `segments` is one or more `(start, end)` ranges (in seconds)
+/// that together make up the lesson — always non-empty and each individually
+/// valid (`start < end`, within the transcript's time range); a lesson can be
+/// assembled from non-contiguous parts, and lessons may have gaps or overlap
+/// between them. `kind` is always one of `ALLOWED_KINDS`; `confidence` is
+/// always within `[0, 1]` — both are validated/clamped in
 /// `analyze_transcript` before this type is constructed, so nothing
 /// downstream needs to re-check them.
 #[derive(Debug, Clone)]
 pub struct LessonSuggestion {
-    pub start: f64,
-    pub end: f64,
+    pub segments: Vec<(f64, f64)>,
     pub title: String,
     pub summary: String,
     pub kind: String,
@@ -304,17 +454,24 @@ const ALLOWED_KINDS: &[&str] = &["lesson", "qna", "discussion", "break", "silenc
 const ANALYSIS_SYSTEM_PROMPT: &str = "You are an assistant that analyzes lecture transcripts \
 for a video editing tool, to propose lesson boundaries. You are given a transcript as a \
 sequence of timestamped segments (in seconds). Respond with a single JSON object of the exact \
-shape {\"lessons\": [{\"start\": number, \"end\": number, \"title\": string, \"summary\": \
-string, \"kind\": string, \"confidence\": number}, ...]} and nothing else — no prose, no \
-markdown fences. Cover the whole transcript by tagging each proposed segment with exactly one \
+shape {\"lessons\": [{\"segments\": [{\"start\": number, \"end\": number}, ...], \"title\": \
+string, \"summary\": string, \"kind\": string, \"confidence\": number}, ...]} and nothing else \
+— no prose, no markdown fences. Only propose lessons for material that actually belongs in one \
+— do not force coverage of the whole transcript. It is fine, and expected, for there to be gaps \
+between lessons (e.g. dead air, an off-topic tangent, or a break that doesn't deserve its own \
+entry), and it is fine for two lessons' segments to overlap where the content justifies it (for \
+example, a duplicate explanation might overlap the original it repeats). Each lesson's \
+`segments` array lists the one or more timestamp ranges that make up that lesson — most lessons \
+will have exactly one, but a lesson may be assembled from multiple non-contiguous ranges when \
+the same material is split across the transcript. Tag each proposed lesson with exactly one \
 `kind`: \"lesson\" (a coherent, teachable segment — give it a short title and a one- or \
 two-sentence summary), \"qna\" (a question-and-answer exchange), \"discussion\" (open \
 discussion or back-and-forth not structured as a single lesson), \"break\" (an off-topic break \
 or pause in instruction), \"silence\" (a long stretch with no substantive spoken content), or \
 \"duplicate\" (a segment that re-explains something already covered earlier in this same \
-transcript). `start` and `end` must be real timestamps in seconds, drawn from (or falling \
-between) the given segment boundaries, with `start` < `end`. Every suggestion must include a \
-`confidence` between 0 and 1 reflecting how sure you are about that suggestion's boundaries and \
+transcript). Each `start` and `end` must be a real timestamp in seconds, drawn from (or falling \
+between) the given segment boundaries, with `start` < `end`. Every lesson must include a \
+`confidence` between 0 and 1 reflecting how sure you are about that lesson's boundaries and \
 kind.";
 
 #[derive(serde::Deserialize)]
@@ -463,15 +620,31 @@ fn parse_lesson_suggestions(
 
     let mut suggestions = Vec::new();
     for raw in raw_lessons {
-        let (Some(start), Some(end)) = (
-            raw.get("start").and_then(value_as_f64),
-            raw.get("end").and_then(value_as_f64),
-        ) else {
+        let Some(raw_segments) = raw.get("segments").and_then(|value| value.as_array()) else {
+            // Missing/non-array `segments` means zero valid segments — drop
+            // the lesson, but this isn't an error for the whole batch.
             continue;
         };
-        // Reject suggestions whose boundaries aren't real timestamps within
-        // (a small tolerance around) the transcript's own time range.
-        if end <= start || start < transcript_start - 1.0 || end > transcript_end + 1.0 {
+
+        let mut segments = Vec::new();
+        for raw_segment in raw_segments {
+            let (Some(start), Some(end)) = (
+                raw_segment.get("start").and_then(value_as_f64),
+                raw_segment.get("end").and_then(value_as_f64),
+            ) else {
+                continue;
+            };
+            // Reject segments whose boundaries aren't real timestamps within
+            // (a small tolerance around) the transcript's own time range.
+            if end <= start || start < transcript_start - 1.0 || end > transcript_end + 1.0 {
+                continue;
+            }
+            segments.push((start, end));
+        }
+
+        // Drop the whole lesson only if every one of its segments was
+        // invalid — a partially-valid lesson keeps its valid segments.
+        if segments.is_empty() {
             continue;
         }
 
@@ -498,8 +671,7 @@ fn parse_lesson_suggestions(
             .clamp(0.0, 1.0);
 
         suggestions.push(LessonSuggestion {
-            start,
-            end,
+            segments,
             title,
             summary,
             kind,
@@ -508,6 +680,88 @@ fn parse_lesson_suggestions(
     }
 
     Ok(suggestions)
+}
+
+/// Gap-detection threshold for trimming lesson segment boundaries against
+/// dead air (`docs/ux-overhaul-plan.md`, Phase 5b / M6). Gaps between
+/// consecutive kept transcript segments longer than this are treated as
+/// silence and trimmed from the edges of any lesson segment that overlaps
+/// them.
+const SILENCE_GAP_THRESHOLD_SECS: f64 = 2.0;
+
+/// Computes dead-air gaps from `segments` — the kept transcript segments for
+/// a video, already sorted by `start` (the same ordering `analyze_video`
+/// loads them in and passes to `analyze_transcript`). For each adjacent pair,
+/// the gap between the end of one and the start of the next is reported only
+/// if it exceeds `threshold_secs`. Because `segments` only contains
+/// `keep = 1` rows to begin with, a reported gap here is either genuine
+/// silence or content the user already marked for removal — both are fair
+/// game to trim lesson boundaries toward.
+fn silence_gaps(segments: &[TranscriptSegmentRow], threshold_secs: f64) -> Vec<(f64, f64)> {
+    segments
+        .windows(2)
+        .filter_map(|pair| {
+            let (prev, next) = (&pair[0], &pair[1]);
+            let gap = next.start - prev.end;
+            (gap > threshold_secs).then_some((prev.end, next.start))
+        })
+        .collect()
+}
+
+/// Trims a single segment's own boundaries against any `gaps` that overlap
+/// them: a gap overlapping the segment's leading edge pushes `start` forward
+/// to the gap's end; a gap overlapping the trailing edge pulls `end` back to
+/// the gap's start. A gap fully inside the segment (touching neither
+/// boundary) is left alone — this trims edges, it never splits a segment
+/// into two. Returns `None` if trimming consumes the entire segment (i.e.
+/// the resulting `start >= end`), such as when a single gap covers the whole
+/// segment.
+fn trim_segment_against_gaps(segment: (f64, f64), gaps: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let (mut start, mut end) = segment;
+    for &(gap_start, gap_end) in gaps {
+        let (pre_start, pre_end) = (start, end);
+        // Leading silence: the gap overlaps the segment's current start.
+        if gap_start <= pre_start && gap_end > pre_start {
+            start = start.max(gap_end);
+        }
+        // Trailing silence: the gap overlaps the segment's current end.
+        if gap_end >= pre_end && gap_start < pre_end {
+            end = end.min(gap_start);
+        }
+    }
+    (start < end).then_some((start, end))
+}
+
+/// Applies `trim_segment_against_gaps` to every segment of every suggestion
+/// against the same `gaps` list. A segment trimmed to nothing is dropped; a
+/// suggestion is dropped entirely only if *all* of its segments were
+/// consumed by silence — mirroring `parse_lesson_suggestions`'s existing
+/// rule of dropping a lesson only when every one of its segments is invalid.
+/// Trimming happens before `replace_ai_lessons_tx` persists these segments,
+/// so whatever survives here is exactly what `lesson_segments` stores and
+/// what `LessonCard` plays back — the trim is visible in the segment list,
+/// never a silent adjustment.
+fn trim_silence_from_suggestions(
+    suggestions: Vec<LessonSuggestion>,
+    gaps: &[(f64, f64)],
+) -> Vec<LessonSuggestion> {
+    suggestions
+        .into_iter()
+        .filter_map(|suggestion| {
+            let segments: Vec<(f64, f64)> = suggestion
+                .segments
+                .iter()
+                .filter_map(|&segment| trim_segment_against_gaps(segment, gaps))
+                .collect();
+            if segments.is_empty() {
+                return None;
+            }
+            Some(LessonSuggestion {
+                segments,
+                ..suggestion
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -522,12 +776,12 @@ mod parse_lesson_suggestions_tests {
     fn keeps_valid_suggestions_and_clamps_confidence() {
         let content = serde_json::json!({
             "lessons": [
-                {"start": 0.0, "end": 10.0, "title": "Intro", "summary": "Welcome", "kind": "lesson", "confidence": 0.9},
+                {"segments": [{"start": 0.0, "end": 10.0}], "title": "Intro", "summary": "Welcome", "kind": "lesson", "confidence": 0.9},
                 // confidence out of [0,1] on both ends should be clamped, not dropped.
-                {"start": 10.0, "end": 20.0, "title": "Q&A", "summary": "", "kind": "qna", "confidence": 5.0},
-                {"start": 20.0, "end": 30.0, "title": "Silence", "summary": "", "kind": "silence", "confidence": -1.0},
+                {"segments": [{"start": 10.0, "end": 20.0}], "title": "Q&A", "summary": "", "kind": "qna", "confidence": 5.0},
+                {"segments": [{"start": 20.0, "end": 30.0}], "title": "Silence", "summary": "", "kind": "silence", "confidence": -1.0},
                 // timestamps as numeric strings should still parse.
-                {"start": "30.0", "end": "40.0", "title": "String timestamps", "summary": "", "kind": "break", "confidence": 0.4},
+                {"segments": [{"start": "30.0", "end": "40.0"}], "title": "String timestamps", "summary": "", "kind": "break", "confidence": 0.4},
             ]
         })
         .to_string();
@@ -537,16 +791,19 @@ mod parse_lesson_suggestions_tests {
         assert_eq!(suggestions.len(), 4);
         assert_eq!(suggestions[1].confidence, 1.0, "confidence > 1 should clamp to 1.0");
         assert_eq!(suggestions[2].confidence, 0.0, "confidence < 0 should clamp to 0.0");
-        assert_eq!(suggestions[3].start, 30.0, "numeric-string timestamps should parse");
-        assert_eq!(suggestions[3].end, 40.0);
+        assert_eq!(
+            suggestions[3].segments,
+            vec![(30.0, 40.0)],
+            "numeric-string timestamps should parse"
+        );
     }
 
     #[test]
     fn falls_back_to_lesson_kind_for_unrecognized_or_missing_kind() {
         let content = serde_json::json!({
             "lessons": [
-                {"start": 0.0, "end": 10.0, "title": "Weird kind", "summary": "", "kind": "made_up_category", "confidence": 0.5},
-                {"start": 10.0, "end": 20.0, "title": "No kind at all", "summary": ""},
+                {"segments": [{"start": 0.0, "end": 10.0}], "title": "Weird kind", "summary": "", "kind": "made_up_category", "confidence": 0.5},
+                {"segments": [{"start": 10.0, "end": 20.0}], "title": "No kind at all", "summary": ""},
             ]
         })
         .to_string();
@@ -563,15 +820,15 @@ mod parse_lesson_suggestions_tests {
         let content = serde_json::json!({
             "lessons": [
                 // valid, should survive.
-                {"start": 0.0, "end": 10.0, "title": "Valid", "summary": "", "kind": "lesson", "confidence": 0.8},
+                {"segments": [{"start": 0.0, "end": 10.0}], "title": "Valid", "summary": "", "kind": "lesson", "confidence": 0.8},
                 // end <= start.
-                {"start": 20.0, "end": 15.0, "title": "Backwards", "summary": "", "kind": "lesson", "confidence": 0.5},
+                {"segments": [{"start": 20.0, "end": 15.0}], "title": "Backwards", "summary": "", "kind": "lesson", "confidence": 0.5},
                 // non-numeric, non-numeric-string timestamp.
-                {"start": "not-a-number", "end": 30.0, "title": "Bad start", "summary": "", "kind": "lesson", "confidence": 0.5},
+                {"segments": [{"start": "not-a-number", "end": 30.0}], "title": "Bad start", "summary": "", "kind": "lesson", "confidence": 0.5},
                 // wildly out of the transcript's own time range.
-                {"start": 500.0, "end": 600.0, "title": "Out of range", "summary": "", "kind": "lesson", "confidence": 0.5},
-                // missing start/end entirely.
-                {"title": "No timestamps", "summary": "", "kind": "lesson", "confidence": 0.5},
+                {"segments": [{"start": 500.0, "end": 600.0}], "title": "Out of range", "summary": "", "kind": "lesson", "confidence": 0.5},
+                // missing segments entirely.
+                {"title": "No segments", "summary": "", "kind": "lesson", "confidence": 0.5},
             ]
         })
         .to_string();
@@ -579,6 +836,101 @@ mod parse_lesson_suggestions_tests {
         let suggestions = parse_lesson_suggestions(&content, START, END).unwrap();
 
         assert_eq!(suggestions.len(), 1, "only the single valid suggestion should survive");
+        assert_eq!(suggestions[0].title, "Valid");
+    }
+
+    #[test]
+    fn multi_segment_lesson_keeps_all_non_contiguous_segments() {
+        let content = serde_json::json!({
+            "lessons": [
+                {
+                    "segments": [
+                        {"start": 0.0, "end": 10.0},
+                        {"start": 50.0, "end": 60.0},
+                    ],
+                    "title": "Split lesson",
+                    "summary": "",
+                    "kind": "lesson",
+                    "confidence": 0.7,
+                },
+            ]
+        })
+        .to_string();
+
+        let suggestions = parse_lesson_suggestions(&content, START, END).unwrap();
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].segments, vec![(0.0, 10.0), (50.0, 60.0)]);
+    }
+
+    #[test]
+    fn drops_only_the_invalid_segments_of_a_partially_valid_lesson() {
+        let content = serde_json::json!({
+            "lessons": [
+                {
+                    "segments": [
+                        {"start": 0.0, "end": 10.0},
+                        // end <= start — dropped.
+                        {"start": 20.0, "end": 15.0},
+                        // out of transcript range — dropped.
+                        {"start": 500.0, "end": 600.0},
+                        {"start": 50.0, "end": 60.0},
+                    ],
+                    "title": "Partially valid",
+                    "summary": "",
+                    "kind": "lesson",
+                    "confidence": 0.6,
+                },
+            ]
+        })
+        .to_string();
+
+        let suggestions = parse_lesson_suggestions(&content, START, END).unwrap();
+
+        assert_eq!(suggestions.len(), 1, "the lesson survives since some segments are valid");
+        assert_eq!(suggestions[0].segments, vec![(0.0, 10.0), (50.0, 60.0)]);
+    }
+
+    #[test]
+    fn drops_the_whole_lesson_when_all_segments_are_invalid() {
+        let content = serde_json::json!({
+            "lessons": [
+                {
+                    "segments": [
+                        {"start": 20.0, "end": 15.0},
+                        {"start": 500.0, "end": 600.0},
+                    ],
+                    "title": "All invalid",
+                    "summary": "",
+                    "kind": "lesson",
+                    "confidence": 0.5,
+                },
+                // control: a fully valid lesson in the same batch should still survive.
+                {"segments": [{"start": 0.0, "end": 10.0}], "title": "Valid", "summary": "", "kind": "lesson", "confidence": 0.5},
+            ]
+        })
+        .to_string();
+
+        let suggestions = parse_lesson_suggestions(&content, START, END).unwrap();
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].title, "Valid");
+    }
+
+    #[test]
+    fn drops_lesson_with_missing_or_non_array_segments_key() {
+        let content = serde_json::json!({
+            "lessons": [
+                {"title": "Missing segments key", "summary": "", "kind": "lesson", "confidence": 0.5},
+                {"segments": "not an array", "title": "Segments not an array", "summary": "", "kind": "lesson", "confidence": 0.5},
+                {"segments": [{"start": 0.0, "end": 10.0}], "title": "Valid", "summary": "", "kind": "lesson", "confidence": 0.5},
+            ]
+        })
+        .to_string();
+
+        let suggestions = parse_lesson_suggestions(&content, START, END).unwrap();
+
+        assert_eq!(suggestions.len(), 1, "not an error for the batch, just dropped lessons");
         assert_eq!(suggestions[0].title, "Valid");
     }
 
@@ -601,6 +953,228 @@ mod parse_lesson_suggestions_tests {
     }
 }
 
+#[cfg(test)]
+mod silence_trimming_tests {
+    use super::{
+        silence_gaps, trim_segment_against_gaps, trim_silence_from_suggestions, LessonSuggestion,
+        TranscriptSegmentRow,
+    };
+
+    /// Minimal kept-transcript-segment fixture — only `start`/`end` matter to
+    /// `silence_gaps`.
+    fn segment(start: f64, end: f64) -> TranscriptSegmentRow {
+        TranscriptSegmentRow {
+            id: "seg".to_string(),
+            video_id: "video".to_string(),
+            start,
+            end,
+            text: "text".to_string(),
+            keep: true,
+        }
+    }
+
+    fn suggestion(segments: Vec<(f64, f64)>) -> LessonSuggestion {
+        LessonSuggestion {
+            segments,
+            title: "Lesson".to_string(),
+            summary: String::new(),
+            kind: "lesson".to_string(),
+            confidence: 0.5,
+        }
+    }
+
+    // --- silence_gaps ---
+
+    #[test]
+    fn small_gap_below_threshold_is_not_reported() {
+        let segments = vec![segment(0.0, 10.0), segment(11.0, 20.0)];
+        assert!(silence_gaps(&segments, 2.0).is_empty());
+    }
+
+    #[test]
+    fn gap_above_threshold_is_reported_with_correct_bounds() {
+        let segments = vec![segment(0.0, 10.0), segment(15.0, 20.0)];
+        assert_eq!(silence_gaps(&segments, 2.0), vec![(10.0, 15.0)]);
+    }
+
+    #[test]
+    fn multiple_gaps_are_all_found() {
+        let segments = vec![
+            segment(0.0, 10.0),
+            segment(15.0, 20.0),
+            segment(21.0, 30.0),
+            segment(40.0, 50.0),
+        ];
+        // (10,15) above threshold, (20,21) below threshold, (30,40) above threshold.
+        assert_eq!(silence_gaps(&segments, 2.0), vec![(10.0, 15.0), (30.0, 40.0)]);
+    }
+
+    #[test]
+    fn no_segments_or_single_segment_produces_no_gaps() {
+        assert!(silence_gaps(&[], 2.0).is_empty());
+        assert!(silence_gaps(&[segment(0.0, 10.0)], 2.0).is_empty());
+    }
+
+    // --- trim_segment_against_gaps ---
+
+    #[test]
+    fn start_landing_inside_a_gap_advances_to_gap_end() {
+        let trimmed = trim_segment_against_gaps((5.0, 20.0), &[(3.0, 8.0)]);
+        assert_eq!(trimmed, Some((8.0, 20.0)));
+    }
+
+    #[test]
+    fn end_landing_inside_a_gap_pulls_back_to_gap_start() {
+        let trimmed = trim_segment_against_gaps((5.0, 20.0), &[(15.0, 25.0)]);
+        assert_eq!(trimmed, Some((5.0, 15.0)));
+    }
+
+    #[test]
+    fn segment_with_no_overlapping_gap_is_unchanged() {
+        let trimmed = trim_segment_against_gaps((5.0, 20.0), &[(100.0, 110.0)]);
+        assert_eq!(trimmed, Some((5.0, 20.0)));
+    }
+
+    #[test]
+    fn segment_entirely_inside_a_gap_returns_none() {
+        let trimmed = trim_segment_against_gaps((10.0, 15.0), &[(5.0, 20.0)]);
+        assert_eq!(trimmed, None);
+    }
+
+    #[test]
+    fn interior_gap_is_left_unchanged_not_split() {
+        let trimmed = trim_segment_against_gaps((0.0, 100.0), &[(40.0, 50.0)]);
+        assert_eq!(trimmed, Some((0.0, 100.0)));
+    }
+
+    #[test]
+    fn segment_trimmed_on_both_edges_by_two_non_adjacent_gaps() {
+        // Leading gap overlaps `start`, trailing gap overlaps `end`, in one call.
+        let trimmed = trim_segment_against_gaps((0.0, 100.0), &[(-5.0, 10.0), (90.0, 105.0)]);
+        assert_eq!(trimmed, Some((10.0, 90.0)));
+
+        // Order of gaps in the slice shouldn't matter.
+        let trimmed_reversed =
+            trim_segment_against_gaps((0.0, 100.0), &[(90.0, 105.0), (-5.0, 10.0)]);
+        assert_eq!(trimmed_reversed, Some((10.0, 90.0)));
+    }
+
+    #[test]
+    fn two_adjacent_gaps_together_fully_consume_a_segment() {
+        // (5,15) trims `start` up to 15; (15,25) trims `end` down to 15 —
+        // together they swallow the segment even though neither gap alone
+        // covers the whole thing.
+        let trimmed = trim_segment_against_gaps((10.0, 20.0), &[(5.0, 15.0), (15.0, 25.0)]);
+        assert_eq!(trimmed, None);
+    }
+
+    // --- trim_silence_from_suggestions ---
+
+    #[test]
+    fn one_segment_trimmed_away_but_another_survives_keeps_the_lesson() {
+        let suggestions = vec![suggestion(vec![(10.0, 15.0), (50.0, 60.0)])];
+        // First segment is entirely inside the gap and is dropped; second
+        // segment doesn't overlap any gap and survives untouched.
+        let gaps = vec![(5.0, 20.0)];
+
+        let trimmed = trim_silence_from_suggestions(suggestions, &gaps);
+
+        assert_eq!(trimmed.len(), 1);
+        assert_eq!(trimmed[0].segments, vec![(50.0, 60.0)]);
+    }
+
+    #[test]
+    fn suggestion_with_all_segments_consumed_by_silence_is_dropped() {
+        let suggestions = vec![suggestion(vec![(10.0, 15.0), (52.0, 58.0)])];
+        let gaps = vec![(5.0, 20.0), (50.0, 60.0)];
+
+        let trimmed = trim_silence_from_suggestions(suggestions, &gaps);
+
+        assert!(trimmed.is_empty());
+    }
+
+    #[test]
+    fn suggestion_with_no_overlapping_gaps_passes_through_unchanged() {
+        let suggestions = vec![suggestion(vec![(5.0, 20.0)])];
+        let gaps = vec![(100.0, 110.0)];
+
+        let trimmed = trim_silence_from_suggestions(suggestions, &gaps);
+
+        assert_eq!(trimmed.len(), 1);
+        assert_eq!(trimmed[0].segments, vec![(5.0, 20.0)]);
+    }
+}
+
+/// Deletes `video_id`'s existing `source = 'ai'` lessons and inserts one
+/// fresh `lessons` row per `suggestion`, in the order given (`sort_order` is
+/// assigned by that order, so callers should sort `suggestions` by their
+/// minimum segment start first). Each inserted lesson also gets one
+/// `lesson_segments` row per entry in `suggestion.segments` (sorted by
+/// `start`, with `sort_order` assigned by that sorted order), and the
+/// lesson's cached `start`/`end` bounds are the min segment start / max
+/// segment end across those rows — this is a fresh INSERT-only path (the
+/// lesson doesn't exist yet), so it computes bounds and writes
+/// `lesson_segments` directly rather than going through
+/// `db::add_lesson_segment_tx`/`recompute_lesson_bounds_tx`, which assume the
+/// lesson already exists with prior segments to recompute cached bounds
+/// from. Manually created/edited lessons (`source != 'ai'`) are left
+/// untouched. Caller owns the transaction and commits it.
+fn replace_ai_lessons_tx(
+    tx: &rusqlite::Transaction<'_>,
+    video_id: &str,
+    suggestions: &[LessonSuggestion],
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM lessons WHERE video_id = ?1 AND source = 'ai'",
+        params![video_id],
+    )
+    .map_err(|err| err.to_string())?;
+
+    for (index, suggestion) in suggestions.iter().enumerate() {
+        let mut segments = suggestion.segments.clone();
+        segments.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let lesson_start = segments
+            .iter()
+            .map(|(start, _)| *start)
+            .fold(f64::INFINITY, f64::min);
+        let lesson_end = segments
+            .iter()
+            .map(|(_, end)| *end)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO lessons (id, video_id, title, summary, start, end, sort_order, confidence, kind, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ai')",
+            params![
+                id,
+                video_id,
+                suggestion.title,
+                suggestion.summary,
+                lesson_start,
+                lesson_end,
+                index as i64,
+                suggestion.confidence,
+                suggestion.kind,
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+
+        for (segment_index, (start, end)) in segments.iter().enumerate() {
+            let segment_id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO lesson_segments (id, lesson_id, start, end, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![segment_id, id, start, end, segment_index as i64],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Loads `video_id`'s kept transcript segments, sends them to GPT-5.5 via
 /// `analyze_transcript`, and replaces that video's AI-sourced lessons with
 /// the result.
@@ -613,9 +1187,13 @@ mod parse_lesson_suggestions_tests {
 /// accumulation.
 #[tauri::command(async)]
 pub async fn analyze_video(
+    app: AppHandle,
     conn: tauri::State<'_, DbConnection>,
     video_id: String,
+    attempt: u32,
 ) -> Result<Vec<LessonRow>, String> {
+    progress::emit(&app, &video_id, Stage::Analyzing, None, None, attempt);
+
     let segments: Vec<TranscriptSegmentRow> = {
         let guard = conn.0.lock().map_err(|err| err.to_string())?;
         let mut stmt = guard
@@ -654,9 +1232,30 @@ pub async fn analyze_video(
     let api_key = settings::read_stored_key()?
         .ok_or_else(|| "No OpenAI API key saved — add one in Settings".to_string())?;
 
-    let mut suggestions =
-        analyze_transcript(&segments, &api_key, instructions.as_deref()).await?;
-    suggestions.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    let suggestions = analyze_transcript(&segments, &api_key, instructions.as_deref()).await?;
+
+    // Trim lesson segment boundaries against dead air before persisting —
+    // gaps are computed from the same kept transcript segments already sent
+    // to GPT-5.5 above, so trimming stays self-consistent with what the
+    // model saw and what `parse_lesson_suggestions` validated segments
+    // against (`docs/ux-overhaul-plan.md`, M6).
+    let gaps = silence_gaps(&segments, SILENCE_GAP_THRESHOLD_SECS);
+    let mut suggestions = trim_silence_from_suggestions(suggestions, &gaps);
+    // `trim_silence_from_suggestions` (like `parse_lesson_suggestions` before
+    // it) guarantees every returned suggestion has at least one segment, so
+    // `min_start` below always has a value.
+    suggestions.sort_by(|a, b| {
+        let min_start = |suggestion: &LessonSuggestion| {
+            suggestion
+                .segments
+                .iter()
+                .map(|(start, _)| *start)
+                .fold(f64::INFINITY, f64::min)
+        };
+        min_start(a)
+            .partial_cmp(&min_start(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     {
         let mut guard = conn.0.lock().map_err(|err| err.to_string())?;
@@ -665,33 +1264,7 @@ pub async fn analyze_video(
         // — only `source = 'ai'` rows are cleared, so any future manually
         // created/edited lessons (source != 'ai') are left untouched.
         let tx = guard.transaction().map_err(|err| err.to_string())?;
-
-        tx.execute(
-            "DELETE FROM lessons WHERE video_id = ?1 AND source = 'ai'",
-            params![video_id],
-        )
-        .map_err(|err| err.to_string())?;
-
-        for (index, suggestion) in suggestions.iter().enumerate() {
-            let id = uuid::Uuid::new_v4().to_string();
-            tx.execute(
-                "INSERT INTO lessons (id, video_id, title, summary, start, end, sort_order, confidence, kind, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ai')",
-                params![
-                    id,
-                    video_id,
-                    suggestion.title,
-                    suggestion.summary,
-                    suggestion.start,
-                    suggestion.end,
-                    index as i64,
-                    suggestion.confidence,
-                    suggestion.kind,
-                ],
-            )
-            .map_err(|err| err.to_string())?;
-        }
-
+        replace_ai_lessons_tx(&tx, &video_id, &suggestions)?;
         tx.commit().map_err(|err| err.to_string())?;
     }
 
@@ -707,4 +1280,180 @@ pub async fn analyze_video(
         .map_err(|err| err.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod replace_ai_lessons_tx_tests {
+    use super::{replace_ai_lessons_tx, LessonSuggestion};
+    use rusqlite::{params, Connection};
+
+    /// In-memory DB with migrations applied plus one project/video — mirrors
+    /// `db::lesson_editing_tests::seeded_conn`'s setup style.
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        crate::db::migrate(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Test', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO videos (id, project_id, file_path, created_at, updated_at)
+             VALUES ('v1', 'p1', '/tmp/video.mp4', 't', 't')",
+            [],
+        )
+        .unwrap();
+
+        conn
+    }
+
+    fn suggestion(start: f64, end: f64, title: &str) -> LessonSuggestion {
+        multi_segment_suggestion(vec![(start, end)], title)
+    }
+
+    fn multi_segment_suggestion(segments: Vec<(f64, f64)>, title: &str) -> LessonSuggestion {
+        LessonSuggestion {
+            segments,
+            title: title.to_string(),
+            summary: String::new(),
+            kind: "lesson".to_string(),
+            confidence: 0.8,
+        }
+    }
+
+    #[test]
+    fn each_inserted_lesson_gets_exactly_one_matching_segment_row() {
+        let mut conn = seeded_conn();
+        let tx = conn.transaction().unwrap();
+
+        let suggestions = vec![
+            suggestion(0.0, 10.0, "First"),
+            suggestion(20.0, 30.0, "Second"),
+        ];
+        replace_ai_lessons_tx(&tx, "v1", &suggestions).unwrap();
+        tx.commit().unwrap();
+
+        let lesson_ids: Vec<String> = conn
+            .prepare("SELECT id FROM lessons WHERE video_id = 'v1' ORDER BY sort_order")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(lesson_ids.len(), 2, "one lesson row per suggestion");
+
+        for lesson_id in &lesson_ids {
+            let segments: Vec<(f64, f64, i64)> = conn
+                .prepare(
+                    "SELECT start, end, sort_order FROM lesson_segments WHERE lesson_id = ?1",
+                )
+                .unwrap()
+                .query_map(params![lesson_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                segments.len(),
+                1,
+                "lesson {lesson_id} should have exactly one segment"
+            );
+
+            let (segment_start, segment_end, sort_order) = segments[0];
+            let (lesson_start, lesson_end): (f64, f64) = conn
+                .query_row(
+                    "SELECT start, end FROM lessons WHERE id = ?1",
+                    params![lesson_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(segment_start, lesson_start);
+            assert_eq!(segment_end, lesson_end);
+            assert_eq!(sort_order, 0);
+        }
+    }
+
+    #[test]
+    fn rerunning_replaces_ai_lessons_and_their_segments_without_accumulating() {
+        let mut conn = seeded_conn();
+
+        {
+            let tx = conn.transaction().unwrap();
+            replace_ai_lessons_tx(&tx, "v1", &[suggestion(0.0, 10.0, "First")]).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = conn.transaction().unwrap();
+            replace_ai_lessons_tx(&tx, "v1", &[suggestion(5.0, 15.0, "Replaced")]).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let lesson_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lessons WHERE video_id = 'v1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(lesson_count, 1, "re-analysis should replace, not accumulate");
+
+        let segment_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM lesson_segments WHERE lesson_id IN (SELECT id FROM lessons WHERE video_id = 'v1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(segment_count, 1, "old segment should be gone via cascade, not left orphaned");
+    }
+
+    #[test]
+    fn multi_segment_suggestion_inserts_all_segments_sorted_with_correct_bounds() {
+        let mut conn = seeded_conn();
+        let tx = conn.transaction().unwrap();
+
+        // Segments given out of start-order on purpose, to confirm
+        // `replace_ai_lessons_tx` sorts them before assigning `sort_order`.
+        let suggestions = vec![multi_segment_suggestion(
+            vec![(50.0, 60.0), (0.0, 10.0), (20.0, 25.0)],
+            "Split lesson",
+        )];
+        replace_ai_lessons_tx(&tx, "v1", &suggestions).unwrap();
+        tx.commit().unwrap();
+
+        let lesson_id: String = conn
+            .query_row(
+                "SELECT id FROM lessons WHERE video_id = 'v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let segments: Vec<(f64, f64, i64)> = conn
+            .prepare(
+                "SELECT start, end, sort_order FROM lesson_segments WHERE lesson_id = ?1 ORDER BY sort_order",
+            )
+            .unwrap()
+            .query_map(params![lesson_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            segments,
+            vec![(0.0, 10.0, 0), (20.0, 25.0, 1), (50.0, 60.0, 2)],
+            "segments should be sorted by start with sort_order assigned in that order"
+        );
+
+        let (lesson_start, lesson_end): (f64, f64) = conn
+            .query_row(
+                "SELECT start, end FROM lessons WHERE id = ?1",
+                params![lesson_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lesson_start, 0.0, "lesson start should be the min segment start");
+        assert_eq!(lesson_end, 60.0, "lesson end should be the max segment end");
+    }
 }

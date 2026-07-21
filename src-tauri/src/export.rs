@@ -1,15 +1,22 @@
-//! Export queue (PRD §10-11, Milestone 7): SRT generation from a lesson's
-//! kept transcript segments, output-filename/collision handling, the
-//! `#[tauri::command]`s that manage `exports` rows, and the single,
-//! sequential, app-wide worker that actually runs `ffmpeg::export_lesson`
-//! (see `ffmpeg.rs` for the encode invocation itself — this module owns
-//! orchestration, not the ffmpeg subprocess details).
+//! Export queue (PRD §10-11, Milestone 7): output-filename/collision
+//! handling, the `#[tauri::command]`s that manage `exports` rows, and the
+//! single, sequential, app-wide worker that actually cuts and (for a
+//! multi-segment lesson) concatenates a lesson's `lesson_segments` into one
+//! output file via `ffmpeg::export_lesson`/`ffmpeg::concat_videos` (see
+//! `ffmpeg.rs` for the encode/concat invocations themselves — this module
+//! owns orchestration, not the ffmpeg subprocess details).
+//!
+//! Exports are video-only (MP4) — SRT export was dropped (see
+//! `docs/ux-overhaul-plan.md`'s M1: re-timing subtitle cues against a
+//! concatenated, gapped output was the riskiest silent-failure part of
+//! multi-segment export, and removing the feature was less work and less
+//! risk than getting that right).
 //!
 //! Per `coursecut-privacy-invariants`: nothing here makes a network call.
 //! It only ever reads the already-imported source video (never modified or
-//! deleted) and this video's own transcript text (already local, never
-//! sent anywhere), and writes new local output files (the exported MP4 and
-//! its paired SRT) under a user-chosen folder.
+//! deleted), and writes new local output files (the exported MP4, plus
+//! transient per-segment temp files cleaned up before/after use) under a
+//! user-chosen folder or the app's cache dir.
 //!
 //! ## Scoped pause/resume (a deliberate scope-narrowing, not an oversight)
 //!
@@ -109,86 +116,6 @@ fn query_export(conn: &Connection, id: &str) -> Result<ExportRow, String> {
 }
 
 // ---------------------------------------------------------------------
-// SRT generation (pure logic, no ffmpeg) — PRD §10.
-// ---------------------------------------------------------------------
-
-/// One clipped, re-based subtitle cue — see `lesson_srt_cues`.
-struct SrtCue {
-    start: f64,
-    end: f64,
-    text: String,
-}
-
-/// Builds the ordered set of SRT cues for a lesson from its transcript
-/// segments: only `keep = 1` segments are considered, each is clipped to
-/// `[lesson_start, lesson_end)` (a segment straddling a boundary is
-/// trimmed, not dropped or included whole; a segment entirely outside the
-/// lesson's range is dropped), and every surviving timestamp is re-based
-/// so `lesson_start` becomes `t = 0` — the exported clip's own timeline,
-/// not the source video's, since that's what the exported MP4's subtitle
-/// track needs to line up against.
-fn lesson_srt_cues(
-    segments: &[TranscriptSegmentRow],
-    lesson_start: f64,
-    lesson_end: f64,
-) -> Vec<SrtCue> {
-    let mut cues = Vec::new();
-    for segment in segments {
-        if !segment.keep {
-            continue;
-        }
-        let clipped_start = segment.start.max(lesson_start);
-        let clipped_end = segment.end.min(lesson_end);
-        if clipped_end <= clipped_start {
-            // Fully outside the lesson's range (or degenerates to zero
-            // length after clipping) — not a subtitle-worthy cue.
-            continue;
-        }
-        cues.push(SrtCue {
-            start: clipped_start - lesson_start,
-            end: clipped_end - lesson_start,
-            text: segment.text.clone(),
-        });
-    }
-    cues
-}
-
-/// `HH:MM:SS,mmm`, the SRT timestamp format. Rounds to the nearest
-/// millisecond rather than truncating, and clamps negative input to zero
-/// (shouldn't occur given `lesson_srt_cues`'s clipping, but a defensive
-/// floor here is cheap and keeps this formatter safe to call standalone).
-fn format_srt_timestamp(seconds: f64) -> String {
-    let total_ms = (seconds.max(0.0) * 1000.0).round() as i64;
-    let ms = total_ms % 1000;
-    let total_s = total_ms / 1000;
-    let s = total_s % 60;
-    let total_m = total_s / 60;
-    let m = total_m % 60;
-    let h = total_m / 60;
-    format!("{h:02}:{m:02}:{s:02},{ms:03}")
-}
-
-/// Formats a lesson's kept transcript segments as a standard SRT file
-/// (PRD §10): `index\nHH:MM:SS,mmm --> HH:MM:SS,mmm\ntext\n\n` per cue,
-/// re-based onto the exported clip's own `[0, end-start)` timeline. Pure
-/// string formatting — no ffmpeg or filesystem access here (the caller
-/// writes the result to disk).
-pub fn generate_srt(segments: &[TranscriptSegmentRow], lesson_start: f64, lesson_end: f64) -> String {
-    let cues = lesson_srt_cues(segments, lesson_start, lesson_end);
-    let mut out = String::new();
-    for (index, cue) in cues.iter().enumerate() {
-        out.push_str(&format!(
-            "{}\n{} --> {}\n{}\n\n",
-            index + 1,
-            format_srt_timestamp(cue.start),
-            format_srt_timestamp(cue.end),
-            cue.text,
-        ));
-    }
-    out
-}
-
-// ---------------------------------------------------------------------
 // Output filename derivation + collision handling.
 // ---------------------------------------------------------------------
 
@@ -221,9 +148,8 @@ fn sanitize_filename(title: &str) -> String {
 /// collide with `taken` (already-registered `exports.output_path` values,
 /// checked by the caller so two lessons queued in the same or a different
 /// batch never resolve to the same not-yet-created path) or with a file
-/// that already exists on disk (either the `.mp4` itself or its paired
-/// `.srt`) — appending `_2`, `_3`, etc. to the sanitized title until a free
-/// name is found.
+/// that already exists on disk — appending `_2`, `_3`, etc. to the
+/// sanitized title until a free name is found.
 ///
 /// This check happens once, at queue time; it does not defend against two
 /// *concurrent* `queue_export` calls racing on the filesystem (SQLite
@@ -244,8 +170,7 @@ fn unique_output_path(output_dir: &Path, title: &str, taken: &HashSet<String>) -
         };
         let candidate = output_dir.join(format!("{stem}.mp4"));
         let candidate_str = candidate.to_string_lossy().to_string();
-        let srt_candidate = candidate.with_extension("srt");
-        if !taken.contains(&candidate_str) && !candidate.exists() && !srt_candidate.exists() {
+        if !taken.contains(&candidate_str) && !candidate.exists() {
             return candidate;
         }
         suffix += 1;
@@ -517,6 +442,32 @@ pub fn list_exports(
         .map_err(|err| err.to_string())
 }
 
+/// Reveals an exported file in the OS file manager (Finder on macOS,
+/// Explorer on Windows — the only two target platforms, see
+/// `CLAUDE.md`/PRD "Platform"). Shells out directly with a hardcoded
+/// binary name rather than going through `tauri_plugin_shell` (whose ACL
+/// in `capabilities/default.json` only allow-lists the ffmpeg/ffprobe
+/// sidecars) — `path` is the only caller-controlled part, same trust
+/// level as an ffmpeg argument already has.
+#[tauri::command]
+pub fn reveal_in_folder(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path])
+            .spawn()
+            .map_err(|err| format!("could not reveal {path}: {err}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .args([format!("/select,{path}")])
+            .spawn()
+            .map_err(|err| format!("could not reveal {path}: {err}"))?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Startup crash recovery.
 // ---------------------------------------------------------------------
@@ -538,7 +489,17 @@ pub fn list_exports(
 /// best-effort deleted first (same non-fatal cleanup convention as
 /// `finalize`'s cancellation path) — an interrupted encode's output isn't a
 /// valid video, and leaving it in place would look like a real export.
-pub fn reconcile_interrupted_exports(conn: &Connection) -> Result<(), String> {
+///
+/// Also best-effort removes the whole `export_tmp` scratch directory (see
+/// `segment_temp_dir_path`) under `cache_dir`: a multi-segment export's
+/// per-segment cut files live there only for the duration of one job, and
+/// `do_export`/`finalize` already clean them up on every in-process return
+/// path (success, failure, or a cancel) — but a whole-app crash mid-job
+/// skips all of that, since nothing runs. Since only one export ever runs
+/// at a time, anything found under `export_tmp` at startup is unconditionally
+/// orphaned from a previous session, so this doesn't need per-job
+/// bookkeeping — the entire directory is safe to remove wholesale.
+pub fn reconcile_interrupted_exports(conn: &Connection, cache_dir: &Path) -> Result<(), String> {
     let mut stmt = conn
         .prepare("SELECT id, output_path FROM exports WHERE status = 'running'")
         .map_err(|err| err.to_string())?;
@@ -551,7 +512,6 @@ pub fn reconcile_interrupted_exports(conn: &Connection) -> Result<(), String> {
 
     for (id, output_path) in interrupted {
         let _ = std::fs::remove_file(&output_path);
-        let _ = std::fs::remove_file(Path::new(&output_path).with_extension("srt"));
         conn.execute(
             "UPDATE exports SET status = 'failed', progress = 0, error = ?1 WHERE id = ?2",
             params![
@@ -561,6 +521,8 @@ pub fn reconcile_interrupted_exports(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|err| err.to_string())?;
     }
+
+    let _ = std::fs::remove_dir_all(cache_dir.join("export_tmp"));
 
     Ok(())
 }
@@ -590,23 +552,33 @@ impl Default for ExportRunning {
     }
 }
 
+/// One segment of a lesson being exported, in `sort_order`. Just the bounds
+/// — `id`/`lesson_id` aren't needed once the segments are loaded in order.
+struct SegmentBounds {
+    start: f64,
+    end: f64,
+}
+
 /// The oldest still-`queued` export, joined with just enough of its
-/// `lessons`/`videos` ancestry to actually run it.
+/// `lessons`/`videos` ancestry to actually run it. `segments` is the
+/// lesson's actual `lesson_segments` rows, in playback order — **not**
+/// `lessons.start`/`.end`, which for a non-contiguous lesson is only a
+/// cached derived bound (min start, max end) and would re-include exactly
+/// the gaps the user excluded if used to cut a single span.
 struct PendingExport {
     id: String,
     lesson_id: String,
     output_path: String,
     video_path: String,
-    start: f64,
-    end: f64,
+    segments: Vec<SegmentBounds>,
 }
 
 fn next_queued_export(app: &AppHandle) -> Result<Option<PendingExport>, String> {
     let conn = app.state::<DbConnection>();
     let guard = conn.0.lock().map_err(|err| err.to_string())?;
-    guard
+    let base: Option<(String, String, String, String)> = guard
         .query_row(
-            "SELECT e.id, e.lesson_id, e.output_path, v.file_path, l.start, l.end
+            "SELECT e.id, e.lesson_id, e.output_path, v.file_path
              FROM exports e
              JOIN lessons l ON l.id = e.lesson_id
              JOIN videos v ON v.id = l.video_id
@@ -615,18 +587,48 @@ fn next_queued_export(app: &AppHandle) -> Result<Option<PendingExport>, String> 
              LIMIT 1",
             [],
             |row| {
-                Ok(PendingExport {
-                    id: row.get(0)?,
-                    lesson_id: row.get(1)?,
-                    output_path: row.get(2)?,
-                    video_path: row.get(3)?,
-                    start: row.get(4)?,
-                    end: row.get(5)?,
-                })
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
             },
         )
         .optional()
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+
+    let Some((id, lesson_id, output_path, video_path)) = base else {
+        return Ok(None);
+    };
+
+    // Same query `db::list_lesson_segments` runs, ordered by playback
+    // order — this is what actually gets cut, not the lesson's cached
+    // start/end bound.
+    let mut stmt = guard
+        .prepare(
+            "SELECT start, end FROM lesson_segments
+             WHERE lesson_id = ?1 ORDER BY sort_order, id",
+        )
+        .map_err(|err| err.to_string())?;
+    let segments: Vec<SegmentBounds> = stmt
+        .query_map(params![lesson_id], |row| {
+            Ok(SegmentBounds {
+                start: row.get(0)?,
+                end: row.get(1)?,
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    Ok(Some(PendingExport {
+        id,
+        lesson_id,
+        output_path,
+        video_path,
+        segments,
+    }))
 }
 
 /// Atomically claims `id` for running: `queued` -> `running`, guarded by
@@ -661,6 +663,11 @@ fn set_progress(app: &AppHandle, id: &str, fraction: f64) {
     );
 }
 
+/// Currently unused now that SRT export (its only consumer) is gone — kept
+/// rather than deleted since it's the one place that already knows how to
+/// load a lesson's *kept* transcript segments, which a later milestone
+/// (silence trimming, PRD ux-overhaul-plan M6) is expected to need again.
+#[allow(dead_code)]
 fn load_kept_segments(app: &AppHandle, lesson_id: &str) -> Result<Vec<TranscriptSegmentRow>, String> {
     let conn = app.state::<DbConnection>();
     let guard = conn.0.lock().map_err(|err| err.to_string())?;
@@ -687,57 +694,224 @@ fn load_kept_segments(app: &AppHandle, lesson_id: &str) -> Result<Vec<Transcript
         .map_err(|err| err.to_string())
 }
 
-/// Runs the encode + writes the paired SRT for one export job. The SRT is
-/// written only after a successful encode, so a failed job never leaves an
-/// orphaned `.srt` sitting next to a missing `.mp4`.
-async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
-    let segments = load_kept_segments(app, &job.lesson_id)?;
+/// Path (not necessarily existing) of the scratch directory used for one
+/// export job's per-segment cut files, under the app's cache dir — same
+/// convention as `ffmpeg.rs`'s `audio_cache_dir`, but per-job rather than
+/// content-hash-keyed, since nothing here is meant to persist or be reused.
+fn segment_temp_dir_path(app: &AppHandle, job_id: &str) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_cache_dir()
+        .map_err(|err| format!("could not resolve app cache dir: {err}"))?
+        .join("export_tmp")
+        .join(job_id))
+}
 
-    let app_for_register = app.clone();
-    let id_for_register = job.id.clone();
-    let register_child = move |child: CommandChild| {
-        let running = app_for_register.state::<ExportRunning>();
-        if let Ok(mut map) = running.0.lock() {
-            map.insert(id_for_register.clone(), child);
-        };
-    };
+/// `segment_temp_dir_path`, created if it doesn't already exist. The caller
+/// (`do_export`) removes it again once its segment files are concatenated
+/// (or on failure/cancellation).
+fn segment_temp_dir(app: &AppHandle, job_id: &str) -> Result<PathBuf, String> {
+    let dir = segment_temp_dir_path(app, job_id)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("could not create export temp dir: {err}"))?;
+    Ok(dir)
+}
 
-    let app_for_progress = app.clone();
-    let id_for_progress = job.id.clone();
-    let on_progress = move |fraction: f64| {
-        set_progress(&app_for_progress, &id_for_progress, fraction);
-    };
+/// Best-effort removal of `paths` and then `dir` itself (only succeeds once
+/// empty) — never fails the caller, since this only ever cleans up this
+/// pipeline's own transient files.
+fn cleanup_segment_temp_files(dir: &Path, paths: &[String]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(dir);
+}
 
-    let encode_result = crate::ffmpeg::export_lesson(
-        app,
-        &job.video_path,
-        job.start,
-        job.end,
-        &job.output_path,
-        register_child,
-        on_progress,
-    )
-    .await;
-
-    // The child is gone either way (finished, errored, or killed) — drop
-    // its registry entry so a stale `cancel_export` call can't try to kill
-    // an already-gone process (and so the next job's registration isn't
-    // shadowed by a leftover entry under a different id — harmless since
-    // it's keyed by id, but this keeps the map from growing unbounded).
-    {
+/// A fresh `register_child` closure for one ffmpeg spawn — a new one is
+/// needed per spawn (a multi-segment export spawns ffmpeg once per segment
+/// plus once for the final concat) since each is consumed by value.
+/// Registering again under the same job id simply overwrites the previous
+/// (already-finished) entry, so `cancel_export` always finds whichever
+/// child is actually running right now.
+fn register_child_closure(app: &AppHandle, job_id: &str) -> impl FnMut(CommandChild) + Send {
+    let app = app.clone();
+    let job_id = job_id.to_string();
+    move |child: CommandChild| {
         let running = app.state::<ExportRunning>();
         if let Ok(mut map) = running.0.lock() {
-            map.remove(&job.id);
+            map.insert(job_id.clone(), child);
         };
     }
+}
 
-    encode_result?;
+/// The child is gone either way (finished, errored, or killed) — drop its
+/// registry entry so a stale `cancel_export` call can't try to kill an
+/// already-gone process.
+fn deregister_child(app: &AppHandle, job_id: &str) {
+    let running = app.state::<ExportRunning>();
+    if let Ok(mut map) = running.0.lock() {
+        map.remove(job_id);
+    };
+}
 
-    let srt = generate_srt(&segments, job.start, job.end);
-    let srt_path = Path::new(&job.output_path).with_extension("srt");
-    std::fs::write(&srt_path, srt).map_err(|err| format!("could not write SRT file: {err}"))?;
+/// Whether `job_id`'s row has already been flipped to `cancelled` (by
+/// `cancel_export`, which only kills whatever ffmpeg child is registered
+/// *right now*) — checked between segments and before the final concat step
+/// in a multi-segment export, since a cancel that lands in the gap between
+/// one segment's process exiting and the next one spawning would otherwise
+/// go unnoticed until the whole job finishes (every remaining segment plus
+/// the concat would still run to completion before `finalize` ever saw the
+/// cancelled status). Defaults to "not cancelled" if the row can't be read,
+/// so a transient lock/query failure never blocks a job that wasn't
+/// actually cancelled.
+fn is_cancelled(app: &AppHandle, job_id: &str) -> bool {
+    let conn = app.state::<DbConnection>();
+    let Ok(guard) = conn.0.lock() else { return false };
+    guard
+        .query_row(
+            "SELECT status FROM exports WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|status| status == "cancelled")
+        .unwrap_or(false)
+}
 
-    Ok(())
+/// A fresh `on_progress` closure for one segment's own `export_lesson` call,
+/// rescaling that segment's own `[0, 1]` fraction into the job's overall
+/// `[0, 1]` progress: `elapsed` is the summed duration of segments already
+/// finished, `segment_duration` is this segment's own duration, and `total`
+/// is the summed duration across every segment in the job. A
+/// segment-count-only weighting (`(index + fraction) / segment_count`)
+/// would be simpler but skews badly when segments have very different
+/// lengths; duration-weighting is barely more code and much more honest
+/// about how much of the job is actually left.
+fn progress_closure(
+    app: &AppHandle,
+    job_id: &str,
+    elapsed: f64,
+    segment_duration: f64,
+    total: f64,
+) -> impl FnMut(f64) + Send {
+    let app = app.clone();
+    let job_id = job_id.to_string();
+    move |fraction: f64| {
+        let overall = if total > 0.0 {
+            (elapsed + fraction * segment_duration) / total
+        } else {
+            fraction
+        };
+        set_progress(&app, &job_id, overall);
+    }
+}
+
+/// Runs the encode for one export job: cuts every one of the lesson's
+/// segments (in order) and, for a multi-segment lesson, concatenates them
+/// into a single output file (PRD decision, `docs/ux-overhaul-plan.md` M1 —
+/// a multi-segment lesson exports as one concatenated video, not one file
+/// per segment).
+///
+/// A single-segment lesson (the common case — one segment per lesson unless
+/// the user has explicitly built a multi-segment one) takes a fast path:
+/// `export_lesson` cuts straight to `job.output_path`, with no intermediate
+/// temp file and no concat step, so it produces exactly the same output as
+/// before multi-segment export existed (no extra re-mux/quality loss).
+///
+/// A multi-segment lesson cuts each segment to its own temp file under
+/// `segment_temp_dir`, then concatenates them via
+/// `ffmpeg::concat_videos` (safe as a stream-copy concat, since every temp
+/// file was just encoded by the same `export_lesson`/libx264/aac settings).
+/// Temp files (and their directory) are removed once the concat succeeds,
+/// and also on a mid-job failure/cancellation — the loop below cleans up
+/// whatever was cut so far before returning `Err`, so a failed or cancelled
+/// multi-segment export never leaves stray per-segment files behind.
+async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
+    if job.segments.is_empty() {
+        return Err(format!(
+            "lesson {} has no segments to export",
+            job.lesson_id
+        ));
+    }
+
+    if job.segments.len() == 1 {
+        let segment = &job.segments[0];
+        let register_child = register_child_closure(app, &job.id);
+        let on_progress = progress_closure(app, &job.id, 0.0, 1.0, 1.0);
+        let result = crate::ffmpeg::export_lesson(
+            app,
+            &job.video_path,
+            segment.start,
+            segment.end,
+            &job.output_path,
+            register_child,
+            on_progress,
+        )
+        .await;
+        deregister_child(app, &job.id);
+        return result;
+    }
+
+    let total_duration: f64 = job
+        .segments
+        .iter()
+        .map(|segment| (segment.end - segment.start).max(0.0))
+        .sum();
+    let temp_dir = segment_temp_dir(app, &job.id)?;
+    let mut temp_paths: Vec<String> = Vec::new();
+    let mut elapsed = 0.0;
+
+    for (index, segment) in job.segments.iter().enumerate() {
+        if is_cancelled(app, &job.id) {
+            cleanup_segment_temp_files(&temp_dir, &temp_paths);
+            return Err("export cancelled".to_string());
+        }
+
+        let temp_path = temp_dir.join(format!("segment-{index}.mp4"));
+        let Some(temp_path_str) = temp_path.to_str().map(str::to_string) else {
+            cleanup_segment_temp_files(&temp_dir, &temp_paths);
+            return Err("segment temp path is not valid UTF-8".to_string());
+        };
+        let segment_duration = (segment.end - segment.start).max(0.0);
+        let register_child = register_child_closure(app, &job.id);
+        let on_progress = progress_closure(app, &job.id, elapsed, segment_duration, total_duration);
+
+        let result = crate::ffmpeg::export_lesson(
+            app,
+            &job.video_path,
+            segment.start,
+            segment.end,
+            &temp_path_str,
+            register_child,
+            on_progress,
+        )
+        .await;
+        deregister_child(app, &job.id);
+
+        if let Err(err) = result {
+            // This segment's own (possibly partial) temp file too, not just
+            // the ones from prior segments.
+            let _ = std::fs::remove_file(&temp_path_str);
+            cleanup_segment_temp_files(&temp_dir, &temp_paths);
+            return Err(err);
+        }
+
+        temp_paths.push(temp_path_str);
+        elapsed += segment_duration;
+    }
+
+    if is_cancelled(app, &job.id) {
+        cleanup_segment_temp_files(&temp_dir, &temp_paths);
+        return Err("export cancelled".to_string());
+    }
+
+    let register_child = register_child_closure(app, &job.id);
+    let concat_result =
+        crate::ffmpeg::concat_videos(app, &temp_paths, &job.output_path, register_child).await;
+    deregister_child(app, &job.id);
+
+    cleanup_segment_temp_files(&temp_dir, &temp_paths);
+
+    concat_result
 }
 
 /// Writes the final status for a finished job, unless `cancel_export`
@@ -746,7 +920,11 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
 /// non-zero/signal exit, which would otherwise look like a genuine
 /// `failed`), and any partially-written output is best-effort cleaned up.
 /// This only ever removes files this export pipeline itself wrote — the
-/// source video is never touched.
+/// source video is never touched. `do_export` already cleans up its own
+/// per-segment temp files on every return path (including a cancellation
+/// mid-job), so there's normally nothing left under `segment_temp_dir` by
+/// the time this runs — the removal here is a defensive backstop, not the
+/// primary cleanup path.
 fn finalize(app: &AppHandle, job: &PendingExport, result: Result<(), String>) {
     let conn = app.state::<DbConnection>();
     let Ok(guard) = conn.0.lock() else { return };
@@ -762,7 +940,9 @@ fn finalize(app: &AppHandle, job: &PendingExport, result: Result<(), String>) {
 
     if current_status == "cancelled" {
         let _ = std::fs::remove_file(&job.output_path);
-        let _ = std::fs::remove_file(Path::new(&job.output_path).with_extension("srt"));
+        if let Ok(temp_dir) = segment_temp_dir_path(app, &job.id) {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
         return;
     }
 
@@ -831,94 +1011,6 @@ pub fn spawn_worker(app: AppHandle) {
             }
         }
     });
-}
-
-#[cfg(test)]
-mod srt_tests {
-    use super::*;
-
-    fn segment(start: f64, end: f64, text: &str, keep: bool) -> TranscriptSegmentRow {
-        TranscriptSegmentRow {
-            id: format!("{start}-{end}"),
-            video_id: "v1".to_string(),
-            start,
-            end,
-            text: text.to_string(),
-            keep,
-        }
-    }
-
-    #[test]
-    fn segment_fully_inside_lesson_is_kept_as_is_after_rebasing() {
-        let segments = vec![segment(12.0, 15.0, "Hello there", true)];
-        let srt = generate_srt(&segments, 10.0, 20.0);
-        assert_eq!(
-            srt,
-            "1\n00:00:02,000 --> 00:00:05,000\nHello there\n\n"
-        );
-    }
-
-    #[test]
-    fn segment_straddling_a_boundary_is_clipped_not_dropped_or_included_whole() {
-        // Lesson is [10, 20). This segment runs from 18 to 25, straddling
-        // the lesson's end boundary — it should be clipped to [18, 20),
-        // not dropped entirely and not kept at its full [18, 25) extent.
-        let segments = vec![segment(18.0, 25.0, "Straddles the end", true)];
-        let srt = generate_srt(&segments, 10.0, 20.0);
-        // Re-based: 18-10=8, clipped end 20-10=10.
-        assert_eq!(
-            srt,
-            "1\n00:00:08,000 --> 00:00:10,000\nStraddles the end\n\n"
-        );
-    }
-
-    #[test]
-    fn keep_false_segment_is_excluded() {
-        let segments = vec![
-            segment(11.0, 12.0, "Kept", true),
-            segment(12.0, 13.0, "Deleted by the user", false),
-        ];
-        let srt = generate_srt(&segments, 10.0, 20.0);
-        assert!(!srt.contains("Deleted by the user"));
-        assert!(srt.contains("Kept"));
-        // Only one cue, numbered 1 (not 2, since the excluded segment
-        // doesn't consume a cue index).
-        assert!(srt.starts_with("1\n"));
-    }
-
-    #[test]
-    fn timestamps_are_rebased_relative_to_lesson_start() {
-        // A segment starting at the source video's t=45s, inside a lesson
-        // that starts at t=40s, should appear at t=5s in the SRT — the
-        // exported clip's own timeline, not the source video's.
-        let segments = vec![segment(45.0, 47.5, "Five seconds in", true)];
-        let srt = generate_srt(&segments, 40.0, 60.0);
-        assert_eq!(
-            srt,
-            "1\n00:00:05,000 --> 00:00:07,500\nFive seconds in\n\n"
-        );
-    }
-
-    #[test]
-    fn segment_entirely_outside_the_lesson_range_is_dropped() {
-        let segments = vec![segment(0.0, 5.0, "Before the lesson", true)];
-        let srt = generate_srt(&segments, 10.0, 20.0);
-        assert_eq!(srt, "");
-    }
-
-    #[test]
-    fn multiple_cues_are_numbered_in_order() {
-        let segments = vec![
-            segment(10.0, 12.0, "First", true),
-            segment(12.0, 14.0, "Second", true),
-        ];
-        let srt = generate_srt(&segments, 10.0, 20.0);
-        assert_eq!(
-            srt,
-            "1\n00:00:00,000 --> 00:00:02,000\nFirst\n\n\
-             2\n00:00:02,000 --> 00:00:04,000\nSecond\n\n"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1006,9 +1098,7 @@ mod reconcile_tests {
         let dir = std::env::temp_dir().join(format!("coursecut-reconcile-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let output_path = dir.join("Lesson.mp4");
-        let srt_path = dir.join("Lesson.srt");
         std::fs::write(&output_path, b"partial, interrupted mp4 bytes").unwrap();
-        std::fs::write(&srt_path, b"partial srt").unwrap();
 
         conn.execute(
             "INSERT INTO exports (id, lesson_id, output_path, status, created_at, progress, error)
@@ -1017,7 +1107,17 @@ mod reconcile_tests {
         )
         .unwrap();
 
-        reconcile_interrupted_exports(&conn).unwrap();
+        // An orphaned per-segment scratch dir left behind by a whole-app
+        // crash mid multi-segment-export in a previous session — nothing in
+        // `do_export`/`finalize` ever runs to clean this up when the app
+        // itself is what died, so `reconcile_interrupted_exports` is the
+        // only place left that can sweep it.
+        let cache_dir = std::env::temp_dir().join(format!("coursecut-reconcile-cache-{}", uuid::Uuid::new_v4()));
+        let orphaned_temp_dir = cache_dir.join("export_tmp").join("e1");
+        std::fs::create_dir_all(&orphaned_temp_dir).unwrap();
+        std::fs::write(orphaned_temp_dir.join("segment-0.mp4"), b"orphaned segment bytes").unwrap();
+
+        reconcile_interrupted_exports(&conn, &cache_dir).unwrap();
 
         let (status, progress, error): (String, f64, Option<String>) = conn
             .query_row(
@@ -1031,9 +1131,13 @@ mod reconcile_tests {
         assert!(error.unwrap().contains("interrupted"));
 
         assert!(!output_path.exists(), "partial output file should be deleted");
-        assert!(!srt_path.exists(), "partial srt file should be deleted");
+        assert!(
+            !cache_dir.join("export_tmp").exists(),
+            "orphaned export_tmp scratch directory should be swept on startup"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[test]
@@ -1046,7 +1150,8 @@ mod reconcile_tests {
         )
         .unwrap();
 
-        reconcile_interrupted_exports(&conn).unwrap();
+        let cache_dir = std::env::temp_dir().join(format!("coursecut-reconcile-cache-{}", uuid::Uuid::new_v4()));
+        reconcile_interrupted_exports(&conn, &cache_dir).unwrap();
 
         let status: String = conn
             .query_row("SELECT status FROM exports WHERE id = 'e2'", [], |row| row.get(0))

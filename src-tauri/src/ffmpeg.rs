@@ -18,6 +18,7 @@ use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
 use crate::db::{self, DbConnection, Video};
+use crate::progress::{self, Stage};
 
 /// Directory extracted audio is cached in, keyed by content hash:
 /// `<app_cache_dir>/audio/<hash>.wav`. Created on first use.
@@ -154,6 +155,7 @@ pub async fn extract_audio_for_video(
     app: AppHandle,
     conn: tauri::State<'_, DbConnection>,
     video_id: String,
+    attempt: u32,
 ) -> Result<Video, String> {
     let file_path = {
         let guard = conn.0.lock().map_err(|err| err.to_string())?;
@@ -171,7 +173,7 @@ pub async fn extract_audio_for_video(
             })?
     };
 
-    match run_extraction(&app, &conn, &video_id, &file_path).await {
+    match run_extraction(&app, &conn, &video_id, &file_path, attempt).await {
         Ok(video) => Ok(video),
         Err(message) => {
             // Best-effort status update; the extraction error is what the
@@ -187,6 +189,7 @@ async fn run_extraction(
     conn: &tauri::State<'_, DbConnection>,
     video_id: &str,
     file_path: &str,
+    attempt: u32,
 ) -> Result<Video, String> {
     // Hashing a multi-gigabyte lecture file is I/O-bound and synchronous;
     // run it on a blocking-pool thread so it doesn't stall the async
@@ -220,6 +223,10 @@ async fn run_extraction(
                 .to_str()
                 .ok_or_else(|| "audio cache path is not valid UTF-8".to_string())?
                 .to_string();
+            // Indeterminate for this milestone — parsing ffmpeg's own
+            // `-progress` output into a real fraction here is future work
+            // (see `docs/ux-overhaul-plan.md`'s Phase 2).
+            progress::emit(app, video_id, Stage::ExtractingAudio, None, None, attempt);
             extract_audio(app, file_path, &output_path_str).await?;
             (output_path_str, Some(duration))
         }
@@ -381,5 +388,116 @@ pub async fn export_lesson(
     }
 
     Err("ffmpeg process ended without reporting a result".to_string())
+}
+
+/// Concatenates `input_paths`, in order, into `output_path` via ffmpeg's
+/// concat demuxer with stream copy (`-f concat -safe 0 -i <list> -c copy`)
+/// — safe here specifically because every input is expected to have just
+/// been produced by `export_lesson` above with the same `libx264`/`aac`
+/// settings, so no re-encode is needed to join them (re-encoding a
+/// concatenation nobody asked for would be strictly worse: slower, and a
+/// second lossy re-encode of already-encoded frames).
+///
+/// Used by `export.rs`'s multi-segment export path: each of a lesson's
+/// segments is cut to its own temp file with `export_lesson`, then those
+/// temp files are joined into the lesson's single output file here (PRD
+/// decision: a multi-segment lesson exports as one concatenated video, not
+/// one file per segment).
+///
+/// The concat demuxer reads its input list from a file, not CLI args, so
+/// this writes one to the system temp dir first and removes it again once
+/// ffmpeg exits, regardless of outcome.
+///
+/// `register_child` follows the same one-shot-after-spawn contract as
+/// `export_lesson`'s: the caller uses it to record this `CommandChild` so
+/// `cancel_export` can find and kill it if the user cancels mid-concat.
+pub async fn concat_videos(
+    app: &AppHandle,
+    input_paths: &[String],
+    output_path: &str,
+    mut register_child: impl FnMut(CommandChild) + Send,
+) -> Result<(), String> {
+    let list_path = std::env::temp_dir().join(format!("coursecut-concat-{}.txt", uuid::Uuid::new_v4()));
+    let mut list_contents = String::new();
+    for path in input_paths {
+        // The concat demuxer parses each `file` line as a single-quoted
+        // string; escape any literal `'` in the path per its documented
+        // convention (close the quote, escaped literal quote, reopen).
+        let escaped = path.replace('\'', "'\\''");
+        list_contents.push_str(&format!("file '{escaped}'\n"));
+    }
+    std::fs::write(&list_path, &list_contents)
+        .map_err(|err| format!("could not write ffmpeg concat filelist: {err}"))?;
+
+    let args: Vec<String> = vec![
+        "-y".to_string(),
+        "-f".to_string(),
+        "concat".to_string(),
+        "-safe".to_string(),
+        "0".to_string(),
+        "-i".to_string(),
+        list_path.to_string_lossy().to_string(),
+        "-c".to_string(),
+        "copy".to_string(),
+        output_path.to_string(),
+    ];
+
+    let spawn_result = app
+        .shell()
+        .sidecar("ffmpeg")
+        .map_err(|err| format!("could not resolve ffmpeg sidecar: {err}"))
+        .and_then(|cmd| {
+            cmd.args(args)
+                .spawn()
+                .map_err(|err| format!("could not spawn ffmpeg: {err}"))
+        });
+
+    let (mut rx, child) = match spawn_result {
+        Ok(pair) => pair,
+        Err(err) => {
+            let _ = std::fs::remove_file(&list_path);
+            return Err(err);
+        }
+    };
+    register_child(child);
+
+    // Same bounded stderr-tail convention as `export_lesson`, for a useful
+    // error message without holding a whole log in memory.
+    let mut stderr_tail = String::new();
+    const MAX_STDERR_TAIL: usize = 4000;
+
+    let result = loop {
+        match rx.recv().await {
+            Some(CommandEvent::Stderr(bytes)) => {
+                if let Ok(line) = String::from_utf8(bytes) {
+                    stderr_tail.push_str(&line);
+                    stderr_tail.push('\n');
+                    if stderr_tail.len() > MAX_STDERR_TAIL {
+                        let cut = stderr_tail.len() - MAX_STDERR_TAIL;
+                        stderr_tail = stderr_tail[cut..].to_string();
+                    }
+                }
+            }
+            Some(CommandEvent::Error(err)) => {
+                break Err(format!("ffmpeg process error: {err}"));
+            }
+            Some(CommandEvent::Terminated(payload)) => {
+                if payload.code == Some(0) {
+                    break Ok(());
+                }
+                break Err(format!(
+                    "ffmpeg exited with code {:?} (signal {:?}): {}",
+                    payload.code,
+                    payload.signal,
+                    stderr_tail.trim()
+                ));
+            }
+            Some(_) => continue,
+            None => break Err("ffmpeg process ended without reporting a result".to_string()),
+        }
+    };
+
+    let _ = std::fs::remove_file(&list_path);
+    result
 }
 

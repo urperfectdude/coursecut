@@ -1,39 +1,45 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import Breadcrumbs from "../components/Breadcrumbs";
 import {
-  analyzeVideo,
   deleteVideo,
   extractAudioForVideo,
+  getOpenAiKeyStatus,
   getProject,
   importVideos,
-  listLessons,
-  listTranscriptSegments,
   listVideos,
+  markVideoError,
   SUPPORTED_VIDEO_EXTENSIONS,
   transcribeVideo,
-  type Lesson,
   type Project,
-  type TranscriptSegment,
   type Video,
+  type VideoProgress,
 } from "../db";
+import { useVideoProgress } from "../hooks/useVideoProgress";
+
+const NO_KEY_MESSAGE =
+  "No OpenAI API key saved yet — add one in Settings, then use Retry to transcribe this video.";
 
 /** Statuses that mean "not yet transcribed" — anything else (transcribed,
- * and any later status future milestones add) can show the transcript
- * toggle. */
+ * and any later status future milestones add) can open the video's staged
+ * flow (M3: `TranscriptStageView`/`LessonEditorView` via `onOpenVideo`). */
 const PRE_TRANSCRIPT_STATUSES = new Set(["pending", "audio_ready", "error"]);
 
 interface ProjectDetailViewProps {
   projectId: string;
   onBack: () => void;
-  onOpenEditor: (videoId: string) => void;
+  // Opens this video's staged flow (docs/ux-overhaul-plan.md Phase 3),
+  // always landing on the transcript stage first.
+  onOpenVideo: (videoId: string) => void;
   // Navigates to this project's Export History (PRD §11, Milestone 8).
   onOpenExportHistory: () => void;
 }
 
 /** Last path component, handling both `/` (macOS) and `\` (Windows).
- * Exported so `ExportHistoryView` (PRD §11, Milestone 8) can reuse it
- * instead of re-implementing path-splitting differently. */
+ * Exported so `ExportHistoryView` (PRD §11, Milestone 8) and the video-stage
+ * views (M3) can reuse it instead of re-implementing path-splitting
+ * differently. */
 export function basename(path: string): string {
   const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return index === -1 ? path : path.slice(index + 1);
@@ -48,6 +54,21 @@ export function basename(path: string): string {
 export function dirname(path: string): string {
   const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return index === -1 ? path : path.slice(0, index);
+}
+
+/** Friendly label for a `Stage` value (`src-tauri/src/progress.rs`), for the
+ * throwaway per-row progress indicator below — M3 replaces this row-level
+ * display with the staged flow's own indicators, so this stays local to
+ * this file rather than a shared formatter. */
+function stageLabel(stage: VideoProgress["stage"]): string {
+  switch (stage) {
+    case "ExtractingAudio":
+      return "Extracting audio";
+    case "Transcribing":
+      return "Transcribing";
+    case "Analyzing":
+      return "Analyzing";
+  }
 }
 
 /** Seconds → `m:ss` / `h:mm:ss`. Duration is probed later, so most rows
@@ -66,7 +87,7 @@ export function formatDuration(seconds: number | null): string {
 export default function ProjectDetailView({
   projectId,
   onBack,
-  onOpenEditor,
+  onOpenVideo,
   onOpenExportHistory,
 }: ProjectDetailViewProps) {
   const [project, setProject] = useState<Project | null>(null);
@@ -80,27 +101,6 @@ export default function ProjectDetailView({
   // instead of the page-level `error` banner above — one bad video
   // shouldn't read as a whole-page failure.
   const [videoErrors, setVideoErrors] = useState<Record<string, string>>({});
-  // Which video's transcript panel is expanded, plus its loaded segments —
-  // only one at a time (read-only preview; editing arrives in a later
-  // milestone).
-  const [expandedVideoId, setExpandedVideoId] = useState<string | null>(null);
-  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
-  const [segmentsLoading, setSegmentsLoading] = useState(false);
-  // Same "one at a time" pattern as the transcript panel above, for the
-  // minimal lesson-suggestion review list (PRD §7.5) — this is a stand-in
-  // surface, not the real Transcript/Timestamp Mode editor (later
-  // milestones).
-  const [expandedLessonsVideoId, setExpandedLessonsVideoId] = useState<string | null>(null);
-  const [lessons, setLessons] = useState<Lesson[]>([]);
-  const [lessonsLoading, setLessonsLoading] = useState(false);
-  // Reject is a client-side-only filter for now (no `delete_lesson` backend
-  // command exists yet — that's a later milestone), so rejected suggestions
-  // are tracked here and simply excluded from the rendered list, not
-  // persisted. Accept has nothing to persist (the row is already written by
-  // `analyze_video`) — it's tracked here purely so the button can show a
-  // visual confirmation.
-  const [rejectedLessonIds, setRejectedLessonIds] = useState<Set<string>>(new Set());
-  const [acceptedLessonIds, setAcceptedLessonIds] = useState<Set<string>>(new Set());
   // Mirrors `importing` for the drag-drop listener and button handlers,
   // which would otherwise close over a stale value — one import at a time.
   const importingRef = useRef(false);
@@ -115,6 +115,13 @@ export default function ProjectDetailView({
   // the Retry/Remove buttons re-render to reflect it.
   const inFlightRef = useRef<Set<string>>(new Set());
   const [inFlightIds, setInFlightIds] = useState<Set<string>>(new Set());
+  // Per-video attempt counter, stamped onto each `extractAudioForVideo`/
+  // `transcribeVideo` call's "video-progress" events (see
+  // `src-tauri/src/progress.rs`) so a Retry shows up as "Retrying (2)…"
+  // rather than looking identical to the first attempt. Starts at 1 (fresh
+  // import) and is bumped only by `handleRetry`.
+  const attemptCountsRef = useRef<Record<string, number>>({});
+  const { progress, clearProgress } = useVideoProgress();
 
   useEffect(() => {
     let cancelled = false;
@@ -151,11 +158,37 @@ export default function ProjectDetailView({
       if (inFlightRef.current.has(video.id)) return;
       inFlightRef.current.add(video.id);
       setInFlightIds(new Set(inFlightRef.current));
+      const attempt = attemptCountsRef.current[video.id] ?? 1;
+      // A cache-hit short-circuit (cached audio or cached transcript) can
+      // resolve this whole call without ever emitting a fresh event —
+      // without clearing here, a stale event from a previous, possibly
+      // different-stage/different-attempt operation on this same video
+      // would keep rendering for the full duration of this one.
+      clearProgress(video.id);
       try {
+        // Checked per video, not once per batch: a key can be added mid-session
+        // (e.g. a user opens Settings in another window between imports), and
+        // this call is cheap enough that per-video is safer without being
+        // wasteful. Fails before `extractAudioForVideo` runs so a video never
+        // pays for ffmpeg transcoding only to fail at the transcription step
+        // for lack of a key.
+        const keyStatus = await getOpenAiKeyStatus();
+        if (!keyStatus.present) {
+          setVideoErrors((prev) => ({ ...prev, [video.id]: NO_KEY_MESSAGE }));
+          // No extraction/transcription attempt was actually made, so
+          // nothing else sets `transcript_status = 'error'` on this row —
+          // without this, the row stays stuck in `pending`/`audio_ready`
+          // forever with no Retry button, since Retry is gated on `error`
+          // status (see `PRE_TRANSCRIPT_STATUSES` above).
+          await markVideoError(video.id).catch(() => {});
+          setVideos(await listVideos(projectId));
+          return;
+        }
+
         let current: Video | null = video;
         if (!current.audio_path) {
           try {
-            current = await extractAudioForVideo(current.id);
+            current = await extractAudioForVideo(current.id, attempt);
           } catch (err) {
             // extract_audio_for_video already records `transcript_status =
             // 'error'` on the row (reflected via the listVideos() call
@@ -168,7 +201,7 @@ export default function ProjectDetailView({
 
         if (current?.audio_path) {
           try {
-            await transcribeVideo(current.id);
+            await transcribeVideo(current.id, attempt);
           } catch (err) {
             // Most commonly "no API key saved" if the user hasn't visited
             // Settings yet — surface it against this video's row rather than
@@ -186,7 +219,7 @@ export default function ProjectDetailView({
         setInFlightIds(new Set(inFlightRef.current));
       }
     },
-    [projectId],
+    [projectId, clearProgress],
   );
 
   const handleImport = useCallback(
@@ -226,6 +259,7 @@ export default function ProjectDetailView({
    * error first so it doesn't linger next to a fresh attempt. */
   const handleRetry = useCallback(
     async (video: Video) => {
+      attemptCountsRef.current[video.id] = (attemptCountsRef.current[video.id] ?? 1) + 1;
       setVideoErrors((prev) => {
         if (!(video.id in prev)) return prev;
         const next = { ...prev };
@@ -236,69 +270,6 @@ export default function ProjectDetailView({
     },
     [processVideo],
   );
-
-  /** Sends this video's transcript to GPT-5.5 for lesson-boundary analysis
-   * (PRD §7.5) and opens the suggestion review panel with the result.
-   * Shares `inFlightRef`/`inFlightIds` with `processVideo` (extraction +
-   * transcription) rather than a second guard, so a video can't be
-   * double-analyzed (or analyzed mid-transcription) any more than it can be
-   * double-retried. */
-  const handleAnalyze = useCallback(async (video: Video) => {
-    if (inFlightRef.current.has(video.id)) return;
-    inFlightRef.current.add(video.id);
-    setInFlightIds(new Set(inFlightRef.current));
-    setVideoErrors((prev) => {
-      if (!(video.id in prev)) return prev;
-      const next = { ...prev };
-      delete next[video.id];
-      return next;
-    });
-    try {
-      const result = await analyzeVideo(video.id);
-      setExpandedLessonsVideoId(video.id);
-      setLessons(result);
-      setRejectedLessonIds(new Set());
-      setAcceptedLessonIds(new Set());
-    } catch (err) {
-      // Most commonly "no API key saved" or "no transcript yet" — surface
-      // it against this video's row, same as extraction/transcription
-      // errors.
-      setVideoErrors((prev) => ({
-        ...prev,
-        [video.id]: err instanceof Error ? err.message : String(err),
-      }));
-    } finally {
-      inFlightRef.current.delete(video.id);
-      setInFlightIds(new Set(inFlightRef.current));
-    }
-  }, []);
-
-  /** Toggles the lesson-suggestion review panel for a video, loading its
-   * currently-stored lessons (mirrors `toggleTranscript` above) — lets
-   * previously-analyzed suggestions be reviewed again without re-running
-   * Analyze. */
-  async function toggleLessons(videoId: string) {
-    if (expandedLessonsVideoId === videoId) {
-      setExpandedLessonsVideoId(null);
-      setLessons([]);
-      return;
-    }
-    setExpandedLessonsVideoId(videoId);
-    setLessons([]);
-    setRejectedLessonIds(new Set());
-    setAcceptedLessonIds(new Set());
-    setLessonsLoading(true);
-    try {
-      setLessons(await listLessons(videoId));
-    } catch (err) {
-      setVideoErrors((prev) => ({
-        ...prev,
-        [videoId]: err instanceof Error ? err.message : String(err),
-      }));
-    } finally {
-      setLessonsLoading(false);
-    }
-  }
 
   /** Removes a video from the project entirely (distinct from Retry — this
    * deletes the row). Does not touch the cached extracted-audio WAV file,
@@ -322,19 +293,11 @@ export default function ProjectDetailView({
           delete next[video.id];
           return next;
         });
-        if (expandedVideoId === video.id) {
-          setExpandedVideoId(null);
-          setSegments([]);
-        }
-        if (expandedLessonsVideoId === video.id) {
-          setExpandedLessonsVideoId(null);
-          setLessons([]);
-        }
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [projectId, expandedVideoId, expandedLessonsVideoId],
+    [projectId],
   );
 
   // Tauri delivers OS drag & drop through the webview event, not DOM events.
@@ -389,34 +352,14 @@ export default function ProjectDetailView({
     }
   }
 
-  /** Toggles the read-only transcript preview for a video row; clicking the
-   * already-expanded video's toggle collapses it again. */
-  async function toggleTranscript(videoId: string) {
-    if (expandedVideoId === videoId) {
-      setExpandedVideoId(null);
-      setSegments([]);
-      return;
-    }
-    setExpandedVideoId(videoId);
-    setSegments([]);
-    setSegmentsLoading(true);
-    try {
-      setSegments(await listTranscriptSegments(videoId));
-    } catch (err) {
-      setVideoErrors((prev) => ({
-        ...prev,
-        [videoId]: err instanceof Error ? err.message : String(err),
-      }));
-    } finally {
-      setSegmentsLoading(false);
-    }
-  }
-
   return (
     <div>
-      <button type="button" className="back-button" onClick={onBack}>
-        ← Back to projects
-      </button>
+      <Breadcrumbs
+        crumbs={[
+          { label: "Projects", onClick: onBack },
+          ...(project ? [{ label: project.name }] : []),
+        ]}
+      />
 
       {loading && <p>Loading project…</p>}
       {error && <p className="error">{error}</p>}
@@ -459,12 +402,28 @@ export default function ProjectDetailView({
             <ul className="video-list">
               {videos.map((video) => {
                 const canShowTranscript = !PRE_TRANSCRIPT_STATUSES.has(video.transcript_status);
-                const isExpanded = expandedVideoId === video.id;
-                const isLessonsExpanded = expandedLessonsVideoId === video.id;
                 const isInFlight = inFlightIds.has(video.id);
+                const videoProgress = progress[video.id];
                 return (
                   <li key={video.id} className="video-list-entry">
-                    <div className="video-list-item">
+                    <div
+                      className={
+                        canShowTranscript ? "video-list-item video-list-item-clickable" : "video-list-item"
+                      }
+                      onClick={canShowTranscript ? () => onOpenVideo(video.id) : undefined}
+                      role={canShowTranscript ? "button" : undefined}
+                      tabIndex={canShowTranscript ? 0 : undefined}
+                      onKeyDown={
+                        canShowTranscript
+                          ? (event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                onOpenVideo(video.id);
+                              }
+                            }
+                          : undefined
+                      }
+                    >
                       <div className="video-info">
                         <span className="video-name">{basename(video.file_path)}</span>
                         <span className="video-path">{video.file_path}</span>
@@ -473,48 +432,40 @@ export default function ProjectDetailView({
                       <span className={`status-badge status-${video.transcript_status}`}>
                         {video.transcript_status}
                       </span>
-                      {canShowTranscript && (
-                        <button
-                          type="button"
-                          className="transcript-toggle"
-                          onClick={() => void toggleTranscript(video.id)}
-                        >
-                          {isExpanded ? "Hide transcript" : "View transcript"}
-                        </button>
-                      )}
-                      {canShowTranscript && (
-                        <button
-                          type="button"
-                          className="analyze-button"
-                          onClick={() => void handleAnalyze(video)}
-                          disabled={isInFlight}
-                        >
-                          {isInFlight ? "Working…" : "Analyze"}
-                        </button>
-                      )}
-                      {canShowTranscript && (
-                        <button
-                          type="button"
-                          className="lessons-toggle"
-                          onClick={() => void toggleLessons(video.id)}
-                        >
-                          {isLessonsExpanded ? "Hide lessons" : "View lessons"}
-                        </button>
-                      )}
-                      {canShowTranscript && (
-                        <button
-                          type="button"
-                          className="edit-button"
-                          onClick={() => onOpenEditor(video.id)}
-                        >
-                          Edit
-                        </button>
+                      {isInFlight && (
+                        <span className="video-progress">
+                          <span
+                            className={
+                              videoProgress?.fraction == null
+                                ? "video-progress-spinner"
+                                : "video-progress-bar"
+                            }
+                            aria-hidden="true"
+                          >
+                            {videoProgress?.fraction != null && (
+                              <span
+                                className="video-progress-bar-fill"
+                                style={{ width: `${Math.round(videoProgress.fraction * 100)}%` }}
+                              />
+                            )}
+                          </span>
+                          <span className="video-progress-label">
+                            {videoProgress ? stageLabel(videoProgress.stage) : "Working…"}
+                            {videoProgress && videoProgress.attempt > 1 && (
+                              <> — Retrying ({videoProgress.attempt})…</>
+                            )}
+                            {videoProgress?.detail && <> ({videoProgress.detail})</>}
+                          </span>
+                        </span>
                       )}
                       {video.transcript_status === "error" && !isInFlight && (
                         <button
                           type="button"
                           className="retry-button"
-                          onClick={() => void handleRetry(video)}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleRetry(video);
+                          }}
                         >
                           Retry
                         </button>
@@ -522,7 +473,10 @@ export default function ProjectDetailView({
                       <button
                         type="button"
                         className="delete-button"
-                        onClick={() => void handleRemove(video)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleRemove(video);
+                        }}
                         disabled={isInFlight}
                         aria-label={`Remove ${basename(video.file_path)}`}
                       >
@@ -532,94 +486,6 @@ export default function ProjectDetailView({
 
                     {videoErrors[video.id] && (
                       <p className="error video-error">{videoErrors[video.id]}</p>
-                    )}
-
-                    {isExpanded && (
-                      <div className="transcript-panel">
-                        {segmentsLoading ? (
-                          <p>Loading transcript…</p>
-                        ) : segments.length === 0 ? (
-                          <p>No transcript segments.</p>
-                        ) : (
-                          <ul className="transcript-segment-list">
-                            {segments.map((segment) => (
-                              <li key={segment.id} className="transcript-segment">
-                                <span className="transcript-segment-time">
-                                  {formatDuration(segment.start)}–{formatDuration(segment.end)}
-                                </span>
-                                <span className="transcript-segment-text">{segment.text}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        )}
-                      </div>
-                    )}
-
-                    {isLessonsExpanded && (
-                      <div className="lesson-panel">
-                        {lessonsLoading ? (
-                          <p>Loading lesson suggestions…</p>
-                        ) : lessons.length === 0 ? (
-                          <p>
-                            No lesson suggestions yet — click Analyze to generate some from the
-                            transcript.
-                          </p>
-                        ) : (
-                          <ul className="lesson-list">
-                            {lessons
-                              .filter((lesson) => !rejectedLessonIds.has(lesson.id))
-                              .map((lesson) => {
-                                const isAccepted = acceptedLessonIds.has(lesson.id);
-                                return (
-                                  <li key={lesson.id} className="lesson-item">
-                                    <div className="lesson-item-header">
-                                      <span className="lesson-title">{lesson.title}</span>
-                                      <span className={`kind-badge kind-${lesson.kind}`}>
-                                        {lesson.kind}
-                                      </span>
-                                      {lesson.confidence !== null && (
-                                        <span className="confidence-badge">
-                                          {Math.round(lesson.confidence * 100)}% confidence
-                                        </span>
-                                      )}
-                                      <span className="lesson-item-time">
-                                        {formatDuration(lesson.start)}–{formatDuration(lesson.end)}
-                                      </span>
-                                    </div>
-                                    {lesson.summary && (
-                                      <p className="lesson-summary">{lesson.summary}</p>
-                                    )}
-                                    <div className="lesson-item-actions">
-                                      <button
-                                        type="button"
-                                        className="lesson-accept-button"
-                                        disabled={isAccepted}
-                                        onClick={() =>
-                                          setAcceptedLessonIds(
-                                            (prev) => new Set(prev).add(lesson.id),
-                                          )
-                                        }
-                                      >
-                                        {isAccepted ? "Accepted" : "Accept"}
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="lesson-reject-button"
-                                        onClick={() =>
-                                          setRejectedLessonIds(
-                                            (prev) => new Set(prev).add(lesson.id),
-                                          )
-                                        }
-                                      >
-                                        Reject
-                                      </button>
-                                    </div>
-                                  </li>
-                                );
-                              })}
-                          </ul>
-                        )}
-                      </div>
                     )}
                   </li>
                 );

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { createProject, deleteProject, listProjects, type Project } from "../db";
+import { createProject, deleteProject, getOpenAiKeyStatus, listProjects, type Project } from "../db";
 
 interface HomeViewProps {
   onOpenProject: (id: string) => void;
@@ -11,6 +11,17 @@ export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProp
   const [newName, setNewName] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // BYOK: CourseCut has no key of its own, so a missing key is a persistent
+  // banner rather than a dismissible toast (PRD "Phase 1 — API key
+  // onboarding"). `null` = not checked yet, so the banner doesn't flash on
+  // first paint before the async check resolves.
+  const [keyPresent, setKeyPresent] = useState<boolean | null>(null);
+  // Distinct from "checked and no key found" — a thrown error here usually
+  // means the OS keychain itself is inaccessible (locked, permission
+  // denied), in which case routing the user into Settings to "add a key"
+  // would likely just fail the same way. Kept separate so that case gets
+  // its own message instead of being presented as a plain missing-key banner.
+  const [keyCheckError, setKeyCheckError] = useState<string | null>(null);
 
   async function refresh() {
     try {
@@ -26,6 +37,15 @@ export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProp
 
   useEffect(() => {
     refresh();
+    // HomeView unmounts whenever `App.tsx` navigates away (it's only
+    // rendered when `view.name === "home"`), so this re-runs on every
+    // return from Settings — no separate focus/refetch trigger needed for
+    // the banner to clear after a key is saved.
+    getOpenAiKeyStatus()
+      .then((status) => setKeyPresent(status.present))
+      .catch((err) =>
+        setKeyCheckError(err instanceof Error ? err.message : String(err)),
+      );
   }, []);
 
   async function handleCreate(event: React.FormEvent) {
@@ -72,6 +92,24 @@ export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProp
           Settings
         </button>
       </form>
+
+      {keyCheckError ? (
+        <div className="key-banner" role="alert">
+          <p>Could not check your OpenAI API key status: {keyCheckError}</p>
+        </div>
+      ) : (
+        keyPresent === false && (
+          <div className="key-banner" role="alert">
+            <p>
+              CourseCut is bring-your-own-key: transcription and analysis need an OpenAI API key.
+              Nothing will process until one is saved.
+            </p>
+            <button type="button" onClick={onOpenSettings}>
+              Add API key
+            </button>
+          </div>
+        )
+      )}
 
       {error && <p className="error">{error}</p>}
 

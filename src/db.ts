@@ -31,6 +31,22 @@ export interface Video {
 // Rust is the enforcing side; this copy only feeds file-dialog filters.
 export const SUPPORTED_VIDEO_EXTENSIONS = ["mp4", "mov", "mkv", "avi", "m4v"];
 
+// Progress events (PRD-adjacent, `docs/ux-overhaul-plan.md` Phase 2) —
+// emitted from Rust on the "video-progress" channel by `progress.rs` during
+// the extract/transcribe/analyze pipeline. Local IPC only, consumed by
+// `src/hooks/useVideoProgress.ts`. Keep in sync with `progress::Stage`/
+// `progress::VideoProgress` in `src-tauri/src/progress.rs`.
+export type Stage = "ExtractingAudio" | "Transcribing" | "Analyzing";
+
+export interface VideoProgress {
+  video_id: string;
+  stage: Stage;
+  // `null` means indeterminate (show a spinner, not a bar).
+  fraction: number | null;
+  detail: string | null;
+  attempt: number;
+}
+
 export async function createProject(name: string): Promise<Project> {
   return invoke<Project>("create_project", { name });
 }
@@ -64,12 +80,23 @@ export async function getVideo(id: string): Promise<Video | null> {
   return invoke<Video | null>("get_video", { id });
 }
 
+// Marks a video row `transcript_status = 'error'` without an actual
+// extraction/transcription attempt — used when the frontend itself
+// short-circuits the pipeline (e.g. no OpenAI key saved), so the row still
+// lands somewhere the existing Retry button can pick it up from, instead of
+// being left stuck in `pending`/`audio_ready` with no way to retry.
+export async function markVideoError(id: string): Promise<void> {
+  await invoke("mark_video_error", { id });
+}
+
 // Runs ffmpeg/ffprobe (Rust-owned sidecars, see `src-tauri/src/ffmpeg.rs`)
 // to probe the video's real duration and extract local audio, caching the
 // result by content hash so re-importing an unchanged file skips the work.
-// Never uploads video — see `coursecut-privacy-invariants`.
-export async function extractAudioForVideo(videoId: string): Promise<Video> {
-  return invoke<Video>("extract_audio_for_video", { videoId });
+// Never uploads video — see `coursecut-privacy-invariants`. `attempt` is
+// stamped onto this call's "video-progress" events (1 for a fresh import,
+// >1 for a Retry) — it's not incremented in Rust.
+export async function extractAudioForVideo(videoId: string, attempt: number): Promise<Video> {
+  return invoke<Video>("extract_audio_for_video", { videoId, attempt });
 }
 
 export interface TranscriptSegment {
@@ -86,9 +113,10 @@ export interface TranscriptSegment {
 // the source video, never SQLite content beyond what locates that audio
 // file. See `coursecut-privacy-invariants`. Skips the API call and copies
 // cached segments instead if another video shares this one's content hash
-// and already has a transcript (PRD §7.4).
-export async function transcribeVideo(videoId: string): Promise<Video> {
-  return invoke<Video>("transcribe_video", { videoId });
+// and already has a transcript (PRD §7.4). `attempt` is stamped onto this
+// call's "video-progress" events, same convention as `extractAudioForVideo`.
+export async function transcribeVideo(videoId: string, attempt: number): Promise<Video> {
+  return invoke<Video>("transcribe_video", { videoId, attempt });
 }
 
 export async function listTranscriptSegments(videoId: string): Promise<TranscriptSegment[]> {
@@ -124,42 +152,120 @@ export interface Lesson {
 // GPT-5.5 chat completions for lesson-boundary analysis (PRD §7.5). See
 // `coursecut-privacy-invariants`. Replaces the video's AI-sourced lesson
 // rows with the fresh suggestions (re-running is a clean replace, not an
-// accumulation) and returns the full updated set.
-export async function analyzeVideo(videoId: string): Promise<Lesson[]> {
-  return invoke<Lesson[]>("analyze_video", { videoId });
+// accumulation) and returns the full updated set. `attempt` is stamped onto
+// this call's "video-progress" events, same convention as
+// `extractAudioForVideo`/`transcribeVideo`.
+export async function analyzeVideo(videoId: string, attempt: number): Promise<Lesson[]> {
+  return invoke<Lesson[]>("analyze_video", { videoId, attempt });
 }
 
 export async function listLessons(videoId: string): Promise<Lesson[]> {
   return invoke<Lesson[]>("list_lessons", { videoId });
 }
 
+// One `{start, end}` range for `createLesson` below — already collapsed
+// from a transcript-segment checkbox selection into contiguous runs by the
+// caller (see `CreateLessonModal`), so a non-contiguous selection arrives
+// here as more than one range.
+export interface LessonSegmentRange {
+  start: number;
+  end: number;
+}
+
+// Creates a manually-built lesson (`source: "manual"`, not `"ai"`) from
+// `segments`, one `lesson_segments` row per range — pure local SQLite
+// mutation, see `src-tauri/src/db.rs`'s `create_lesson`. `source !==
+// "ai"` means `analyzeVideo`'s re-analysis (`replace_ai_lessons_tx` in
+// `openai.rs`, which deletes only `WHERE source = 'ai'`) never touches it.
+export async function createLesson(
+  videoId: string,
+  title: string,
+  segments: LessonSegmentRange[],
+): Promise<Lesson> {
+  return invoke<Lesson>("create_lesson", { videoId, title, segments });
+}
+
 // Lesson editing (PRD §8.1/§9) — patch/split/merge/delete/reorder, all pure
 // local SQLite mutations (see `src-tauri/src/db.rs`). `updateLesson` uses
 // patch semantics: omit (or pass `undefined` for) a field to leave it
-// unchanged.
+// unchanged. Since `0006_lesson_segments.sql`, `start`/`end` are a cached
+// bound derived from a lesson's segments and are no longer settable here —
+// see `updateLessonSegment`/`addLessonSegment`/`deleteLessonSegment` below.
 export async function updateLesson(
   id: string,
-  patch: { title?: string; summary?: string; start?: number; end?: number },
+  patch: { title?: string; summary?: string },
 ): Promise<Lesson> {
   return invoke<Lesson>("update_lesson", {
     id,
     title: patch.title ?? null,
     summary: patch.summary ?? null,
-    start: patch.start ?? null,
-    end: patch.end ?? null,
   });
 }
 
-// Splits a lesson into two at `atTime` (must be strictly inside the
-// lesson's current `[start, end)`); returns both resulting rows.
-export async function splitLesson(lessonId: string, atTime: number): Promise<Lesson[]> {
-  return invoke<Lesson[]>("split_lesson", { lessonId, atTime });
+// Splits `segmentId` (which must belong to `lessonId`) into two at `atTime`
+// (must be strictly inside that segment's current `[start, end)`); returns
+// both resulting lesson rows.
+export async function splitLesson(lessonId: string, segmentId: string, atTime: number): Promise<Lesson[]> {
+  return invoke<Lesson[]>("split_lesson", { lessonId, segmentId, atTime });
 }
 
 // Merges `secondId` into `firstId` (both must belong to the same video);
 // returns the merged row. `secondId`'s row is deleted.
 export async function mergeLessons(firstId: string, secondId: string): Promise<Lesson> {
   return invoke<Lesson>("merge_lessons", { firstId, secondId });
+}
+
+// A lesson's segments (PRD §8.1/§9, `0006_lesson_segments.sql`) — a lesson
+// is built from one or more, possibly overlapping and non-contiguous,
+// segments of its source video. `lessons.start`/`.end` remain a read-only
+// cached bound (min/max across these) kept in sync by Rust after every
+// segment write; see `coursecut-data-model`.
+export interface LessonSegment {
+  id: string;
+  lesson_id: string;
+  start: number;
+  end: number;
+  sort_order: number;
+}
+
+// Result of `deleteLessonSegment`: deleting a lesson's last remaining
+// segment deletes the lesson itself rather than leaving it with stale
+// cached bounds — `lesson_deleted` tells the caller which happened.
+export interface DeleteLessonSegmentResult {
+  lesson_id: string;
+  lesson_deleted: boolean;
+}
+
+// Read-only listing of a lesson's segments, in playback (`sort_order`) order.
+export async function listLessonSegments(lessonId: string): Promise<LessonSegment[]> {
+  return invoke<LessonSegment[]>("list_lesson_segments", { lessonId });
+}
+
+// Appends a new segment to `lessonId` (always added last); the parent
+// lesson's cached `start`/`end` bound is recomputed on the Rust side. No
+// overlap validation, by design — see `docs/lesson-segments-plan.md`.
+export async function addLessonSegment(lessonId: string, start: number, end: number): Promise<LessonSegment> {
+  return invoke<LessonSegment>("add_lesson_segment", { lessonId, start, end });
+}
+
+// Updates a segment's `start`/`end`; the parent lesson's cached bound is
+// recomputed on the Rust side. Same no-overlap stance as `addLessonSegment`.
+export async function updateLessonSegment(id: string, start: number, end: number): Promise<LessonSegment> {
+  return invoke<LessonSegment>("update_lesson_segment", { id, start, end });
+}
+
+// Deletes a segment. If it was the lesson's only segment, the lesson itself
+// is deleted instead (see `DeleteLessonSegmentResult`).
+export async function deleteLessonSegment(id: string): Promise<DeleteLessonSegmentResult> {
+  return invoke<DeleteLessonSegmentResult>("delete_lesson_segment", { id });
+}
+
+// Sets `sort_order` to each id's position in `orderedIds` — must be exactly
+// the lesson's current set of segment ids (Rust rejects a partial/mismatched
+// list rather than silently applying it). Doesn't change any segment's own
+// start/end, only playback sequence.
+export async function reorderLessonSegments(lessonId: string, orderedIds: string[]): Promise<void> {
+  await invoke("reorder_lesson_segments", { lessonId, orderedIds });
 }
 
 export async function deleteLesson(id: string): Promise<void> {
@@ -226,11 +332,11 @@ export async function getAnalysisInstructions(): Promise<string | null> {
 }
 
 // Export queue (PRD §10-11, Milestone 7) — see `src-tauri/src/export.rs`.
-// Purely local: trims a lesson's `[start, end)` from its already-imported
-// source video into a frame-accurately re-encoded MP4 plus a paired SRT
-// (from that lesson's kept transcript segments), run one at a time by a
-// single app-wide background worker. Never uploads anything — see
-// `coursecut-privacy-invariants`.
+// Purely local: cuts each of a lesson's `lesson_segments` from its
+// already-imported source video into frame-accurately re-encoded clips and
+// (for a multi-segment lesson) concatenates them into a single output MP4,
+// run one at a time by a single app-wide background worker. Never uploads
+// anything — see `coursecut-privacy-invariants`.
 
 export interface ExportRow {
   id: string;
@@ -295,4 +401,9 @@ export async function retryExport(id: string): Promise<ExportRow> {
 // lessons client-side.
 export async function listExports(projectId: string): Promise<ExportRow[]> {
   return invoke<ExportRow[]>("list_exports", { projectId });
+}
+
+// Reveals an exported file in Finder (macOS) or Explorer (Windows).
+export async function revealInFolder(path: string): Promise<void> {
+  return invoke<void>("reveal_in_folder", { path });
 }

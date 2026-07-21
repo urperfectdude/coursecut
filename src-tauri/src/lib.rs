@@ -3,7 +3,9 @@ mod db;
 mod export;
 mod ffmpeg;
 mod openai;
+mod progress;
 mod settings;
+mod wav;
 
 use tauri::Manager;
 
@@ -27,7 +29,11 @@ pub fn run() {
             // can reach it. Must run before the worker task is spawned
             // below, so it never has a chance to see a stale `running` row
             // from a previous session.
-            export::reconcile_interrupted_exports(&connection)?;
+            let cache_dir = app
+                .path()
+                .app_cache_dir()
+                .map_err(|err| format!("could not resolve app cache dir: {err}"))?;
+            export::reconcile_interrupted_exports(&connection, &cache_dir)?;
             app.manage(db::DbConnection(std::sync::Mutex::new(connection)));
             // Tracks the `CommandChild` of whatever export is currently
             // running, so `cancel_export` can find and kill it (see
@@ -49,14 +55,21 @@ pub fn run() {
             db::import_videos,
             db::list_videos,
             db::get_video,
+            db::mark_video_error,
             db::list_transcript_segments,
             db::list_lessons,
             db::update_transcript_segment,
             db::update_lesson,
+            db::create_lesson,
             db::split_lesson,
             db::merge_lessons,
             db::delete_lesson,
             db::reorder_lessons,
+            db::list_lesson_segments,
+            db::add_lesson_segment,
+            db::update_lesson_segment,
+            db::delete_lesson_segment,
+            db::reorder_lesson_segments,
             ffmpeg::extract_audio_for_video,
             openai::transcribe_video,
             openai::analyze_video,
@@ -71,6 +84,7 @@ pub fn run() {
             export::cancel_export,
             export::retry_export,
             export::list_exports,
+            export::reveal_in_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running coursecut");

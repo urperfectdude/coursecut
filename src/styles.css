@@ -61,6 +61,41 @@ body {
   cursor: pointer;
 }
 
+/* Staged navigation (`docs/ux-overhaul-plan.md` Phase 3) — replaces most
+   per-view "← Back" buttons. */
+.breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+}
+
+.breadcrumb-item {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.breadcrumb-separator {
+  opacity: 0.5;
+}
+
+.breadcrumb-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.breadcrumb-current {
+  opacity: 0.7;
+}
+
 .import-actions {
   display: flex;
   align-items: center;
@@ -105,6 +140,13 @@ body {
   display: flex;
   align-items: center;
   gap: 1rem;
+}
+
+/* Clickable once transcribed (`docs/ux-overhaul-plan.md` M3) — navigates
+   into the transcript stage; Retry/Remove stop propagation so they don't
+   also trigger the row navigation. */
+.video-list-item-clickable {
+  cursor: pointer;
 }
 
 .video-info {
@@ -160,6 +202,64 @@ body {
   color: #d33;
 }
 
+/* Throwaway per-row progress indicator (M2, `docs/ux-overhaul-plan.md`) —
+   M3 replaces this with the staged flow's own indicators. */
+.video-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  opacity: 0.85;
+}
+
+.video-progress-bar {
+  display: inline-block;
+  width: 60px;
+  height: 6px;
+  border-radius: 3px;
+  background: #ccc5;
+  overflow: hidden;
+}
+
+.video-progress-bar-fill {
+  display: block;
+  height: 100%;
+  background: #2a8;
+  transition: width 0.2s ease;
+}
+
+.video-progress-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid #ccc8;
+  border-top-color: #2a8;
+  animation: video-progress-spin 0.8s linear infinite;
+}
+
+@keyframes video-progress-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.key-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid #d99a3a;
+  border-radius: 4px;
+  background: #d99a3a1a;
+}
+
+.key-banner p {
+  margin: 0;
+}
+
 .video-error {
   margin: 0.25rem 0 0;
   font-size: 0.85rem;
@@ -169,21 +269,9 @@ body {
   color: #2a8;
 }
 
-.transcript-toggle,
-.retry-button,
-.analyze-button,
-.lessons-toggle {
+.retry-button {
   font-size: 0.8rem;
   white-space: nowrap;
-}
-
-.transcript-panel {
-  margin-top: 0.5rem;
-  max-height: 220px;
-  overflow-y: auto;
-  border: 1px solid #ccc5;
-  border-radius: 4px;
-  padding: 0.5rem 0.75rem;
 }
 
 .transcript-segment-list {
@@ -207,46 +295,6 @@ body {
   flex-shrink: 0;
 }
 
-.lesson-panel {
-  margin-top: 0.5rem;
-  max-height: 320px;
-  overflow-y: auto;
-  border: 1px solid #ccc5;
-  border-radius: 4px;
-  padding: 0.5rem 0.75rem;
-}
-
-.lesson-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-}
-
-.lesson-item {
-  padding-bottom: 0.6rem;
-  border-bottom: 1px solid #ccc3;
-}
-
-.lesson-item:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.lesson-item-header {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.lesson-title {
-  font-weight: 600;
-  font-size: 0.9rem;
-}
-
 .lesson-item-time {
   margin-left: auto;
   font-variant-numeric: tabular-nums;
@@ -254,21 +302,10 @@ body {
   font-size: 0.8rem;
 }
 
-.lesson-summary {
-  margin: 0.35rem 0 0;
-  font-size: 0.85rem;
-  opacity: 0.85;
-}
-
 .lesson-item-actions {
   display: flex;
   gap: 0.5rem;
   margin-top: 0.4rem;
-}
-
-.lesson-accept-button,
-.lesson-reject-button {
-  font-size: 0.75rem;
 }
 
 .confidence-badge {
@@ -323,27 +360,7 @@ body {
   resize: vertical;
 }
 
-.edit-button {
-  font-size: 0.8rem;
-  white-space: nowrap;
-}
-
-/* Lesson editor (Transcript Mode, PRD §8.1) */
-
-.editor-video {
-  display: block;
-  width: 100%;
-  max-height: 40vh;
-  margin: 0.75rem 0;
-  background: #000;
-}
-
-.editor-layout {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1.5rem;
-  align-items: start;
-}
+/* Transcript stage (PRD §8.1) and lessons stage panel (M3) */
 
 .editor-panel {
   min-width: 0;
@@ -365,25 +382,13 @@ body {
   align-items: center;
 }
 
-.transcript-segment-text-button {
+.transcript-segment-text {
   flex: 1;
-  text-align: left;
-  background: none;
-  border: none;
-  padding: 0;
-  font: inherit;
-  cursor: pointer;
-  color: inherit;
 }
 
 .transcript-segment-deleted {
   opacity: 0.45;
   text-decoration: line-through;
-}
-
-.transcript-segment-active {
-  background: #46a2;
-  border-radius: 4px;
 }
 
 .transcript-segment-keep {
@@ -407,16 +412,18 @@ body {
   opacity: 0.6;
 }
 
-.editor-lesson-list {
-  max-height: 60vh;
-  overflow-y: auto;
-}
-
-.editor-lesson-item {
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  cursor: pointer;
+/* Lessons stage tile grid (M4, replaces the old flat `.lesson-list`) —
+ * `LessonCard` renders each lesson as a gallery tile. Selecting a tile no
+ * longer expands it in place (segment editing moved to its own page, see
+ * `LessonSegmentsView`), so every tile stays a fixed grid cell. */
+.lesson-tile-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+  align-items: start;
 }
 
 .lesson-title-input {
@@ -447,90 +454,265 @@ body {
   padding: 0.1rem 0.25rem;
 }
 
+/* `LessonSegmentsView`'s own summary field — same `.lesson-summary-input`
+ * as the grid tile used to use, just constrained to a readable width on
+ * this full-page layout instead of stretching to the whole window. */
+.lesson-segments-summary {
+  max-width: 40rem;
+}
+
 .lesson-summary-input:hover,
 .lesson-summary-input:focus {
   border-color: #ccc8;
   border-radius: 3px;
 }
 
-/* Timestamp Mode (PRD §8.2, Milestone 6) */
+/* Source video preview (PRD §8.2 successor, Milestone "lesson segments") —
+ * the compact, always-visible player against the raw source file. See
+ * `docs/lesson-segments-plan.md`. */
 
-.mode-toggle {
+.source-preview {
+  margin: 0.75rem 0 1.25rem;
+  max-width: 32rem;
+}
+
+.source-preview-video {
+  display: block;
+  width: 100%;
+  max-height: 30vh;
+  background: #000;
+}
+
+/* Replaces native `<video controls>` (M4 — shadow-DOM controls can't carry
+ * the yellow segment-highlight overlay, which now lives on
+ * `.source-preview-scrubber` below instead of a second, detached bar). */
+.source-preview-controls-row {
   display: flex;
-  gap: 0.5rem;
-  margin: 0.75rem 0;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.35rem;
 }
 
-.mode-toggle-button {
+.source-preview-play-button {
+  line-height: 1;
+  padding: 0.25rem 0.6rem;
+}
+
+.source-preview-time-readout {
+  font-variant-numeric: tabular-nums;
   font-size: 0.85rem;
-  padding: 0.35rem 0.75rem;
-  border: 1px solid #ccc8;
-  border-radius: 4px;
-  background: none;
+  opacity: 0.75;
+}
+
+.source-preview-scrubber-wrapper {
+  position: relative;
+  margin-top: 0.35rem;
+}
+
+.source-preview-scrubber {
+  width: 100%;
+  display: block;
+  position: relative;
+  z-index: 1;
+}
+
+.source-preview-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 6px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.source-preview-segment-highlight {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  /* Yellow so the selected lesson's footage reads at a glance against the
+   * scrubber. Kept slightly transparent to show the track underneath, with
+   * an inset outline so it stays legible on a light-theme scrubber, where
+   * yellow-on-light-gray would otherwise wash out (`:root` sets
+   * `color-scheme: light dark`, so both themes are in play). */
+  background: #fc0c;
+  box-shadow: inset 0 0 0 1px #0003;
+  border-radius: 2px;
+}
+
+.source-preview-hint {
+  font-size: 0.75rem;
+  opacity: 0.6;
+  margin: 0.35rem 0;
+}
+
+.source-preview-mark-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.source-preview-mark-value {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+  opacity: 0.75;
+  min-width: 3.5rem;
+}
+
+/* Lesson cards (M4: tiles in `.lesson-tile-grid` above; expansion doubles as
+ * selection, per `docs/lesson-segments-plan.md`). */
+
+.lesson-card {
+  border: 1px solid #ccc3;
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+}
+
+.lesson-card-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
   cursor: pointer;
-  color: inherit;
 }
 
-.mode-toggle-button-active {
-  border-color: #46a;
-  background: #46a2;
+.lesson-card-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 
-.editor-lesson-item-selected {
+/* Kind/confidence chips, moved to their own row below the title (see the
+ * conversation that dropped this tile's start–end timestamp) — smaller
+ * than the same chips would otherwise render, since they're secondary
+ * metadata here rather than the row's main content. */
+.lesson-card-badge-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.kind-badge-small,
+.confidence-badge-small {
+  font-size: 0.68rem;
+  padding: 0.1rem 0.4rem;
+}
+
+.lesson-card-selected {
   background: #46a1;
-  border-radius: 4px;
+  border-color: #46a8;
 }
 
-.timestamp-note {
+.lesson-card-preview {
+  margin-top: 0.5rem;
+}
+
+/* `LessonSegmentsView` reuses `.lesson-card-preview`'s video/controls
+ * styling for its own (larger, full-page) preview. */
+.lesson-segments-preview {
+  max-width: 40rem;
+}
+
+.lesson-card-video {
+  display: block;
+  width: 100%;
+  max-height: 25vh;
+  background: #000;
+}
+
+/* Custom controls, replacing native `<video controls>` — the scrubber
+ * spans the lesson's own virtual (stitched-segments) length rather than
+ * the whole source file's duration. */
+.lesson-card-controls-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.3rem;
+}
+
+.lesson-card-play-button {
+  line-height: 1;
+  padding: 0.2rem 0.5rem;
+}
+
+.lesson-card-time-readout {
+  font-variant-numeric: tabular-nums;
   font-size: 0.8rem;
-  opacity: 0.7;
+  opacity: 0.75;
 }
 
-.timestamp-editor {
+.lesson-card-scrubber {
+  width: 100%;
+  display: block;
+  margin-top: 0.3rem;
+}
+
+.lesson-card-segment-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
 }
 
-.timestamp-selected-title {
-  font-weight: 600;
-  margin: 0;
-}
-
-.timestamp-fields {
+.lesson-card-segment-row {
   display: flex;
-  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid #ccc2;
+  font-size: 0.85rem;
 }
 
-.timestamp-field {
+.lesson-card-segment-row:last-child {
+  border-bottom: none;
+}
+
+.lesson-card-segment-field {
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
-  font-size: 0.8rem;
-}
-
-.timestamp-field input {
-  font: inherit;
-  width: 8rem;
-}
-
-.timestamp-actions {
-  display: flex;
-  gap: 0.5rem;
-}
-
-.timestamp-scrubber {
-  width: 100%;
-}
-
-.timestamp-hint {
   font-size: 0.75rem;
-  opacity: 0.6;
 }
 
-.timestamp-error {
-  font-size: 0.8rem;
-  margin: 0;
+.lesson-card-segment-field input {
+  font: inherit;
+  width: 6rem;
+}
+
+.lesson-card-segment-time-hint {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+.lesson-card-segment-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+/* Move-up/move-down reordering, `LessonSegmentsView` only (see the
+ * conversation that added swap-reordering there) — a lesson's segments
+ * play back in this order, so it's the one place that needs it. */
+.lesson-card-segment-order {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+}
+
+.lesson-card-segment-order button {
+  line-height: 1;
+  padding: 0 0.35rem;
+}
+
+.lesson-card-segment-order-index {
+  font-size: 0.7rem;
+  opacity: 0.6;
 }
 
 /* Export queue (PRD §10-11, Milestone 7) */
@@ -546,19 +728,28 @@ body {
   margin: 0.5rem 0;
 }
 
-.export-panel {
-  margin-top: 1.25rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid #ccc3;
+/* Transcript stage's Analyze / View lessons row (M3) — same flex-row shape
+   as `.export-controls` above, kept separate since it's a different page's
+   concern. */
+.stage-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
 }
 
-.export-list {
-  list-style: none;
-  margin: 0;
+/* Inline text-styled button — the lessons stage's empty-state "analyze this
+   video's transcript" link (M3), which navigates rather than mutating, so it
+   reads as a link embedded in a sentence rather than a standalone button. */
+.link-button {
+  background: none;
+  border: none;
   padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 .export-item {
@@ -648,6 +839,12 @@ body {
   gap: 1rem;
 }
 
+.project-header-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
 .export-history-button {
   cursor: pointer;
   flex-shrink: 0;
@@ -677,4 +874,85 @@ body {
 
 .export-history-path {
   overflow-wrap: anywhere;
+}
+
+/* Shared modal shell (M4's Create Lesson modal is the first user; kept
+ * generic rather than named after that one feature in case a later
+ * milestone needs a second modal). */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: #0008;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.modal-panel {
+  background: canvas;
+  color: canvastext;
+  border-radius: 6px;
+  padding: 1.25rem;
+  width: min(32rem, 90vw);
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 4px 24px #0006;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+/* Create Lesson modal (M4) — transcript segment checkbox picker. */
+
+.create-lesson-title-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+
+.create-lesson-title-field input {
+  font: inherit;
+  padding: 0.3rem 0.4rem;
+}
+
+.create-lesson-segment-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 40vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.create-lesson-segment-row label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.create-lesson-segment-time {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+
+.create-lesson-segment-text {
+  flex: 1;
+}
+
+.create-lesson-summary-hint {
+  font-size: 0.8rem;
+  opacity: 0.7;
+  margin: 0.6rem 0 0;
 }
