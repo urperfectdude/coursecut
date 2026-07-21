@@ -30,16 +30,19 @@ case "$TARGET" in
   aarch64-apple-darwin|x86_64-apple-darwin|universal-apple-darwin)
     # evermeet.cx ships a static x86_64 build (libx264/libx265/aac baked in,
     # no dylib deps beyond system frameworks); it runs on Apple Silicon
-    # under Rosetta 2, so the same pair covers aarch64, x86_64, and the
-    # universal-apple-darwin sidecar name `cargo tauri build --target
-    # universal-apple-darwin` looks for.
+    # under Rosetta 2, so the same pair covers aarch64 and x86_64. A
+    # `cargo tauri build --target universal-apple-darwin` builds each arch
+    # slice separately before merging, and looks up the sidecar under all
+    # three names along the way, so write all three from one download.
     curl -sL -o "$TMP/ffmpeg.zip" https://evermeet.cx/ffmpeg/ffmpeg-8.1.2.zip
     curl -sL -o "$TMP/ffprobe.zip" https://evermeet.cx/ffmpeg/ffprobe-8.1.2.zip
     unzip -o -q "$TMP/ffmpeg.zip" -d "$TMP"
     unzip -o -q "$TMP/ffprobe.zip" -d "$TMP"
-    cp "$TMP/ffmpeg" "$OUT/ffmpeg-$TARGET"
-    cp "$TMP/ffprobe" "$OUT/ffprobe-$TARGET"
-    chmod +x "$OUT/ffmpeg-$TARGET" "$OUT/ffprobe-$TARGET"
+    chmod +x "$TMP/ffmpeg" "$TMP/ffprobe"
+    for t in aarch64-apple-darwin x86_64-apple-darwin universal-apple-darwin; do
+      cp "$TMP/ffmpeg" "$OUT/ffmpeg-$t"
+      cp "$TMP/ffprobe" "$OUT/ffprobe-$t"
+    done
     ;;
   x86_64-pc-windows-msvc)
     curl -sL -o "$TMP/win.zip" https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
