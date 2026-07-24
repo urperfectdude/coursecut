@@ -260,6 +260,42 @@ export async function deleteLessonSegment(id: string): Promise<DeleteLessonSegme
   return invoke<DeleteLessonSegmentResult>("delete_lesson_segment", { id });
 }
 
+// Per-lesson AI segment edit (`docs/lesson-ai-edit-plan.md`) — the free-text
+// prompt box on `LessonSegmentsView.tsx`. Sends only this lesson's current
+// segment ranges, a windowed slice of the underlying video's transcript
+// **text** (never audio, never video), and the user's instruction text to
+// GPT-5.5 — see `coursecut-privacy-invariants`. Proposing a change is a pure
+// network call with no DB write; `baseline` omitted (or `undefined`) means
+// "start from this lesson's real current segments," which is what the main
+// prompt box always does. Passing `baseline` (the popup's current, not-yet-
+// applied proposal) is how the review popup's "Update proposal" refines
+// without re-reading the DB — see `LessonSegmentsView`'s popup.
+export async function previewLessonSegmentEdit(
+  lessonId: string,
+  instruction: string,
+  baseline?: LessonSegmentRange[],
+): Promise<LessonSegmentRange[]> {
+  return invoke<LessonSegmentRange[]>("preview_lesson_segment_edit", {
+    lessonId,
+    instruction,
+    baseline: baseline ?? null,
+  });
+}
+
+// Commits `segments` — exactly what `previewLessonSegmentEdit` returned and
+// the review popup displayed — as `lessonId`'s new `lesson_segments`,
+// replacing whatever was there before. Synchronous local DB write, no
+// network call. Rejects an empty `segments` array (the popup already
+// disables Apply for that case, but Rust re-checks) rather than deleting
+// the lesson as a side effect — see `src-tauri/src/openai.rs`'s
+// `apply_lesson_segment_edit` docs.
+export async function applyLessonSegmentEdit(
+  lessonId: string,
+  segments: LessonSegmentRange[],
+): Promise<LessonSegment[]> {
+  return invoke<LessonSegment[]>("apply_lesson_segment_edit", { lessonId, segments });
+}
+
 // Sets `sort_order` to each id's position in `orderedIds` — must be exactly
 // the lesson's current set of segment ids (Rust rejects a partial/mismatched
 // list rather than silently applying it). Doesn't change any segment's own

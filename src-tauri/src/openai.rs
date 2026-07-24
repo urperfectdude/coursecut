@@ -14,11 +14,12 @@
 
 use std::path::Path;
 
+use regex::Regex;
 use rusqlite::{params, OptionalExtension};
 use tauri::AppHandle;
 
 use crate::app_settings;
-use crate::db::{self, DbConnection, LessonRow, TranscriptSegmentRow, Video};
+use crate::db::{self, DbConnection, LessonRow, LessonSegmentRow, TranscriptSegmentRow, Video};
 use crate::progress::{self, Stage};
 use crate::settings;
 use crate::wav;
@@ -600,6 +601,38 @@ pub async fn analyze_transcript(
     parse_lesson_suggestions(&content, transcript_start, transcript_end)
 }
 
+/// Validates and parses a JSON `segments` array (`[{"start": number, "end": number}, ...]`,
+/// numeric-or-numeric-string per `value_as_f64`) into `(f64, f64)` ranges, silently dropping
+/// (never erroring on) any individual entry that isn't well-formed: non-numeric bounds,
+/// `start >= end`, or bounds outside `[range_start - 1.0, range_end + 1.0]` (a small tolerance
+/// around the transcript context actually given — mirrors both system prompts telling the model
+/// to draw ranges from within it). Returns an empty `Vec` (not an error) if `value` isn't a JSON
+/// array at all, or every entry in it was invalid. Shared by `parse_lesson_suggestions` (whole-
+/// video analysis) and `parse_edit_segments` (per-lesson AI edit, below) rather than duplicating
+/// this validation loop.
+fn parse_segment_array(value: &serde_json::Value, range_start: f64, range_end: f64) -> Vec<(f64, f64)> {
+    let Some(raw_segments) = value.as_array() else {
+        return Vec::new();
+    };
+
+    let mut segments = Vec::new();
+    for raw_segment in raw_segments {
+        let (Some(start), Some(end)) = (
+            raw_segment.get("start").and_then(value_as_f64),
+            raw_segment.get("end").and_then(value_as_f64),
+        ) else {
+            continue;
+        };
+        // Reject segments whose boundaries aren't real timestamps within
+        // (a small tolerance around) the given range.
+        if end <= start || start < range_start - 1.0 || end > range_end + 1.0 {
+            continue;
+        }
+        segments.push((start, end));
+    }
+    segments
+}
+
 /// Parses a chat-completion message's JSON `content` string (expected shape:
 /// `{"lessons": [...]}`, per `ANALYSIS_SYSTEM_PROMPT`) into validated
 /// `LessonSuggestion`s. Split out from `analyze_transcript` so this parsing
@@ -620,30 +653,15 @@ fn parse_lesson_suggestions(
 
     let mut suggestions = Vec::new();
     for raw in raw_lessons {
-        let Some(raw_segments) = raw.get("segments").and_then(|value| value.as_array()) else {
-            // Missing/non-array `segments` means zero valid segments — drop
-            // the lesson, but this isn't an error for the whole batch.
-            continue;
+        // Missing/non-array `segments`, or every entry in it invalid, both
+        // fall out of `parse_segment_array` as an empty `Vec` — drop the
+        // lesson in either case, but this isn't an error for the whole
+        // batch (a partially-valid lesson keeps its valid segments).
+        let segments = match raw.get("segments") {
+            Some(value) => parse_segment_array(value, transcript_start, transcript_end),
+            None => Vec::new(),
         };
 
-        let mut segments = Vec::new();
-        for raw_segment in raw_segments {
-            let (Some(start), Some(end)) = (
-                raw_segment.get("start").and_then(value_as_f64),
-                raw_segment.get("end").and_then(value_as_f64),
-            ) else {
-                continue;
-            };
-            // Reject segments whose boundaries aren't real timestamps within
-            // (a small tolerance around) the transcript's own time range.
-            if end <= start || start < transcript_start - 1.0 || end > transcript_end + 1.0 {
-                continue;
-            }
-            segments.push((start, end));
-        }
-
-        // Drop the whole lesson only if every one of its segments was
-        // invalid — a partially-valid lesson keeps its valid segments.
         if segments.is_empty() {
             continue;
         }
@@ -1455,5 +1473,522 @@ mod replace_ai_lessons_tx_tests {
             .unwrap();
         assert_eq!(lesson_start, 0.0, "lesson start should be the min segment start");
         assert_eq!(lesson_end, 60.0, "lesson end should be the max segment end");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Per-lesson AI segment edit (`docs/lesson-ai-edit-plan.md`) — a free-text
+// prompt box on `LessonSegmentsView.tsx` that proposes a revised segment
+// list for one already-created lesson (never other lessons, never
+// `transcript_segments.keep`). Same shape as `analyze_video` above (text-
+// only GPT-5.5 chat completion, `{"segments": [...]}` reply), but scoped to
+// one lesson and gated behind an explicit review step: `preview_lesson_
+// segment_edit` never writes to the database, and `apply_lesson_segment_
+// edit` never calls OpenAI — the frontend's old-vs-new popup is the seam
+// between them.
+// ---------------------------------------------------------------------
+
+/// Scans `text` (the raw instruction string — unmodified before or after
+/// this call, still what's actually sent to the model) for `mm:ss` /
+/// `h:mm:ss` / `hh:mm:ss:fff`-shaped substrings and converts each to total
+/// seconds. Deliberately loose matching (no required zero-padding, no
+/// required milliseconds) — unlike `LessonSegmentsView.tsx`'s own strict
+/// `hh:mm:ss:fff`-only `parseTimestamp`, a user typing into a free-text
+/// prompt box won't reliably zero-pad or include a milliseconds component.
+/// Doesn't validate or clamp anything against a lesson/video's real bounds
+/// — purely "what timestamps, if any, did the user type," used by
+/// `preview_lesson_segment_edit` to widen the transcript context window it
+/// loads. No timestamps found is a valid, empty result, not an error.
+fn extract_timestamps_seconds(text: &str) -> Vec<f64> {
+    // 2 to 4 colon-separated groups of 1-3 digits: `mm:ss`, `h:mm:ss`, or
+    // `hh:mm:ss:fff`. `\b` on both ends keeps this from matching in the
+    // middle of a longer digit run (e.g. a 5+ digit id string).
+    let pattern = Regex::new(r"\b\d{1,3}(?::\d{1,3}){1,3}\b").expect("static regex is valid");
+
+    pattern
+        .find_iter(text)
+        .filter_map(|matched| {
+            let parts: Vec<f64> = matched
+                .as_str()
+                .split(':')
+                .map(|part| part.parse::<f64>().ok())
+                .collect::<Option<Vec<f64>>>()?;
+
+            match parts.as_slice() {
+                [minutes, seconds] => Some(minutes * 60.0 + seconds),
+                [hours, minutes, seconds] => Some(hours * 3600.0 + minutes * 60.0 + seconds),
+                [hours, minutes, seconds, millis] => {
+                    Some(hours * 3600.0 + minutes * 60.0 + seconds + millis / 1000.0)
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+const LESSON_EDIT_SYSTEM_PROMPT: &str = "You are an assistant that revises a single lesson's \
+segment list for a video editing tool, per a user's free-text instruction. You are given: the \
+lesson's current segment ranges (start/end, in seconds, in order), a window of the underlying \
+video's transcript as timestamped segments (also in seconds, via `[start-end]` prefixes, on the \
+same timeline as the lesson's segment ranges), and the user's instruction. Respond with a single \
+JSON object of the exact shape {\"segments\": [{\"start\": number, \"end\": number}, ...]} and \
+nothing else — no prose, no markdown fences. Revise the lesson's segments per the instruction: \
+you may split a segment into more ranges than were given, merge or remove segments (returning \
+fewer ranges, or none at all if the instruction amounts to removing everything from this \
+lesson), or trim a segment's start/end. Every returned range must come from within the \
+transcript context given, with `start` < `end`. The instruction may contain literal timestamps \
+(for example \"cut from 2:15 to 3:40\", \"split at 12:03\", \"trim everything after 4:15\") on \
+this same source video timeline — the same seconds-based timeline every transcript line's \
+`[start-end]` prefix, and every given segment range, already use. Treat any such timestamp as a \
+precise, authoritative boundary: convert it to seconds and use it directly, rather than \
+approximating it from nearby transcript wording. Use the transcript content/wording only for \
+whatever the instruction doesn't pin to a specific time.";
+
+/// Parses a chat-completion message's JSON `content` string (expected
+/// shape: `{"segments": [...]}`, per `LESSON_EDIT_SYSTEM_PROMPT`) into a
+/// validated `Vec<(f64, f64)>` via the shared `parse_segment_array`. Split
+/// out from `edit_lesson_segments_via_ai` so this parsing logic — the part
+/// with no network dependency — can be exercised directly, mirroring
+/// `parse_lesson_suggestions`. A well-formed but empty `segments` array is
+/// `Ok(vec![])`, not an error — an empty proposal (e.g. "delete this whole
+/// lesson") is valid at this stage; nothing is written to the database
+/// until the user reviews and applies it (see `apply_lesson_segment_edit`).
+fn parse_edit_segments(
+    content: &str,
+    range_start: f64,
+    range_end: f64,
+) -> Result<Vec<(f64, f64)>, String> {
+    let payload: serde_json::Value = serde_json::from_str(content)
+        .map_err(|err| format!("could not parse GPT-5.5 JSON payload: {err}"))?;
+
+    let segments_value = payload
+        .get("segments")
+        .ok_or_else(|| "GPT-5.5 JSON payload is missing a \"segments\" array".to_string())?;
+
+    Ok(parse_segment_array(segments_value, range_start, range_end))
+}
+
+/// Sends `baseline_segments` (the lesson's current ranges, or — for a
+/// refinement — the popup's not-yet-applied proposal), a windowed slice of
+/// the underlying video's transcript, and the user's free-text
+/// `instruction` to GPT-5.5 chat completions, and parses the response into
+/// a revised `Vec<(f64, f64)>` of segment ranges. Only transcript **text**
+/// and `instruction` (also text) are ever sent — never audio, never video,
+/// per `coursecut-privacy-invariants`. An empty result is a valid proposal
+/// (see `parse_edit_segments`); this function never touches the database.
+pub async fn edit_lesson_segments_via_ai(
+    baseline_segments: &[(f64, f64)],
+    transcript_segments: &[TranscriptSegmentRow],
+    instruction: &str,
+    api_key: &str,
+) -> Result<Vec<(f64, f64)>, String> {
+    let baseline_text = if baseline_segments.is_empty() {
+        "(none — this lesson currently has no segments)".to_string()
+    } else {
+        baseline_segments
+            .iter()
+            .map(|(start, end)| format!("[{start:.2}-{end:.2}]"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let transcript_text = transcript_segments
+        .iter()
+        .map(|segment| format!("[{:.2}-{:.2}] {}", segment.start, segment.end, segment.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let user_prompt = format!(
+        "Current lesson segments (seconds): {baseline_text}\n\n\
+         Transcript context (timestamps in seconds):\n\n{transcript_text}\n\n\
+         Instruction: {instruction}"
+    );
+
+    let request_body = serde_json::json!({
+        "model": "gpt-5.5",
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": LESSON_EDIT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    });
+
+    // Same shape as `analyze_transcript`'s request: one text-only
+    // completion, but a full-window transcript plus the model's own
+    // generation time can still take a while.
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+    let client = reqwest::Client::new();
+    let request = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&request_body)
+        .send();
+
+    let response = match tokio::time::timeout(REQUEST_TIMEOUT, request).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => return Err(format!("GPT-5.5 request failed: {err}")),
+        Err(_) => return Err("GPT-5.5 request timed out".to_string()),
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(300).collect();
+        return Err(format!("GPT-5.5 returned {status}: {snippet}"));
+    }
+
+    let parsed: ChatCompletionResponse = response
+        .json()
+        .await
+        .map_err(|err| format!("could not parse GPT-5.5 response: {err}"))?;
+
+    let content = parsed
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|choice| choice.message.content)
+        .ok_or_else(|| "GPT-5.5 response had no message content".to_string())?;
+
+    // Validate returned ranges against the transcript context's own span —
+    // mirrors `analyze_transcript`'s "must be within the transcript given"
+    // rule. If the window came back with no kept transcript at all (a rare
+    // edge case — e.g. a lesson sitting in a stretch of the video that's
+    // all `keep = 0`), there's nothing to bound against; skip the range
+    // check entirely rather than rejecting every proposed segment against
+    // an `(Infinity, -Infinity)` empty span.
+    let (range_start, range_end) = if transcript_segments.is_empty() {
+        (f64::NEG_INFINITY, f64::INFINITY)
+    } else {
+        let start = transcript_segments
+            .iter()
+            .map(|segment| segment.start)
+            .fold(f64::INFINITY, f64::min);
+        let end = transcript_segments
+            .iter()
+            .map(|segment| segment.end)
+            .fold(f64::NEG_INFINITY, f64::max);
+        (start, end)
+    };
+
+    parse_edit_segments(&content, range_start, range_end)
+}
+
+/// Padding (seconds, each side) around a lesson's own current span used to
+/// size the transcript context sent to `edit_lesson_segments_via_ai` —
+/// enough surrounding text for the model to see context around a lesson's
+/// current edges ("remove the tangent right before the demo starts")
+/// without shipping the whole video's transcript for a scoped edit. Also
+/// the per-side pad folded in around any timestamp the instruction pins to
+/// a specific point (see `preview_lesson_segment_edit`).
+const LESSON_EDIT_CONTEXT_PAD_SECS: f64 = 60.0;
+
+/// Proposes a revised segment list for `lesson_id` per `instruction`,
+/// without writing anything to the database — see `apply_lesson_segment_
+/// edit` for the write side of this two-step, review-gated flow
+/// (`docs/lesson-ai-edit-plan.md`).
+///
+/// `baseline` is `None` for the main prompt box's initial submission (this
+/// loads the lesson's current `lesson_segments` from the DB as the
+/// baseline) or `Some` for a refinement typed inside the review popup —
+/// exactly the *previous, not-yet-applied* proposal the popup was showing,
+/// not the DB rows, since nothing has been written yet. Either way, the
+/// transcript context window is always sized from the lesson's own real,
+/// current `lesson_segments` (never the resolved baseline) — a
+/// refinement's context window doesn't drift just because the hypothetical
+/// proposal being refined has moved away from the lesson's real footprint.
+///
+/// Only transcript **text** and `instruction` (also text) ever reach
+/// OpenAI here — never audio, never video, never any other SQLite content
+/// beyond what locates the right rows. See `coursecut-privacy-invariants`.
+#[tauri::command(async)]
+pub async fn preview_lesson_segment_edit(
+    _app: AppHandle,
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+    instruction: String,
+    baseline: Option<Vec<db::SegmentRange>>,
+) -> Result<Vec<db::SegmentRange>, String> {
+    if instruction.trim().is_empty() {
+        return Err("Describe the change you want before previewing it.".to_string());
+    }
+
+    // `db::SegmentRange` is this command's IPC boundary shape (`{start,
+    // end}`, matching the frontend's `LessonSegmentRange`); everything
+    // below works in the plain `(f64, f64)` tuples the rest of this
+    // module's segment-editing/validation logic already uses.
+    let baseline: Option<Vec<(f64, f64)>> = baseline
+        .map(|ranges| ranges.into_iter().map(|range| (range.start, range.end)).collect());
+
+    let (video_id, own_segments) = {
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        let lesson = db::query_lesson(&guard, &lesson_id)?;
+
+        let mut stmt = guard
+            .prepare(
+                "SELECT start, end FROM lesson_segments WHERE lesson_id = ?1
+                 ORDER BY sort_order, id",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(params![lesson_id], |row| {
+                Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(|err| err.to_string())?;
+        let own_segments: Vec<(f64, f64)> =
+            rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())?;
+
+        (lesson.video_id, own_segments)
+    };
+
+    let baseline_segments = baseline.unwrap_or_else(|| own_segments.clone());
+
+    // Window base: the lesson's own real footprint (never the resolved
+    // baseline — see docs above), padded on each side. A lesson always has
+    // at least one segment while it exists (deleting the last one deletes
+    // the lesson itself, see `db::delete_lesson_segment_tx`), so the
+    // `lesson.start`/`lesson.end` fallback below is defense-in-depth, not
+    // an expected path.
+    let (mut window_start, mut window_end) = if own_segments.is_empty() {
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        let lesson = db::query_lesson(&guard, &lesson_id)?;
+        (lesson.start, lesson.end)
+    } else {
+        let start = own_segments
+            .iter()
+            .map(|(start, _)| *start)
+            .fold(f64::INFINITY, f64::min);
+        let end = own_segments
+            .iter()
+            .map(|(_, end)| *end)
+            .fold(f64::NEG_INFINITY, f64::max);
+        (start, end)
+    };
+    window_start -= LESSON_EDIT_CONTEXT_PAD_SECS;
+    window_end += LESSON_EDIT_CONTEXT_PAD_SECS;
+
+    // Widen further to cover every timestamp the instruction pins to a
+    // specific point, each ± the same pad — so a timestamp reaching outside
+    // the lesson's own current span still has real transcript text behind
+    // it, rather than the model being asked about a time range it was
+    // never shown anything for.
+    for timestamp in extract_timestamps_seconds(&instruction) {
+        window_start = window_start.min(timestamp - LESSON_EDIT_CONTEXT_PAD_SECS);
+        window_end = window_end.max(timestamp + LESSON_EDIT_CONTEXT_PAD_SECS);
+    }
+
+    let transcript_segments: Vec<TranscriptSegmentRow> = {
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, video_id, start, end, text, keep FROM transcript_segments
+                 WHERE video_id = ?1 AND keep = 1 AND end >= ?2 AND start <= ?3
+                 ORDER BY start, id",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(params![video_id, window_start, window_end], |row| {
+                Ok(TranscriptSegmentRow {
+                    id: row.get("id")?,
+                    video_id: row.get("video_id")?,
+                    start: row.get("start")?,
+                    end: row.get("end")?,
+                    text: row.get("text")?,
+                    keep: row.get("keep")?,
+                })
+            })
+            .map_err(|err| err.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())?
+    };
+
+    let api_key = settings::read_stored_key()?
+        .ok_or_else(|| "No OpenAI API key saved — add one in Settings".to_string())?;
+
+    let result =
+        edit_lesson_segments_via_ai(&baseline_segments, &transcript_segments, &instruction, &api_key)
+            .await?;
+
+    Ok(result
+        .into_iter()
+        .map(|(start, end)| db::SegmentRange { start, end })
+        .collect())
+}
+
+/// Commits `segments` — exactly the array `preview_lesson_segment_edit`
+/// returned and the frontend's review popup displayed — as `lesson_id`'s
+/// new `lesson_segments`, replacing whatever was there before. Synchronous,
+/// no network call: `preview_lesson_segment_edit` is the only place this
+/// feature's AI output exists before the user has seen and accepted it (see
+/// its own docs), so by the time this runs there's nothing left to decide,
+/// just a transaction to commit. Re-validates `start < end` per range
+/// defensively, even though the frontend shouldn't be able to send anything
+/// `preview` didn't already produce.
+///
+/// Rejects an empty `segments` array outright, without touching the
+/// database — this path never deletes a lesson as a side effect of an AI
+/// proposal (even one the user has reviewed and confirmed); whole-lesson
+/// deletion already has its own explicit, confirmed affordance elsewhere on
+/// this page. Contrast with `db::delete_lesson_segment`'s "last segment
+/// gone deletes the lesson" rule, which fires from an explicit, unambiguous
+/// per-segment delete click, not a free-text instruction's AI-authored
+/// interpretation.
+#[tauri::command]
+pub fn apply_lesson_segment_edit(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+    segments: Vec<db::SegmentRange>,
+) -> Result<Vec<LessonSegmentRow>, String> {
+    if segments.is_empty() {
+        return Err(
+            "That would remove every segment in this lesson — to delete the whole lesson, use \
+             Delete Lesson instead."
+                .to_string(),
+        );
+    }
+    // Same IPC boundary shape (`db::SegmentRange`) as `preview_lesson_segment_edit`'s baseline/
+    // return value — converted to plain tuples here since the rest of this function's
+    // validate/sort/insert logic already works in that shape.
+    let segments: Vec<(f64, f64)> = segments
+        .into_iter()
+        .map(|range| (range.start, range.end))
+        .collect();
+    for (start, end) in &segments {
+        if !(start < end) {
+            return Err(format!(
+                "invalid segment range: start ({start}) must be before end ({end})"
+            ));
+        }
+    }
+
+    let mut sorted_segments = segments;
+    sorted_segments.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    {
+        let mut guard = conn.0.lock().map_err(|err| err.to_string())?;
+        let tx = guard.transaction().map_err(|err| err.to_string())?;
+
+        tx.execute(
+            "DELETE FROM lesson_segments WHERE lesson_id = ?1",
+            params![lesson_id],
+        )
+        .map_err(|err| err.to_string())?;
+
+        for (index, (start, end)) in sorted_segments.iter().enumerate() {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO lesson_segments (id, lesson_id, start, end, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, lesson_id, start, end, index as i64],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+
+        db::recompute_lesson_bounds_tx(&tx, &lesson_id)?;
+        tx.commit().map_err(|err| err.to_string())?;
+    }
+
+    let guard = conn.0.lock().map_err(|err| err.to_string())?;
+    let mut stmt = guard
+        .prepare(
+            "SELECT id, lesson_id, start, end, sort_order FROM lesson_segments
+             WHERE lesson_id = ?1 ORDER BY sort_order, id",
+        )
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map(params![lesson_id], |row| {
+            Ok(LessonSegmentRow {
+                id: row.get("id")?,
+                lesson_id: row.get("lesson_id")?,
+                start: row.get("start")?,
+                end: row.get("end")?,
+                sort_order: row.get("sort_order")?,
+            })
+        })
+        .map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod extract_timestamps_tests {
+    use super::extract_timestamps_seconds;
+
+    #[test]
+    fn plain_m_ss() {
+        assert_eq!(extract_timestamps_seconds("split at 12:30"), vec![750.0]);
+    }
+
+    #[test]
+    fn h_mm_ss() {
+        assert_eq!(
+            extract_timestamps_seconds("cut everything after 1:02:03"),
+            vec![3723.0]
+        );
+    }
+
+    #[test]
+    fn hh_mm_ss_fff() {
+        assert_eq!(extract_timestamps_seconds("trim to 00:01:02:500"), vec![62.5]);
+    }
+
+    #[test]
+    fn multiple_timestamps_in_one_string() {
+        assert_eq!(
+            extract_timestamps_seconds("cut from 2:15 to 3:40"),
+            vec![135.0, 220.0]
+        );
+    }
+
+    #[test]
+    fn no_timestamps_is_an_empty_result_not_an_error() {
+        assert!(extract_timestamps_seconds("cut the part about pricing").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod parse_edit_segments_tests {
+    use super::parse_edit_segments;
+
+    #[test]
+    fn parses_valid_segments_within_range() {
+        let content = serde_json::json!({
+            "segments": [{"start": 10.0, "end": 20.0}, {"start": 30.0, "end": 40.0}]
+        })
+        .to_string();
+
+        let segments = parse_edit_segments(&content, 0.0, 100.0).unwrap();
+        assert_eq!(segments, vec![(10.0, 20.0), (30.0, 40.0)]);
+    }
+
+    #[test]
+    fn empty_segments_array_is_ok_with_no_segments() {
+        let content = serde_json::json!({"segments": []}).to_string();
+        let segments = parse_edit_segments(&content, 0.0, 100.0).unwrap();
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn drops_out_of_range_or_backwards_segments_without_failing() {
+        let content = serde_json::json!({
+            "segments": [
+                {"start": 10.0, "end": 20.0},
+                {"start": 20.0, "end": 15.0},
+                {"start": 500.0, "end": 600.0},
+            ]
+        })
+        .to_string();
+
+        let segments = parse_edit_segments(&content, 0.0, 100.0).unwrap();
+        assert_eq!(segments, vec![(10.0, 20.0)]);
+    }
+
+    #[test]
+    fn missing_segments_key_is_an_error() {
+        let content = serde_json::json!({"not_segments": []}).to_string();
+        assert!(parse_edit_segments(&content, 0.0, 100.0).is_err());
+    }
+
+    #[test]
+    fn non_json_content_is_an_error_not_a_panic() {
+        assert!(parse_edit_segments("not json", 0.0, 100.0).is_err());
     }
 }

@@ -24,3 +24,4 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros"] }
 tauri-plugin-shell = "2"
 sha2 = "0.11.0"
+regex = "1"

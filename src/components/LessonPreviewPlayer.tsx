@@ -37,9 +37,20 @@ export default function LessonPreviewPlayer({
   lessonTitle,
   onTimeUpdate,
 }: LessonPreviewPlayerProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPaused, setIsPaused] = useState(true);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  // YouTube-style size modes: "small" is this component's normal inline
+  // size (unchanged), "wide" breaks it out of the surrounding layout into a
+  // fixed, centered, oversized overlay (see the CSS) — a lighter-weight
+  // "theater mode" than full screen. "Full screen" is the native browser
+  // API instead of a mode of its own, since it isn't something React state
+  // can drive directly — `isFullscreen` below just mirrors it for the
+  // button's pressed state.
+  const [sizeMode, setSizeMode] = useState<"small" | "wide">("small");
+  const [isFullscreen, setIsFullscreen] = useState(false);
   // Index (into `segments`, in `sort_order`) of the segment currently being
   // played/looped. Advances to the next segment once playback reaches the
   // active one's `end`; wraps back to 0 after the last segment. Mirrored
@@ -61,6 +72,33 @@ export default function LessonPreviewPlayer({
   useEffect(() => {
     pendingAutoSeekRef.current = true;
   }, []);
+
+  // The video element persists for this component's whole lifetime (only
+  // `currentTime` moves between segments, `src` never changes), so setting
+  // `playbackRate` here is enough — no need to re-apply it on segment
+  // advance or seek.
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = playbackRate;
+  }, [playbackRate]);
+
+  // Mirrors the browser's actual full-screen state (rather than tracking
+  // one locally set-and-forget on click) so it also updates correctly when
+  // the user exits via Esc instead of the button.
+  useEffect(() => {
+    function handleFullscreenChange() {
+      setIsFullscreen(document.fullscreenElement === containerRef.current);
+    }
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen();
+    } else {
+      void containerRef.current?.requestFullscreen();
+    }
+  }
 
   // A fresh `segments` array (new fetch, e.g. after an edit elsewhere)
   // resets which one is "active" — the old index may no longer be valid
@@ -147,7 +185,14 @@ export default function LessonPreviewPlayer({
   }
 
   return (
-    <>
+    <div
+      ref={containerRef}
+      className={
+        "lesson-card-player" +
+        (sizeMode === "wide" ? " lesson-card-player-wide" : "") +
+        (isFullscreen ? " lesson-card-player-fullscreen" : "")
+      }
+    >
       <video
         ref={videoRef}
         src={convertFileSrc(videoFilePath)}
@@ -170,6 +215,44 @@ export default function LessonPreviewPlayer({
         <span className="lesson-card-time-readout">
           {formatDuration(virtualCurrentTime)} / {formatDuration(totalVirtualDuration)}
         </span>
+        <select
+          className="lesson-card-speed-select"
+          value={playbackRate}
+          onChange={(event) => setPlaybackRate(Number(event.target.value))}
+          aria-label="Playback speed"
+        >
+          {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+            <option key={rate} value={rate}>
+              {rate}x
+            </option>
+          ))}
+        </select>
+        <div className="lesson-card-size-controls">
+          <button
+            type="button"
+            aria-pressed={sizeMode === "small"}
+            aria-label="Small player"
+            onClick={() => setSizeMode("small")}
+          >
+            ▭
+          </button>
+          <button
+            type="button"
+            aria-pressed={sizeMode === "wide"}
+            aria-label="Wide player"
+            onClick={() => setSizeMode(sizeMode === "wide" ? "small" : "wide")}
+          >
+            ▬
+          </button>
+          <button
+            type="button"
+            aria-pressed={isFullscreen}
+            aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
+            onClick={toggleFullscreen}
+          >
+            {isFullscreen ? "⤢" : "⛶"}
+          </button>
+        </div>
       </div>
 
       <input
@@ -183,6 +266,6 @@ export default function LessonPreviewPlayer({
         onChange={handleVirtualScrub}
         aria-label={`Scrub lesson ${lessonTitle}`}
       />
-    </>
+    </div>
   );
 }

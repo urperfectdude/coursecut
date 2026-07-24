@@ -603,7 +603,10 @@ pub fn update_transcript_segment(
     .map_err(|err| err.to_string())
 }
 
-fn query_lesson(conn: &Connection, id: &str) -> Result<LessonRow, String> {
+/// `pub(crate)` so `openai.rs`'s per-lesson AI edit commands (`preview_lesson_segment_edit`/
+/// `apply_lesson_segment_edit`) can load a lesson's `video_id`/cached bounds without duplicating
+/// this query.
+pub(crate) fn query_lesson(conn: &Connection, id: &str) -> Result<LessonRow, String> {
     conn.query_row(
         "SELECT id, video_id, title, summary, start, end, sort_order, confidence, kind, source
          FROM lessons WHERE id = ?1",
@@ -689,7 +692,9 @@ fn query_lesson_segment(conn: &Connection, id: &str) -> Result<LessonSegmentRow,
 /// cached bound is left as-is — there's nothing to derive it from, and the
 /// spec for this step explicitly doesn't require a lesson to keep at least
 /// one segment.
-fn recompute_lesson_bounds_tx(tx: &rusqlite::Transaction<'_>, lesson_id: &str) -> Result<(), String> {
+/// `pub(crate)` so `openai.rs`'s `apply_lesson_segment_edit` can reuse this after rewriting a
+/// lesson's `lesson_segments` rows, same as every in-module caller below.
+pub(crate) fn recompute_lesson_bounds_tx(tx: &rusqlite::Transaction<'_>, lesson_id: &str) -> Result<(), String> {
     let bounds: Vec<(f64, f64)> = {
         let mut stmt = tx
             .prepare("SELECT start, end FROM lesson_segments WHERE lesson_id = ?1")
@@ -955,12 +960,15 @@ pub fn reorder_lesson_segments(
     tx.commit().map_err(|err| err.to_string())
 }
 
-/// One `{start, end}` range from the frontend's Create Lesson modal, already
-/// collapsed from a transcript-segment checkbox selection into contiguous
-/// runs (see `src/components/CreateLessonModal.tsx`) — a non-contiguous
-/// checked selection arrives here as more than one `SegmentRange`. Plain
-/// IPC input, not a table row.
-#[derive(Debug, Deserialize)]
+/// One `{start, end}` range. Originally just the frontend's Create Lesson
+/// modal's input shape (already collapsed from a transcript-segment
+/// checkbox selection into contiguous runs, see
+/// `src/components/CreateLessonModal.tsx` — a non-contiguous checked
+/// selection arrives here as more than one `SegmentRange`); also reused by
+/// `openai.rs`'s per-lesson AI edit commands, which both take and return
+/// this shape over IPC (hence `Serialize` too, not just `Deserialize`).
+/// Plain IPC value, not a table row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SegmentRange {
     pub start: f64,
     pub end: f64,

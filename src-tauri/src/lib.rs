@@ -73,6 +73,8 @@ pub fn run() {
             ffmpeg::extract_audio_for_video,
             openai::transcribe_video,
             openai::analyze_video,
+            openai::preview_lesson_segment_edit,
+            openai::apply_lesson_segment_edit,
             settings::save_openai_key,
             settings::get_openai_key_status,
             settings::test_openai_key,

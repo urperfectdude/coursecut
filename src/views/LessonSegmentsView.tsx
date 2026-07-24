@@ -1,14 +1,18 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import Breadcrumbs from "../components/Breadcrumbs";
 import LessonPreviewPlayer from "../components/LessonPreviewPlayer";
+import SourceVideoPreview from "../components/SourceVideoPreview";
 import { basename } from "./ProjectDetailView";
 import {
+  addLessonSegment,
+  applyLessonSegmentEdit,
   deleteLessonSegment,
   getProject,
   getVideo,
   listLessonSegments,
   listLessons,
+  previewLessonSegmentEdit,
   queueExport,
   reorderLessonSegments,
   splitLesson,
@@ -16,6 +20,7 @@ import {
   updateLessonSegment,
   type Lesson,
   type LessonSegment,
+  type LessonSegmentRange,
   type Project,
   type Video,
 } from "../db";
@@ -29,6 +34,82 @@ function formatDuration(seconds: number): string {
   const s = total % 60;
   const mmss = `${m}:${String(s).padStart(2, "0")}`;
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : mmss;
+}
+
+/** Seconds → editable `hh:mm:ss:fff` — the single format for the per-segment
+ * start/end fields (replaces the old read-only `h:mm:ss` hint plus separate
+ * plain-seconds numeric input). */
+function formatTimestamp(seconds: number): string {
+  const totalMs = Math.round(seconds * 1000);
+  const ms = totalMs % 1000;
+  const totalSec = Math.floor(totalMs / 1000);
+  const s = totalSec % 60;
+  const totalMin = Math.floor(totalSec / 60);
+  const m = totalMin % 60;
+  const h = Math.floor(totalMin / 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}:${String(ms).padStart(3, "0")}`;
+}
+
+/** Inverse of `formatTimestamp` — strict `hh:mm:ss:fff` only (always what the
+ * field itself displays), so there's no ambiguity over how many digits a
+ * partial millisecond count would mean. Returns `null` on anything else. */
+function parseTimestamp(input: string): number | null {
+  const match = /^(\d+):([0-5]?\d):([0-5]?\d):(\d{3})$/.exec(input.trim());
+  if (!match) return null;
+  const [, hh, mm, ss, fff] = match;
+  return Number(hh) * 3600 + Number(mm) * 60 + Number(ss) + Number(fff) / 1000;
+}
+
+/** Floating-point tolerance for comparing a proposed range against a current
+ * one — segment bounds round-trip through JSON/the AI response, so an exact
+ * `===` would flag a segment the model echoed back unchanged as "trimmed"
+ * over a rounding fraction of a second. */
+const RANGE_MATCH_EPSILON_SECS = 0.01;
+
+function rangesApproximatelyEqual(a: LessonSegmentRange, b: LessonSegmentRange): boolean {
+  return (
+    Math.abs(a.start - b.start) < RANGE_MATCH_EPSILON_SECS &&
+    Math.abs(a.end - b.end) < RANGE_MATCH_EPSILON_SECS
+  );
+}
+
+function rangesOverlap(a: LessonSegmentRange, b: LessonSegmentRange): boolean {
+  return a.start < b.end && b.start < a.end;
+}
+
+type SegmentDiffKind = "unchanged" | "trimmed" | "new";
+
+interface SegmentDiffRow extends LessonSegmentRange {
+  kind: SegmentDiffKind;
+}
+
+/** A first-cut, straightforward interval comparison between `current` (the
+ * lesson's real segments, always the left side of the diff — never the
+ * pre-refine proposal) and `proposed` (what would land if Apply is
+ * clicked): each proposed range is exact-match "unchanged", overlapping-
+ * but-different-bounds "trimmed", or no-overlap-with-anything-current
+ * "new"; each current range with no overlap in `proposed` is "removed". Not
+ * a full diff algorithm — see `docs/lesson-ai-edit-plan.md`. */
+function diffProposedSegments(
+  current: LessonSegmentRange[],
+  proposed: LessonSegmentRange[],
+): { proposedRows: SegmentDiffRow[]; removed: LessonSegmentRange[] } {
+  const proposedRows = proposed.map((range) => {
+    let kind: SegmentDiffKind = "new";
+    if (current.some((existing) => rangesApproximatelyEqual(existing, range))) {
+      kind = "unchanged";
+    } else if (current.some((existing) => rangesOverlap(existing, range))) {
+      kind = "trimmed";
+    }
+    return { ...range, kind };
+  });
+  const removed = current.filter(
+    (existing) =>
+      !proposed.some(
+        (range) => rangesApproximatelyEqual(existing, range) || rangesOverlap(existing, range),
+      ),
+  );
+  return { proposedRows, removed };
 }
 
 interface LessonSegmentsViewProps {
@@ -98,6 +179,18 @@ export default function LessonSegmentsView({
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
+  // Per-lesson AI segment edit (`docs/lesson-ai-edit-plan.md`) — the free-
+  // text prompt box below and its old-vs-new review popup. `proposedSegments`
+  // non-null means the popup is open; `aiPreviewBusy` covers both the main
+  // box's initial preview and the popup's "Update proposal" refine (same
+  // call shape), `aiApplyBusy` is separate so the popup's own buttons can
+  // disable independently of the outer prompt box.
+  const [aiInstruction, setAiInstruction] = useState("");
+  const [aiPreviewBusy, setAiPreviewBusy] = useState(false);
+  const [aiApplyBusy, setAiApplyBusy] = useState(false);
+  const [proposedSegments, setProposedSegments] = useState<LessonSegmentRange[] | null>(null);
+  const [refineInstruction, setRefineInstruction] = useState("");
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -134,6 +227,66 @@ export default function LessonSegmentsView({
   useEffect(() => {
     void fetchSegments();
   }, [fetchSegments]);
+
+  // Submits the outer prompt box: always starts from this lesson's real,
+  // current DB segments (no `baseline`), never anything left over from a
+  // cancelled popup. Doesn't touch `segments` state either way — only opens
+  // the popup on success.
+  const handlePreviewEdit = useCallback(async () => {
+    if (aiPreviewBusy || aiInstruction.trim() === "") return;
+    setAiPreviewBusy(true);
+    try {
+      const proposal = await previewLessonSegmentEdit(lessonId, aiInstruction);
+      setProposedSegments(proposal);
+      setSegmentsError(null);
+    } catch (err) {
+      setSegmentsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAiPreviewBusy(false);
+    }
+  }, [aiPreviewBusy, aiInstruction, lessonId]);
+
+  // The popup's "Update proposal": iterates on the *current* proposal
+  // (passed as `baseline`), not the lesson's real DB rows.
+  const handleRefineProposal = useCallback(async () => {
+    if (aiPreviewBusy || proposedSegments === null || refineInstruction.trim() === "") return;
+    setAiPreviewBusy(true);
+    try {
+      const proposal = await previewLessonSegmentEdit(lessonId, refineInstruction, proposedSegments);
+      setProposedSegments(proposal);
+      setRefineInstruction("");
+      setSegmentsError(null);
+    } catch (err) {
+      setSegmentsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAiPreviewBusy(false);
+    }
+  }, [aiPreviewBusy, proposedSegments, refineInstruction, lessonId]);
+
+  const handleApplyProposal = useCallback(async () => {
+    if (aiApplyBusy || proposedSegments === null || proposedSegments.length === 0) return;
+    setAiApplyBusy(true);
+    try {
+      await applyLessonSegmentEdit(lessonId, proposedSegments);
+      setProposedSegments(null);
+      setRefineInstruction("");
+      setAiInstruction("");
+      await fetchSegments();
+      setSegmentsError(null);
+    } catch (err) {
+      setSegmentsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAiApplyBusy(false);
+    }
+  }, [aiApplyBusy, proposedSegments, lessonId, fetchSegments]);
+
+  // No calls, `segments` untouched — the outer instruction textarea is left
+  // as-is so the user can tweak wording and resubmit (which always goes
+  // through the no-`baseline` path above, so it never inherits this).
+  const handleCancelProposal = useCallback(() => {
+    setProposedSegments(null);
+    setRefineInstruction("");
+  }, []);
 
   const commitSummary = useCallback(async () => {
     if (!lesson || summaryBusy) return;
@@ -181,9 +334,9 @@ export default function LessonSegmentsView({
         return next;
       });
       if (draft === undefined) return;
-      const parsed = Number(draft);
-      if (!Number.isFinite(parsed)) {
-        setSegmentsError("Start must be a number.");
+      const parsed = parseTimestamp(draft);
+      if (parsed === null) {
+        setSegmentsError("Start must be in hh:mm:ss:fff format.");
         return;
       }
       if (!(parsed < segment.end)) {
@@ -222,9 +375,9 @@ export default function LessonSegmentsView({
         return next;
       });
       if (draft === undefined) return;
-      const parsed = Number(draft);
-      if (!Number.isFinite(parsed)) {
-        setSegmentsError("End must be a number.");
+      const parsed = parseTimestamp(draft);
+      if (parsed === null) {
+        setSegmentsError("End must be in hh:mm:ss:fff format.");
         return;
       }
       if (!(parsed > segment.start)) {
@@ -387,6 +540,42 @@ export default function LessonSegmentsView({
     [lessonId, currentTime, fetchSegments],
   );
 
+  // Adds a new segment `[start, end)` to this lesson from the side-by-side
+  // `SourceVideoPreview`'s Mark In/Out controls — this page only ever has
+  // one lesson to target (unlike `LessonEditorView`'s multi-lesson
+  // selection), so `hasSelectedLesson` is always true and there's no
+  // selection state to thread through. Rethrows on failure so
+  // `SourceVideoPreview` leaves the user's marks in place to retry, same
+  // contract as `LessonEditorView`'s own `handleAddSegment`.
+  const handleAddSourceSegment = useCallback(
+    async (start: number, end: number) => {
+      try {
+        await addLessonSegment(lessonId, start, end);
+        await fetchSegments();
+        setSegmentsError(null);
+      } catch (err) {
+        setSegmentsError(err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    },
+    [lessonId, fetchSegments],
+  );
+
+  // Cumulative virtual-timeline duration *before* each segment, same
+  // stitched-together-timeline math as `LessonPreviewPlayer`'s own
+  // `segmentOffsets` (kept separate rather than shared since that one also
+  // tracks the active-playback index, which isn't relevant here) — this is
+  // what lets the read-only "final video" columns below show each
+  // segment's position in the exported lesson rather than the source file.
+  const segmentOffsets = useMemo(() => {
+    let acc = 0;
+    return segments.map((segment) => {
+      const offset = acc;
+      acc += segment.end - segment.start;
+      return offset;
+    });
+  }, [segments]);
+
   return (
     <div>
       <Breadcrumbs
@@ -441,15 +630,67 @@ export default function LessonSegmentsView({
             {formatDuration(lesson.start)}–{formatDuration(lesson.end)}
           </p>
 
-          <div className="lesson-card-preview lesson-segments-preview">
-            <LessonPreviewPlayer
-              videoFilePath={video.file_path}
-              segments={segments}
-              lessonTitle={lesson.title}
-              onTimeUpdate={setCurrentTime}
+          <div className="lesson-segments-ai-panel">
+            <textarea
+              className="lesson-segments-ai-textarea"
+              value={aiInstruction}
+              disabled={aiPreviewBusy}
+              onChange={(event) => setAiInstruction(event.target.value)}
+              placeholder="Describe the change — e.g. &quot;cut the part about pricing&quot; or &quot;split at 12:30&quot; or &quot;trim everything after 4:15&quot;"
+              rows={2}
+              aria-label="Describe a change to this lesson's segments"
             />
-            {segmentsLoading && <p>Loading segments…</p>}
-            {segmentsError && <p className="error">{segmentsError}</p>}
+            <p className="lesson-segments-ai-hint">
+              Exact timestamps (<code>m:ss</code>, <code>h:mm:ss</code>) in your instruction are
+              honored precisely.
+            </p>
+            <button
+              type="button"
+              disabled={aiPreviewBusy || aiInstruction.trim() === ""}
+              onClick={() => void handlePreviewEdit()}
+            >
+              {aiPreviewBusy && proposedSegments === null ? "Previewing…" : "Preview changes"}
+            </button>
+          </div>
+
+          <div className="lesson-segments-preview-row">
+            {/* The raw source video, alongside the lesson's own stitched
+               preview — lets the user scrub the full original recording to
+               find a boundary without leaving this page, rather than only
+               being able to play back what's already in the lesson. Shares
+               `currentTime` (via `onTimeUpdate`) with the lesson preview, so
+               either player's playhead drives Trim/Split at playhead below;
+               its own segment-highlight overlay shows where this lesson's
+               segments sit in the full recording, and its Mark In/Out feeds
+               `handleAddSourceSegment` to add new ones. Placed first (left)
+               since it's the input the lesson preview (right) is derived
+               from — the arrow between them reads that direction. */}
+            <div className="lesson-segments-source-preview">
+              <p className="lesson-segments-preview-label">Original video</p>
+              <SourceVideoPreview
+                filePath={video.file_path}
+                selectedLessonSegments={segments}
+                hasSelectedLesson
+                onTimeUpdate={setCurrentTime}
+                onAddSegment={handleAddSourceSegment}
+              />
+            </div>
+
+            <span className="lesson-segments-preview-arrow" aria-hidden="true">
+              »
+            </span>
+
+            <div className="lesson-card-preview lesson-segments-preview">
+              <p className="lesson-segments-preview-label">Final video</p>
+              <LessonPreviewPlayer
+                videoFilePath={video.file_path}
+                segments={segments}
+                lessonTitle={lesson.title}
+                onTimeUpdate={setCurrentTime}
+              />
+              {segmentsLoading && <p>Loading segments…</p>}
+              {segmentsError && <p className="error">{segmentsError}</p>}
+            </div>
           </div>
 
           <ul className="lesson-card-segment-list">
@@ -478,12 +719,14 @@ export default function LessonSegmentsView({
                     </button>
                   </div>
                   <label className="lesson-card-segment-field">
-                    Start (s) <span className="lesson-card-segment-time-hint">{formatDuration(segment.start)}</span>
+                    Start
                     <input
-                      type="number"
-                      step="0.01"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                      placeholder="hh:mm:ss:fff"
                       disabled={isSegmentBusy}
-                      value={startDrafts[segment.id] ?? segment.start.toFixed(2)}
+                      value={startDrafts[segment.id] ?? formatTimestamp(segment.start)}
                       onChange={(event) =>
                         setStartDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
                       }
@@ -495,12 +738,14 @@ export default function LessonSegmentsView({
                     />
                   </label>
                   <label className="lesson-card-segment-field">
-                    End (s) <span className="lesson-card-segment-time-hint">{formatDuration(segment.end)}</span>
+                    End
                     <input
-                      type="number"
-                      step="0.01"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                      placeholder="hh:mm:ss:fff"
                       disabled={isSegmentBusy}
-                      value={endDrafts[segment.id] ?? segment.end.toFixed(2)}
+                      value={endDrafts[segment.id] ?? formatTimestamp(segment.end)}
                       onChange={(event) =>
                         setEndDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
                       }
@@ -511,6 +756,18 @@ export default function LessonSegmentsView({
                       aria-label={`End time for segment ${segment.id}`}
                     />
                   </label>
+                  <span className="lesson-card-segment-field lesson-card-segment-field-readonly">
+                    Final video start
+                    <span aria-label={`Final video start time for segment ${segment.id}`}>
+                      {formatTimestamp(segmentOffsets[index])}
+                    </span>
+                  </span>
+                  <span className="lesson-card-segment-field lesson-card-segment-field-readonly">
+                    Final video end
+                    <span aria-label={`Final video end time for segment ${segment.id}`}>
+                      {formatTimestamp(segmentOffsets[index] + (segment.end - segment.start))}
+                    </span>
+                  </span>
                   <div className="lesson-card-segment-actions">
                     <button
                       type="button"
@@ -546,8 +803,140 @@ export default function LessonSegmentsView({
               );
             })}
           </ul>
+
+          {proposedSegments !== null && (
+            <LessonAiEditReviewModal
+              currentSegments={segments}
+              proposedSegments={proposedSegments}
+              refineInstruction={refineInstruction}
+              onRefineInstructionChange={setRefineInstruction}
+              onRefine={() => void handleRefineProposal()}
+              onApply={() => void handleApplyProposal()}
+              onCancel={handleCancelProposal}
+              previewBusy={aiPreviewBusy}
+              applyBusy={aiApplyBusy}
+            />
+          )}
         </>
       )}
+    </div>
+  );
+}
+
+interface LessonAiEditReviewModalProps {
+  currentSegments: LessonSegmentRange[];
+  proposedSegments: LessonSegmentRange[];
+  refineInstruction: string;
+  onRefineInstructionChange: (value: string) => void;
+  onRefine: () => void;
+  onApply: () => void;
+  onCancel: () => void;
+  previewBusy: boolean;
+  applyBusy: boolean;
+}
+
+/** Old-vs-new review popup for the AI segment edit prompt
+ * (`docs/lesson-ai-edit-plan.md`) — opened by `LessonSegmentsView` whenever
+ * `proposedSegments` is non-null. Always diffs against `currentSegments`
+ * (the lesson's real, current rows), never against whatever the proposal
+ * looked like before the last refine, so the review always reads as "real
+ * lesson today" vs. "what would land if Apply is clicked now." */
+function LessonAiEditReviewModal({
+  currentSegments,
+  proposedSegments,
+  refineInstruction,
+  onRefineInstructionChange,
+  onRefine,
+  onApply,
+  onCancel,
+  previewBusy,
+  applyBusy,
+}: LessonAiEditReviewModalProps) {
+  const { proposedRows, removed } = useMemo(
+    () => diffProposedSegments(currentSegments, proposedSegments),
+    [currentSegments, proposedSegments],
+  );
+  const isEmptyProposal = proposedSegments.length === 0;
+  const busy = previewBusy || applyBusy;
+
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div
+        className="modal-panel lesson-segments-ai-modal"
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Review proposed segment changes"
+      >
+        <h2>Review proposed changes</h2>
+
+        {isEmptyProposal ? (
+          <p>This would remove every segment in this lesson.</p>
+        ) : (
+          <>
+            <p className="lesson-segments-ai-diff-heading">Current segments</p>
+            <ul className="lesson-segments-ai-diff-list">
+              {currentSegments.map((segment, index) => (
+                <li key={`current-${index}`} className="lesson-segments-ai-diff-row">
+                  {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
+                </li>
+              ))}
+              {currentSegments.length === 0 && <li>(no segments)</li>}
+            </ul>
+
+            <p className="lesson-segments-ai-diff-heading">Proposed segments</p>
+            <ul className="lesson-segments-ai-diff-list">
+              {proposedRows.map((row, index) => (
+                <li
+                  key={`proposed-${index}`}
+                  className={`lesson-segments-ai-diff-row lesson-segments-ai-diff-${row.kind}`}
+                >
+                  {formatTimestamp(row.start)}–{formatTimestamp(row.end)}
+                  <span className="lesson-segments-ai-diff-badge">{row.kind}</span>
+                </li>
+              ))}
+              {removed.map((segment, index) => (
+                <li
+                  key={`removed-${index}`}
+                  className="lesson-segments-ai-diff-row lesson-segments-ai-diff-removed"
+                >
+                  {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
+                  <span className="lesson-segments-ai-diff-badge">removed</span>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+
+        <label className="lesson-segments-ai-refine-field">
+          Refine this proposal
+          <textarea
+            className="lesson-segments-ai-textarea"
+            value={refineInstruction}
+            disabled={busy}
+            onChange={(event) => onRefineInstructionChange(event.target.value)}
+            placeholder="e.g. &quot;keep more of the ending&quot;"
+            rows={2}
+            aria-label="Refine the proposed segment changes"
+          />
+        </label>
+        <p className="lesson-segments-ai-hint">
+          Exact timestamps (<code>m:ss</code>, <code>h:mm:ss</code>) in your instruction are
+          honored precisely.
+        </p>
+        <button type="button" disabled={busy || refineInstruction.trim() === ""} onClick={onRefine}>
+          {previewBusy ? "Updating…" : "Update proposal"}
+        </button>
+
+        <div className="modal-actions">
+          <button type="button" onClick={onCancel} disabled={applyBusy}>
+            Cancel
+          </button>
+          <button type="button" onClick={onApply} disabled={busy || isEmptyProposal}>
+            {applyBusy ? "Applying…" : "Apply"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

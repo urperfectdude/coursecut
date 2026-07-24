@@ -615,6 +615,63 @@ body {
   max-width: 40rem;
 }
 
+/* Side-by-side lesson preview + raw source preview on `LessonSegmentsView`
+ * — the lesson's own stitched clip next to the full original recording, so
+ * the user can scrub the source for a boundary without leaving the page.
+ * Wraps to stacked on narrow windows rather than squeezing both players. */
+.lesson-segments-preview-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+.lesson-segments-preview-row > .lesson-segments-preview,
+.lesson-segments-preview-row > .lesson-segments-source-preview {
+  flex: 1 1 22rem;
+  max-width: 40rem;
+}
+
+.lesson-segments-source-preview .source-preview {
+  max-width: none;
+}
+
+.lesson-segments-preview-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+  margin: 0 0 0.3rem;
+}
+
+/* ">>" between the two players, reading "source video becomes this lesson
+ * preview". Centered on the row (roughly level with the video frames,
+ * ignoring the controls/hint text below them — a fixed vertical offset
+ * would be more precise but isn't worth the brittleness for a decorative
+ * separator), and excluded from flex-wrap sizing so it never claims a full
+ * row of its own on narrow windows. */
+.lesson-segments-preview-arrow {
+  align-self: center;
+  flex: 0 0 auto;
+  font-size: 1.75rem;
+  line-height: 1;
+  opacity: 0.5;
+}
+
+/* Force both players to the same frame height regardless of each video's
+ * own intrinsic aspect ratio — without this, `width: 100%` + `max-height`
+ * (the base `.lesson-card-video`/`.source-preview-video` rules) only caps
+ * height, so two differently-shaped recordings render at different heights
+ * side by side. `object-fit: contain` letterboxes into that fixed height
+ * instead of distorting either video. */
+.lesson-segments-preview-row .lesson-card-video,
+.lesson-segments-preview-row .source-preview-video {
+  height: 25vh;
+  max-height: 25vh;
+  object-fit: contain;
+}
+
 .lesson-card-video {
   display: block;
   width: 100%;
@@ -641,6 +698,64 @@ body {
   font-variant-numeric: tabular-nums;
   font-size: 0.8rem;
   opacity: 0.75;
+}
+
+.lesson-card-speed-select {
+  margin-left: auto;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.lesson-card-player {
+  position: relative;
+}
+
+/* "Theater mode" — breaks the player out of its normal spot in the layout
+   (grid tile or lesson page) into a large, centered fixed overlay, without
+   requiring the native full-screen API. */
+.lesson-card-player-wide {
+  position: fixed;
+  top: 4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(94vw, 1400px);
+  z-index: 1000;
+  background: canvas;
+  padding: 1rem;
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+}
+
+.lesson-card-player-wide .lesson-card-video {
+  max-height: 80vh;
+}
+
+.lesson-card-player-fullscreen {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  height: 100%;
+  padding: 1rem;
+  background: #000;
+}
+
+.lesson-card-player-fullscreen .lesson-card-video {
+  max-height: 82vh;
+}
+
+.lesson-card-size-controls {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.lesson-card-size-controls button {
+  line-height: 1;
+  padding: 0.2rem 0.4rem;
+}
+
+.lesson-card-size-controls button[aria-pressed="true"] {
+  background: rgba(127, 127, 127, 0.35);
+  border-radius: 4px;
 }
 
 .lesson-card-scrubber {
@@ -681,10 +796,11 @@ body {
 
 .lesson-card-segment-field input {
   font: inherit;
-  width: 6rem;
+  font-variant-numeric: tabular-nums;
+  width: 8rem;
 }
 
-.lesson-card-segment-time-hint {
+.lesson-card-segment-field-readonly span {
   font-variant-numeric: tabular-nums;
   opacity: 0.7;
 }
@@ -955,4 +1071,97 @@ body {
   font-size: 0.8rem;
   opacity: 0.7;
   margin: 0.6rem 0 0;
+}
+
+/* Per-lesson AI segment edit (`docs/lesson-ai-edit-plan.md`) — the free-text
+ * prompt panel on `LessonSegmentsView` and its old-vs-new review popup
+ * (reuses the shared `.modal-overlay`/`.modal-panel`/`.modal-actions` shell
+ * above rather than duplicating modal chrome). */
+
+.lesson-segments-ai-panel {
+  margin: 0.75rem 0 1.25rem;
+  max-width: 40rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.lesson-segments-ai-textarea {
+  width: 100%;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.5rem;
+  resize: vertical;
+}
+
+.lesson-segments-ai-hint {
+  font-size: 0.75rem;
+  opacity: 0.65;
+  margin: 0;
+}
+
+.lesson-segments-ai-panel > button {
+  align-self: flex-start;
+}
+
+.lesson-segments-ai-modal {
+  width: min(36rem, 90vw);
+}
+
+.lesson-segments-ai-diff-heading {
+  font-weight: 600;
+  font-size: 0.85rem;
+  margin: 0.75rem 0 0.3rem;
+}
+
+.lesson-segments-ai-diff-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.lesson-segments-ai-diff-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  padding: 0.2rem 0.4rem;
+  border-radius: 3px;
+}
+
+.lesson-segments-ai-diff-badge {
+  font-size: 0.7rem;
+  opacity: 0.75;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.lesson-segments-ai-diff-unchanged {
+  opacity: 0.7;
+}
+
+.lesson-segments-ai-diff-trimmed {
+  background: #fc03;
+}
+
+.lesson-segments-ai-diff-new {
+  background: #2a82;
+}
+
+.lesson-segments-ai-diff-removed {
+  background: #d332;
+  text-decoration: line-through;
+}
+
+.lesson-segments-ai-refine-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+  margin-top: 0.85rem;
 }
