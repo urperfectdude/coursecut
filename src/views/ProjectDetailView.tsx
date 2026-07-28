@@ -17,6 +17,7 @@ import {
   type VideoProgress,
 } from "../db";
 import { useVideoProgress } from "../hooks/useVideoProgress";
+import { formatTimestamp } from "../lib/timestamp";
 
 const NO_KEY_MESSAGE =
   "No OpenAI API key saved yet — add one in Settings, then use Retry to transcribe this video.";
@@ -71,17 +72,11 @@ function stageLabel(stage: VideoProgress["stage"]): string {
   }
 }
 
-/** Seconds → `m:ss` / `h:mm:ss`. Duration is probed later, so most rows
- * show the `--:--` placeholder for now. Exported so `ExportHistoryView`
- * (PRD §11, Milestone 8) can reuse it for lesson duration formatting. */
+/** Seconds → `hh:mm:ss`. Duration is probed later, so most rows show
+ * the placeholder for now. Exported so `ExportHistoryView` (PRD §11,
+ * Milestone 8) can reuse it for lesson duration formatting. */
 export function formatDuration(seconds: number | null): string {
-  if (seconds === null) return "--:--";
-  const total = Math.round(seconds);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mmss = `${m}:${String(s).padStart(2, "0")}`;
-  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : mmss;
+  return seconds === null ? "--:--:--" : formatTimestamp(seconds);
 }
 
 export default function ProjectDetailView({

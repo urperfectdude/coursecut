@@ -1490,35 +1490,43 @@ mod replace_ai_lessons_tx_tests {
 
 /// Scans `text` (the raw instruction string — unmodified before or after
 /// this call, still what's actually sent to the model) for `mm:ss` /
-/// `h:mm:ss` / `hh:mm:ss:fff`-shaped substrings and converts each to total
-/// seconds. Deliberately loose matching (no required zero-padding, no
-/// required milliseconds) — unlike `LessonSegmentsView.tsx`'s own strict
-/// `hh:mm:ss:fff`-only `parseTimestamp`, a user typing into a free-text
-/// prompt box won't reliably zero-pad or include a milliseconds component.
+/// `h:mm:ss` / `hh:mm:ss:ff` / `hh:mm:ss:fff`-shaped substrings and converts
+/// each to total seconds. Deliberately loose matching (no required zero-
+/// padding, sub-second component optional and either 2 or 3 digits) —
+/// unlike `LessonSegmentsView.tsx`'s own strict `hh:mm:ss:fff`-only
+/// `parseTimestampMs`, a user typing into a free-text prompt box won't
+/// reliably zero-pad or stick to exactly 3 fractional digits. A 2-digit
+/// trailing group is read as centiseconds and a 3-digit one as
+/// milliseconds (`:5` alone isn't matched — see the regex below), so `78`
+/// means 0.78s and `078` means 0.078s, not the same value read two ways.
 /// Doesn't validate or clamp anything against a lesson/video's real bounds
 /// — purely "what timestamps, if any, did the user type," used by
 /// `preview_lesson_segment_edit` to widen the transcript context window it
 /// loads. No timestamps found is a valid, empty result, not an error.
 fn extract_timestamps_seconds(text: &str) -> Vec<f64> {
     // 2 to 4 colon-separated groups of 1-3 digits: `mm:ss`, `h:mm:ss`, or
-    // `hh:mm:ss:fff`. `\b` on both ends keeps this from matching in the
-    // middle of a longer digit run (e.g. a 5+ digit id string).
+    // `hh:mm:ss:ff`/`hh:mm:ss:fff`. `\b` on both ends keeps this from
+    // matching in the middle of a longer digit run (e.g. a 5+ digit id
+    // string).
     let pattern = Regex::new(r"\b\d{1,3}(?::\d{1,3}){1,3}\b").expect("static regex is valid");
 
     pattern
         .find_iter(text)
         .filter_map(|matched| {
-            let parts: Vec<f64> = matched
-                .as_str()
-                .split(':')
+            let raw_parts: Vec<&str> = matched.as_str().split(':').collect();
+            let parts: Vec<f64> = raw_parts
+                .iter()
                 .map(|part| part.parse::<f64>().ok())
                 .collect::<Option<Vec<f64>>>()?;
 
             match parts.as_slice() {
                 [minutes, seconds] => Some(minutes * 60.0 + seconds),
                 [hours, minutes, seconds] => Some(hours * 3600.0 + minutes * 60.0 + seconds),
-                [hours, minutes, seconds, millis] => {
-                    Some(hours * 3600.0 + minutes * 60.0 + seconds + millis / 1000.0)
+                [hours, minutes, seconds, fraction] => {
+                    // Scale by however many digits were actually typed —
+                    // `78` (2 digits) is 0.78s, `078` (3 digits) is 0.078s.
+                    let divisor = 10f64.powi(raw_parts[3].len() as i32);
+                    Some(hours * 3600.0 + minutes * 60.0 + seconds + fraction / divisor)
                 }
                 _ => None,
             }
@@ -1928,6 +1936,11 @@ mod extract_timestamps_tests {
     #[test]
     fn hh_mm_ss_fff() {
         assert_eq!(extract_timestamps_seconds("trim to 00:01:02:500"), vec![62.5]);
+    }
+
+    #[test]
+    fn hh_mm_ss_ff_centiseconds() {
+        assert_eq!(extract_timestamps_seconds("trim to 00:01:02:50"), vec![62.5]);
     }
 
     #[test]

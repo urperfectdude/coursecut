@@ -14,7 +14,6 @@ import {
   listLessons,
   mergeLessons,
   queueExport,
-  updateLesson,
   type Lesson,
   type LessonSegment,
   type Project,
@@ -48,15 +47,6 @@ interface LessonEditorViewProps {
   // conversation that moved it here instead, top-right next to "+ Create
   // lesson").
   onOpenExportHistory: () => void;
-}
-
-/** One entry on the undo/redo stack — deliberately scoped to this stage's
- * only cheaply-reversible edit, lesson renames (keep/delete toggles have
- * their own separate stack, on the transcript stage — see
- * `TranscriptStageView`); see the note rendered near the Undo/Redo buttons. */
-interface UndoableAction {
-  undo: () => Promise<void>;
-  redo: () => Promise<void>;
 }
 
 export default function LessonEditorView({
@@ -95,19 +85,10 @@ export default function LessonEditorView({
 
   // Per-row "in-flight" guards (same defensive pattern as
   // `ProjectDetailView`'s `inFlightRef`/`inFlightIds`) — a rapid double
-  // click on a lesson's Split/Merge/Delete/rename-commit shouldn't fire two
-  // concurrent mutations against the same row.
+  // click on a lesson's Split/Merge/Delete shouldn't fire two concurrent
+  // mutations against the same row.
   const lessonBusyRef = useRef<Set<string>>(new Set());
   const [lessonBusyIds, setLessonBusyIds] = useState<Set<string>>(new Set());
-
-  // In-progress edits for the inline title field, keyed by lesson id — only
-  // present while it differs from its last-committed value. Summary
-  // editing lives on `LessonSegmentsView` now, not this grid tile.
-  const [titleDrafts, setTitleDrafts] = useState<Record<string, string>>({});
-
-  // Undo/redo stack (see `UndoableAction` above for scope).
-  const [undoStack, setUndoStack] = useState<UndoableAction[]>([]);
-  const [redoStack, setRedoStack] = useState<UndoableAction[]>([]);
 
   // Queuing exports (PRD §10-11, Milestone 7). `selectedForExport` drives
   // the per-lesson checkboxes used by "Export selected". This stage only
@@ -176,84 +157,15 @@ export default function LessonEditorView({
     };
   }, [selectedLessonId, segmentsRefreshKey]);
 
-  const pushUndo = useCallback((action: UndoableAction) => {
-    setUndoStack((prev) => [...prev, action]);
-    // A fresh edit invalidates whatever was previously redoable.
-    setRedoStack([]);
-  }, []);
-
-  const handleUndo = useCallback(async () => {
-    const action = undoStack[undoStack.length - 1];
-    if (!action) return;
-    setUndoStack((prev) => prev.slice(0, -1));
-    try {
-      await action.undo();
-      setRedoStack((prev) => [...prev, action]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }, [undoStack]);
-
-  const handleRedo = useCallback(async () => {
-    const action = redoStack[redoStack.length - 1];
-    if (!action) return;
-    setRedoStack((prev) => prev.slice(0, -1));
-    try {
-      await action.redo();
-      setUndoStack((prev) => [...prev, action]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }, [redoStack]);
-
   // ---------------------------------------------------------------------
-  // Lessons: rename (undoable), split/merge/delete (not undoable — see
-  // `docs/PRD.md` §8.1 and the note rendered near the Undo button), and
-  // adding a segment from `SourceVideoPreview`'s mark in/out controls.
+  // Lessons: split/merge/delete (see `docs/PRD.md` §8.1), and adding a
+  // segment from `SourceVideoPreview`'s mark in/out controls. Renaming lives
+  // on the lesson's own segments page (`LessonSegmentsView`) now, not here.
   // ---------------------------------------------------------------------
 
   async function refreshLessons() {
     setLessons(await listLessons(videoId));
   }
-
-  const commitTitle = useCallback(
-    async (lesson: Lesson) => {
-      const draft = titleDrafts[lesson.id];
-      setTitleDrafts((prev) => {
-        if (!(lesson.id in prev)) return prev;
-        const next = { ...prev };
-        delete next[lesson.id];
-        return next;
-      });
-      if (draft === undefined) return;
-      const trimmed = draft.trim();
-      if (trimmed === "" || trimmed === lesson.title) return;
-      if (lessonBusyRef.current.has(lesson.id)) return;
-      lessonBusyRef.current.add(lesson.id);
-      setLessonBusyIds(new Set(lessonBusyRef.current));
-      const previousTitle = lesson.title;
-      try {
-        const updated = await updateLesson(lesson.id, { title: trimmed });
-        setLessons((prev) => prev.map((l) => (l.id === lesson.id ? updated : l)));
-        pushUndo({
-          undo: async () => {
-            const reverted = await updateLesson(lesson.id, { title: previousTitle });
-            setLessons((prev) => prev.map((l) => (l.id === lesson.id ? reverted : l)));
-          },
-          redo: async () => {
-            const reapplied = await updateLesson(lesson.id, { title: trimmed });
-            setLessons((prev) => prev.map((l) => (l.id === lesson.id ? reapplied : l)));
-          },
-        });
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        lessonBusyRef.current.delete(lesson.id);
-        setLessonBusyIds(new Set(lessonBusyRef.current));
-      }
-    },
-    [titleDrafts, pushUndo],
-  );
 
   const handleMergeWithNext = useCallback(async (lesson: Lesson, next: Lesson) => {
     if (lessonBusyRef.current.has(lesson.id) || lessonBusyRef.current.has(next.id)) return;
@@ -410,16 +322,6 @@ export default function LessonEditorView({
           />
 
           <section className="editor-panel">
-            <div className="undo-redo-bar">
-              <button type="button" onClick={() => void handleUndo()} disabled={undoStack.length === 0}>
-                Undo
-              </button>
-              <button type="button" onClick={() => void handleRedo()} disabled={redoStack.length === 0}>
-                Redo
-              </button>
-              <span className="undo-note">Undo covers lesson renames only.</span>
-            </div>
-
             {sortedLessons.length > 0 && (
               <div className="export-controls">
                 <button
@@ -460,11 +362,6 @@ export default function LessonEditorView({
                       isSelected={selectedLessonId === lesson.id}
                       onSelect={(id) => setSelectedLessonId((prev) => (prev === id ? null : id))}
                       isBusy={lessonBusyIds.has(lesson.id)}
-                      titleDraft={titleDrafts[lesson.id]}
-                      onTitleDraftChange={(value) =>
-                        setTitleDrafts((prev) => ({ ...prev, [lesson.id]: value }))
-                      }
-                      onCommitTitle={commitTitle}
                       onDelete={handleDeleteLesson}
                       next={next}
                       isNextBusy={next ? lessonBusyIds.has(next.id) : false}

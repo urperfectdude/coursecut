@@ -1,16 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { createLesson, listTranscriptSegments, type LessonSegmentRange, type TranscriptSegment } from "../db";
-
-/** Seconds → `m:ss` / `h:mm:ss` — duplicated from `LessonCard`'s copy rather
- * than shared, same convention as that file's own note. */
-function formatDuration(seconds: number): string {
-  const total = Math.round(seconds);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mmss = `${m}:${String(s).padStart(2, "0")}`;
-  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : mmss;
-}
+import { formatTimestamp } from "../lib/timestamp";
 
 /** Collapses `segments` (already in `start`/`id` order, per
  * `listTranscriptSegments`) into one `{start, end}` range per contiguous run
@@ -151,7 +141,7 @@ export default function CreateLessonModal({ videoId, onClose, onCreated }: Creat
                     onChange={() => toggleSegment(segment.id)}
                   />
                   <span className="create-lesson-segment-time">
-                    {formatDuration(segment.start)}–{formatDuration(segment.end)}
+                    {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
                   </span>
                   <span className="create-lesson-segment-text">{segment.text}</span>
                 </label>

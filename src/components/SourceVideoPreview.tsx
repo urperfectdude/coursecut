@@ -1,6 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { LessonSegment } from "../db";
+import { formatTimestamp } from "../lib/timestamp";
 
 // FFprobe isn't wired up for per-video frame rate in this codebase (see
 // `coursecut-architecture`), so there's no real FPS to step by. This
@@ -9,17 +10,6 @@ import type { LessonSegment } from "../db";
 // stand-in for real FPS probing (out of scope for this milestone).
 const FRAME_STEP_SECONDS = 1 / 30;
 const BIG_STEP_SECONDS = 1;
-
-/** Seconds → `m:ss` / `h:mm:ss` — duplicated from `LessonCard`'s copy
- * rather than shared, same convention as that file's own note. */
-function formatDuration(seconds: number): string {
-  const total = Math.round(seconds);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mmss = `${m}:${String(s).padStart(2, "0")}`;
-  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : mmss;
-}
 
 export interface SourceVideoPreviewHandle {
   seekTo: (time: number) => void;
@@ -64,10 +54,35 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     // the button, the space-bar shortcut, or (once looping/auto-seek lands
     // elsewhere) a programmatic seek.
     const [isPaused, setIsPaused] = useState(true);
+    const [playbackRate, setPlaybackRate] = useState(1);
+    // A CSS-driven full-viewport overlay rather than the native browser
+    // Fullscreen API — Tauri's WKWebView on macOS doesn't support
+    // `element.requestFullscreen()` for arbitrary elements, so that call
+    // silently no-ops there. See `LessonPreviewPlayer`, which shares this
+    // approach.
+    const [isFullscreen, setIsFullscreen] = useState(false);
     const [markIn, setMarkIn] = useState<number | null>(null);
     const [markOut, setMarkOut] = useState<number | null>(null);
     const [addingSegment, setAddingSegment] = useState(false);
     const [addSegmentError, setAddSegmentError] = useState<string | null>(null);
+
+    useEffect(() => {
+      if (videoRef.current) videoRef.current.playbackRate = playbackRate;
+    }, [playbackRate]);
+
+    // Esc also exits, matching native full-screen conventions.
+    useEffect(() => {
+      if (!isFullscreen) return;
+      function handleKeyDown(event: KeyboardEvent) {
+        if (event.key === "Escape") setIsFullscreen(false);
+      }
+      document.addEventListener("keydown", handleKeyDown);
+      return () => document.removeEventListener("keydown", handleKeyDown);
+    }, [isFullscreen]);
+
+    function toggleFullscreen() {
+      setIsFullscreen((value) => !value);
+    }
 
     useImperativeHandle(ref, () => ({
       seekTo(time: number) {
@@ -166,7 +181,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     }, []);
 
     return (
-      <div className="source-preview">
+      <div className={"source-preview" + (isFullscreen ? " source-preview-fullscreen" : "")}>
         <video
           ref={videoRef}
           src={convertFileSrc(filePath)}
@@ -190,8 +205,29 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
             {isPaused ? "▶" : "⏸"}
           </button>
           <span className="source-preview-time-readout">
-            {formatDuration(currentTime)} / {formatDuration(duration)}
+            {formatTimestamp(currentTime)} / {formatTimestamp(duration)}
           </span>
+          <select
+            className="source-preview-speed-select"
+            value={playbackRate}
+            onChange={(event) => setPlaybackRate(Number(event.target.value))}
+            aria-label="Playback speed"
+          >
+            {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+              <option key={rate} value={rate}>
+                {rate}x
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="source-preview-fullscreen-button"
+            aria-pressed={isFullscreen}
+            aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
+            onClick={toggleFullscreen}
+          >
+            {isFullscreen ? "⤢" : "⛶"}
+          </button>
         </div>
 
         <div className="source-preview-scrubber-wrapper">
@@ -228,11 +264,11 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
           <button type="button" disabled={!hasSelectedLesson} onClick={() => setMarkIn(currentTime)}>
             Mark In
           </button>
-          <span className="source-preview-mark-value">{markIn !== null ? formatDuration(markIn) : "—"}</span>
+          <span className="source-preview-mark-value">{markIn !== null ? formatTimestamp(markIn) : "—"}</span>
           <button type="button" disabled={!hasSelectedLesson} onClick={() => setMarkOut(currentTime)}>
             Mark Out
           </button>
-          <span className="source-preview-mark-value">{markOut !== null ? formatDuration(markOut) : "—"}</span>
+          <span className="source-preview-mark-value">{markOut !== null ? formatTimestamp(markOut) : "—"}</span>
           <button type="button" disabled={!canAddSegment} onClick={() => void handleAddSegment()}>
             Add segment
           </button>

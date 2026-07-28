@@ -24,41 +24,7 @@ import {
   type Project,
   type Video,
 } from "../db";
-
-/** Seconds → `m:ss` / `h:mm:ss` — duplicated per-file rather than shared,
- * same convention as `LessonCard`'s and `SourceVideoPreview`'s own copies. */
-function formatDuration(seconds: number): string {
-  const total = Math.round(seconds);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mmss = `${m}:${String(s).padStart(2, "0")}`;
-  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : mmss;
-}
-
-/** Seconds → editable `hh:mm:ss:fff` — the single format for the per-segment
- * start/end fields (replaces the old read-only `h:mm:ss` hint plus separate
- * plain-seconds numeric input). */
-function formatTimestamp(seconds: number): string {
-  const totalMs = Math.round(seconds * 1000);
-  const ms = totalMs % 1000;
-  const totalSec = Math.floor(totalMs / 1000);
-  const s = totalSec % 60;
-  const totalMin = Math.floor(totalSec / 60);
-  const m = totalMin % 60;
-  const h = Math.floor(totalMin / 60);
-  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}:${String(ms).padStart(3, "0")}`;
-}
-
-/** Inverse of `formatTimestamp` — strict `hh:mm:ss:fff` only (always what the
- * field itself displays), so there's no ambiguity over how many digits a
- * partial millisecond count would mean. Returns `null` on anything else. */
-function parseTimestamp(input: string): number | null {
-  const match = /^(\d+):([0-5]?\d):([0-5]?\d):(\d{3})$/.exec(input.trim());
-  if (!match) return null;
-  const [, hh, mm, ss, fff] = match;
-  return Number(hh) * 3600 + Number(mm) * 60 + Number(ss) + Number(fff) / 1000;
-}
+import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "../lib/timestamp";
 
 /** Floating-point tolerance for comparing a proposed range against a current
  * one — segment bounds round-trip through JSON/the AI response, so an exact
@@ -112,6 +78,67 @@ function diffProposedSegments(
   return { proposedRows, removed };
 }
 
+/** One entry on this page's undo/redo stack — covers every segment-mutating
+ * action (bound edits, trim, split, delete, reorder, add, AI-applied edits),
+ * via `applySegmentSnapshot` rather than a bespoke inverse per action (title/
+ * summary edits aren't covered — those aren't "segment edits", and are
+ * cheap to just retype). */
+interface UndoableAction {
+  undo: () => Promise<void>;
+  redo: () => Promise<void>;
+}
+
+/** Reconciles `lessonId`'s actual DB segments to exactly match
+ * `targetRanges` (order included), returning the resulting rows — the
+ * shared restore primitive behind every undo/redo step on this page, so a
+ * single generic function covers bound edits, trim, split, delete, reorder,
+ * add, and AI-applied edits alike instead of a bespoke inverse per action.
+ *
+ * Reconciles by index rather than by identity: the first
+ * `min(current.length, targetRanges.length)` existing rows are updated in
+ * place to the corresponding target range, any current rows beyond that are
+ * deleted, and any extra target ranges are appended fresh — then a single
+ * reorder call fixes the final sequence. Updating in place before deleting
+ * means the segment count never drops to zero mid-restore even when
+ * `current.length > targetRanges.length`, which matters because deleting a
+ * lesson's *last* segment deletes the lesson itself (see
+ * `deleteLessonSegment`) — a fate this function must never trigger as a
+ * side effect of an undo/redo step. Restored rows get fresh ids where
+ * appended; nothing on this page keys off a segment's id across an
+ * undo/redo boundary, so that's fine. */
+async function applySegmentSnapshot(
+  lessonId: string,
+  targetRanges: LessonSegmentRange[],
+): Promise<LessonSegment[]> {
+  const current = await listLessonSegments(lessonId);
+  const overlapCount = Math.min(current.length, targetRanges.length);
+
+  for (let i = 0; i < overlapCount; i++) {
+    const segment = current[i];
+    const target = targetRanges[i];
+    if (segment.start !== target.start || segment.end !== target.end) {
+      await updateLessonSegment(segment.id, target.start, target.end);
+    }
+  }
+
+  for (let i = current.length - 1; i >= overlapCount; i--) {
+    await deleteLessonSegment(current[i].id);
+  }
+
+  const appendedIds: string[] = [];
+  for (let i = overlapCount; i < targetRanges.length; i++) {
+    const created = await addLessonSegment(lessonId, targetRanges[i].start, targetRanges[i].end);
+    appendedIds.push(created.id);
+  }
+
+  const orderedIds = [...current.slice(0, overlapCount).map((segment) => segment.id), ...appendedIds];
+  if (orderedIds.length > 1) {
+    await reorderLessonSegments(lessonId, orderedIds);
+  }
+
+  return listLessonSegments(lessonId);
+}
+
 interface LessonSegmentsViewProps {
   projectId: string;
   videoId: string;
@@ -157,10 +184,21 @@ export default function LessonSegmentsView({
   const [summaryDraft, setSummaryDraft] = useState<string | undefined>(undefined);
   const [summaryBusy, setSummaryBusy] = useState(false);
 
-  // Real (source-file) current time, mirrored up from `LessonPreviewPlayer`
+  // Same draft-then-commit-on-blur pattern as the summary above — the title
+  // is only editable here, not on the grid tile.
+  const [titleDraft, setTitleDraft] = useState<string | undefined>(undefined);
+  const [titleBusy, setTitleBusy] = useState(false);
+
+  // Real (source-file) current time, mirrored up from either preview player
   // — used for "at playhead" trim/split, which operate on the real time,
-  // not that component's own virtual stitched-timeline one.
+  // not `LessonPreviewPlayer`'s own virtual stitched-timeline one.
   const [currentTime, setCurrentTime] = useState(0);
+  // Same real-time coordinate, but mirrored up only from the final
+  // (`LessonPreviewPlayer`) side — used solely to highlight which segment is
+  // currently playing in the list below. Kept separate from `currentTime`
+  // (shared with the source player) so scrubbing the *original* recording
+  // doesn't imply a segment is "playing" in the final, stitched video.
+  const [finalVideoTime, setFinalVideoTime] = useState(0);
 
   // Draft values for the per-segment start/end numeric inputs, keyed by
   // segment id — same draft-then-commit-on-blur pattern as the summary
@@ -171,6 +209,10 @@ export default function LessonSegmentsView({
   // Per-segment in-flight guard, same defensive pattern as
   // `LessonEditorView`'s busy-id sets.
   const [segmentBusyIds, setSegmentBusyIds] = useState<Set<string>>(new Set());
+
+  // Undo/redo stack for segment edits (see `UndoableAction` above for scope).
+  const [undoStack, setUndoStack] = useState<UndoableAction[]>([]);
+  const [redoStack, setRedoStack] = useState<UndoableAction[]>([]);
 
   // Queuing this lesson's own export — same folder-picker-then-queue flow
   // as `LessonEditorView`'s per-lesson Export button; viewing/managing the
@@ -228,6 +270,57 @@ export default function LessonSegmentsView({
     void fetchSegments();
   }, [fetchSegments]);
 
+  const pushUndo = useCallback((action: UndoableAction) => {
+    setUndoStack((prev) => [...prev, action]);
+    // A fresh edit invalidates whatever was previously redoable.
+    setRedoStack([]);
+  }, []);
+
+  const handleUndo = useCallback(async () => {
+    const action = undoStack[undoStack.length - 1];
+    if (!action) return;
+    setUndoStack((prev) => prev.slice(0, -1));
+    try {
+      await action.undo();
+      setRedoStack((prev) => [...prev, action]);
+    } catch (err) {
+      setSegmentsError(err instanceof Error ? err.message : String(err));
+    }
+  }, [undoStack]);
+
+  const handleRedo = useCallback(async () => {
+    const action = redoStack[redoStack.length - 1];
+    if (!action) return;
+    setRedoStack((prev) => prev.slice(0, -1));
+    try {
+      await action.redo();
+      setUndoStack((prev) => [...prev, action]);
+    } catch (err) {
+      setSegmentsError(err instanceof Error ? err.message : String(err));
+    }
+  }, [redoStack]);
+
+  // Runs a segment-mutating IPC call, then records an undo/redo step
+  // spanning it — captures this lesson's full segment range list right
+  // before `mutate` and right after, so `applySegmentSnapshot` can restore
+  // either side later. Every segment-mutating handler below routes through
+  // this instead of calling `fetchSegments` itself, so each one gets
+  // undo/redo "for free" without a bespoke inverse.
+  const withSegmentUndo = useCallback(
+    async (mutate: () => Promise<void>) => {
+      const before = segments.map((segment) => ({ start: segment.start, end: segment.end }));
+      await mutate();
+      const after = await listLessonSegments(lessonId);
+      setSegments(after);
+      const afterRanges = after.map((segment) => ({ start: segment.start, end: segment.end }));
+      pushUndo({
+        undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
+        redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+      });
+    },
+    [segments, lessonId, pushUndo],
+  );
+
   // Submits the outer prompt box: always starts from this lesson's real,
   // current DB segments (no `baseline`), never anything left over from a
   // cancelled popup. Doesn't touch `segments` state either way — only opens
@@ -267,18 +360,19 @@ export default function LessonSegmentsView({
     if (aiApplyBusy || proposedSegments === null || proposedSegments.length === 0) return;
     setAiApplyBusy(true);
     try {
-      await applyLessonSegmentEdit(lessonId, proposedSegments);
+      await withSegmentUndo(async () => {
+        await applyLessonSegmentEdit(lessonId, proposedSegments);
+      });
       setProposedSegments(null);
       setRefineInstruction("");
       setAiInstruction("");
-      await fetchSegments();
       setSegmentsError(null);
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
     } finally {
       setAiApplyBusy(false);
     }
-  }, [aiApplyBusy, proposedSegments, lessonId, fetchSegments]);
+  }, [aiApplyBusy, proposedSegments, lessonId, withSegmentUndo]);
 
   // No calls, `segments` untouched — the outer instruction textarea is left
   // as-is so the user can tweak wording and resubmit (which always goes
@@ -304,6 +398,25 @@ export default function LessonSegmentsView({
       setSummaryBusy(false);
     }
   }, [lesson, summaryDraft, summaryBusy]);
+
+  const commitTitle = useCallback(async () => {
+    if (!lesson || titleBusy) return;
+    if (titleDraft === undefined) return;
+    const trimmed = titleDraft.trim();
+    setTitleDraft(undefined);
+    // An empty title would leave the lesson unlabeled everywhere it's
+    // referenced (breadcrumbs, the grid tile, exports) — revert instead.
+    if (trimmed === "" || trimmed === lesson.title) return;
+    setTitleBusy(true);
+    try {
+      setLesson(await updateLesson(lesson.id, { title: trimmed }));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTitleBusy(false);
+    }
+  }, [lesson, titleDraft, titleBusy]);
 
   const handleExport = useCallback(async () => {
     if (exporting) return;
@@ -334,7 +447,7 @@ export default function LessonSegmentsView({
         return next;
       });
       if (draft === undefined) return;
-      const parsed = parseTimestamp(draft);
+      const parsed = parseTimestampMs(draft);
       if (parsed === null) {
         setSegmentsError("Start must be in hh:mm:ss:fff format.");
         return;
@@ -345,8 +458,9 @@ export default function LessonSegmentsView({
       }
       setSegmentBusyIds((prev) => new Set(prev).add(segment.id));
       try {
-        await updateLessonSegment(segment.id, parsed, segment.end);
-        await fetchSegments();
+        await withSegmentUndo(async () => {
+          await updateLessonSegment(segment.id, parsed, segment.end);
+        });
         setSegmentsError(null);
       } catch (err) {
         setSegmentsError(err instanceof Error ? err.message : String(err));
@@ -358,7 +472,7 @@ export default function LessonSegmentsView({
         });
       }
     },
-    [startDrafts, segmentBusyIds, fetchSegments],
+    [startDrafts, segmentBusyIds, withSegmentUndo],
   );
 
   const commitSegmentEnd = useCallback(
@@ -375,7 +489,7 @@ export default function LessonSegmentsView({
         return next;
       });
       if (draft === undefined) return;
-      const parsed = parseTimestamp(draft);
+      const parsed = parseTimestampMs(draft);
       if (parsed === null) {
         setSegmentsError("End must be in hh:mm:ss:fff format.");
         return;
@@ -386,8 +500,9 @@ export default function LessonSegmentsView({
       }
       setSegmentBusyIds((prev) => new Set(prev).add(segment.id));
       try {
-        await updateLessonSegment(segment.id, segment.start, parsed);
-        await fetchSegments();
+        await withSegmentUndo(async () => {
+          await updateLessonSegment(segment.id, segment.start, parsed);
+        });
         setSegmentsError(null);
       } catch (err) {
         setSegmentsError(err instanceof Error ? err.message : String(err));
@@ -399,7 +514,59 @@ export default function LessonSegmentsView({
         });
       }
     },
-    [endDrafts, segmentBusyIds, fetchSegments],
+    [endDrafts, segmentBusyIds, withSegmentUndo],
+  );
+
+  // Step size for the Start/End fields' ▲/▼ nudge buttons — matches the old
+  // plain-seconds `<input type="number" step="0.01">` this hh:mm:ss:fff
+  // field replaced, so nudging still moves in 10ms increments.
+  const BOUND_STEP_SECONDS = 0.01;
+
+  // Nudges one bound of `segment` by ±`BOUND_STEP_SECONDS`, committing
+  // immediately (no draft/blur step, unlike typing into the field) — same
+  // in-flight guard and error handling as `commitSegmentStart`/`commitSegmentEnd`.
+  // Silently no-ops if the nudge would push start past end or below zero,
+  // same "change ignored" spirit as those two without needing a banner for
+  // what's obviously just the button being at its limit.
+  const adjustSegmentBound = useCallback(
+    async (segment: LessonSegment, bound: "start" | "end", direction: 1 | -1) => {
+      if (segmentBusyIds.has(segment.id)) return;
+      const delta = direction * BOUND_STEP_SECONDS;
+      const nextStart = bound === "start" ? segment.start + delta : segment.start;
+      const nextEnd = bound === "end" ? segment.end + delta : segment.end;
+      if (nextStart < 0 || !(nextStart < nextEnd)) return;
+      setSegmentBusyIds((prev) => new Set(prev).add(segment.id));
+      try {
+        await withSegmentUndo(async () => {
+          await updateLessonSegment(segment.id, nextStart, nextEnd);
+        });
+        if (bound === "start") {
+          setStartDrafts((prev) => {
+            if (!(segment.id in prev)) return prev;
+            const next = { ...prev };
+            delete next[segment.id];
+            return next;
+          });
+        } else {
+          setEndDrafts((prev) => {
+            if (!(segment.id in prev)) return prev;
+            const next = { ...prev };
+            delete next[segment.id];
+            return next;
+          });
+        }
+        setSegmentsError(null);
+      } catch (err) {
+        setSegmentsError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setSegmentBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(segment.id);
+          return next;
+        });
+      }
+    },
+    [segmentBusyIds, withSegmentUndo],
   );
 
   const handleTrimSegmentStart = useCallback(
@@ -411,8 +578,9 @@ export default function LessonSegmentsView({
       }
       setSegmentBusyIds((prev) => new Set(prev).add(segment.id));
       try {
-        await updateLessonSegment(segment.id, currentTime, segment.end);
-        await fetchSegments();
+        await withSegmentUndo(async () => {
+          await updateLessonSegment(segment.id, currentTime, segment.end);
+        });
         setStartDrafts((prev) => {
           if (!(segment.id in prev)) return prev;
           const next = { ...prev };
@@ -430,7 +598,7 @@ export default function LessonSegmentsView({
         });
       }
     },
-    [currentTime, segmentBusyIds, fetchSegments],
+    [currentTime, segmentBusyIds, withSegmentUndo],
   );
 
   const handleTrimSegmentEnd = useCallback(
@@ -442,8 +610,9 @@ export default function LessonSegmentsView({
       }
       setSegmentBusyIds((prev) => new Set(prev).add(segment.id));
       try {
-        await updateLessonSegment(segment.id, segment.start, currentTime);
-        await fetchSegments();
+        await withSegmentUndo(async () => {
+          await updateLessonSegment(segment.id, segment.start, currentTime);
+        });
         setEndDrafts((prev) => {
           if (!(segment.id in prev)) return prev;
           const next = { ...prev };
@@ -461,7 +630,7 @@ export default function LessonSegmentsView({
         });
       }
     },
-    [currentTime, segmentBusyIds, fetchSegments],
+    [currentTime, segmentBusyIds, withSegmentUndo],
   );
 
   const handleDeleteSegment = useCallback(
@@ -470,13 +639,23 @@ export default function LessonSegmentsView({
       if (!window.confirm("Delete this segment? This cannot be undone.")) return;
       setSegmentBusyIds((prev) => new Set(prev).add(segment.id));
       try {
+        // Not routed through `withSegmentUndo` — a delete that takes the
+        // whole lesson down with it (see below) leaves nothing on this page
+        // to restore a snapshot into, so it must never push an undo entry.
+        const before = segments.map((s) => ({ start: s.start, end: s.end }));
         const result = await deleteLessonSegment(segment.id);
         if (result.lesson_deleted) {
           // The lesson itself no longer exists — nothing left to edit here.
           onNavigateLessons();
           return;
         }
-        await fetchSegments();
+        const after = await listLessonSegments(lessonId);
+        setSegments(after);
+        const afterRanges = after.map((s) => ({ start: s.start, end: s.end }));
+        pushUndo({
+          undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
+          redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+        });
         setSegmentsError(null);
       } catch (err) {
         setSegmentsError(err instanceof Error ? err.message : String(err));
@@ -488,7 +667,7 @@ export default function LessonSegmentsView({
         });
       }
     },
-    [segmentBusyIds, fetchSegments, onNavigateLessons],
+    [segments, segmentBusyIds, lessonId, onNavigateLessons, pushUndo],
   );
 
   // Swaps `segments[index]` with its neighbor at `index + direction` (-1 =
@@ -507,11 +686,12 @@ export default function LessonSegmentsView({
         const reordered = [...segments];
         reordered[index] = b;
         reordered[other] = a;
-        await reorderLessonSegments(
-          lessonId,
-          reordered.map((segment) => segment.id),
-        );
-        await fetchSegments();
+        await withSegmentUndo(async () => {
+          await reorderLessonSegments(
+            lessonId,
+            reordered.map((segment) => segment.id),
+          );
+        });
         setSegmentsError(null);
       } catch (err) {
         setSegmentsError(err instanceof Error ? err.message : String(err));
@@ -524,20 +704,21 @@ export default function LessonSegmentsView({
         });
       }
     },
-    [segments, segmentBusyIds, lessonId, fetchSegments],
+    [segments, segmentBusyIds, lessonId, withSegmentUndo],
   );
 
   const handleSplitSegment = useCallback(
     async (segment: LessonSegment) => {
       try {
-        await splitLesson(lessonId, segment.id, currentTime);
-        await fetchSegments();
+        await withSegmentUndo(async () => {
+          await splitLesson(lessonId, segment.id, currentTime);
+        });
         setSegmentsError(null);
       } catch (err) {
         setSegmentsError(err instanceof Error ? err.message : String(err));
       }
     },
-    [lessonId, currentTime, fetchSegments],
+    [lessonId, currentTime, withSegmentUndo],
   );
 
   // Adds a new segment `[start, end)` to this lesson from the side-by-side
@@ -550,15 +731,16 @@ export default function LessonSegmentsView({
   const handleAddSourceSegment = useCallback(
     async (start: number, end: number) => {
       try {
-        await addLessonSegment(lessonId, start, end);
-        await fetchSegments();
+        await withSegmentUndo(async () => {
+          await addLessonSegment(lessonId, start, end);
+        });
         setSegmentsError(null);
       } catch (err) {
         setSegmentsError(err instanceof Error ? err.message : String(err));
         throw err;
       }
     },
-    [lessonId, fetchSegments],
+    [lessonId, withSegmentUndo],
   );
 
   // Cumulative virtual-timeline duration *before* each segment, same
@@ -603,7 +785,18 @@ export default function LessonSegmentsView({
       {video && lesson && (
         <>
           <div className="project-header">
-            <h1>{lesson.title}</h1>
+            <input
+              type="text"
+              className="lesson-title-input"
+              value={titleDraft ?? lesson.title}
+              disabled={titleBusy}
+              onChange={(event) => setTitleDraft(event.target.value)}
+              onBlur={() => void commitTitle()}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+              aria-label="Lesson title"
+            />
             <div className="project-header-actions">
               <button
                 type="button"
@@ -627,7 +820,7 @@ export default function LessonSegmentsView({
             aria-label={`Summary for lesson ${lesson.title}`}
           />
           <p className="lesson-item-time">
-            {formatDuration(lesson.start)}–{formatDuration(lesson.end)}
+            {formatTimestamp(lesson.start)}–{formatTimestamp(lesson.end)}
           </p>
 
           <div className="lesson-segments-ai-panel">
@@ -686,19 +879,41 @@ export default function LessonSegmentsView({
                 videoFilePath={video.file_path}
                 segments={segments}
                 lessonTitle={lesson.title}
-                onTimeUpdate={setCurrentTime}
+                onTimeUpdate={(time) => {
+                  setCurrentTime(time);
+                  setFinalVideoTime(time);
+                }}
               />
               {segmentsLoading && <p>Loading segments…</p>}
               {segmentsError && <p className="error">{segmentsError}</p>}
             </div>
           </div>
 
+          <div className="undo-redo-bar">
+            <button type="button" onClick={() => void handleUndo()} disabled={undoStack.length === 0}>
+              Undo
+            </button>
+            <button type="button" onClick={() => void handleRedo()} disabled={redoStack.length === 0}>
+              Redo
+            </button>
+            <span className="undo-note">Undo covers segment edits only.</span>
+          </div>
+
           <ul className="lesson-card-segment-list">
             {segments.map((segment, index) => {
               const isSegmentBusy = segmentBusyIds.has(segment.id);
               const canSplitSegment = currentTime > segment.start && currentTime < segment.end;
+              // Same "is the playhead inside this segment's range" check as
+              // `canSplitSegment` above, just against the final-video-only
+              // `finalVideoTime` instead of the shared `currentTime`.
+              const isActiveSegment = finalVideoTime > segment.start && finalVideoTime < segment.end;
               return (
-                <li key={segment.id} className="lesson-card-segment-row">
+                <li
+                  key={segment.id}
+                  className={
+                    "lesson-card-segment-row" + (isActiveSegment ? " lesson-card-segment-row-active" : "")
+                  }
+                >
                   <div className="lesson-card-segment-order">
                     <span className="lesson-card-segment-order-index">{index + 1}</span>
                     <button
@@ -720,52 +935,92 @@ export default function LessonSegmentsView({
                   </div>
                   <label className="lesson-card-segment-field">
                     Start
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
-                      placeholder="hh:mm:ss:fff"
-                      disabled={isSegmentBusy}
-                      value={startDrafts[segment.id] ?? formatTimestamp(segment.start)}
-                      onChange={(event) =>
-                        setStartDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
-                      }
-                      onBlur={() => void commitSegmentStart(segment)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") event.currentTarget.blur();
-                      }}
-                      aria-label={`Start time for segment ${segment.id}`}
-                    />
+                    <div className="lesson-card-segment-input-row">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                        placeholder="hh:mm:ss:fff"
+                        disabled={isSegmentBusy}
+                        value={startDrafts[segment.id] ?? formatTimestampMs(segment.start)}
+                        onChange={(event) =>
+                          setStartDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
+                        }
+                        onBlur={() => void commitSegmentStart(segment)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") event.currentTarget.blur();
+                        }}
+                        aria-label={`Start time for segment ${segment.id}`}
+                      />
+                      <div className="lesson-card-segment-stepper">
+                        <button
+                          type="button"
+                          disabled={isSegmentBusy}
+                          onClick={() => void adjustSegmentBound(segment, "start", 1)}
+                          aria-label={`Increase start time for segment ${segment.id}`}
+                        >
+                          ▲
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isSegmentBusy}
+                          onClick={() => void adjustSegmentBound(segment, "start", -1)}
+                          aria-label={`Decrease start time for segment ${segment.id}`}
+                        >
+                          ▼
+                        </button>
+                      </div>
+                    </div>
                   </label>
                   <label className="lesson-card-segment-field">
                     End
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
-                      placeholder="hh:mm:ss:fff"
-                      disabled={isSegmentBusy}
-                      value={endDrafts[segment.id] ?? formatTimestamp(segment.end)}
-                      onChange={(event) =>
-                        setEndDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
-                      }
-                      onBlur={() => void commitSegmentEnd(segment)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") event.currentTarget.blur();
-                      }}
-                      aria-label={`End time for segment ${segment.id}`}
-                    />
+                    <div className="lesson-card-segment-input-row">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                        placeholder="hh:mm:ss:fff"
+                        disabled={isSegmentBusy}
+                        value={endDrafts[segment.id] ?? formatTimestampMs(segment.end)}
+                        onChange={(event) =>
+                          setEndDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
+                        }
+                        onBlur={() => void commitSegmentEnd(segment)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") event.currentTarget.blur();
+                        }}
+                        aria-label={`End time for segment ${segment.id}`}
+                      />
+                      <div className="lesson-card-segment-stepper">
+                        <button
+                          type="button"
+                          disabled={isSegmentBusy}
+                          onClick={() => void adjustSegmentBound(segment, "end", 1)}
+                          aria-label={`Increase end time for segment ${segment.id}`}
+                        >
+                          ▲
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isSegmentBusy}
+                          onClick={() => void adjustSegmentBound(segment, "end", -1)}
+                          aria-label={`Decrease end time for segment ${segment.id}`}
+                        >
+                          ▼
+                        </button>
+                      </div>
+                    </div>
                   </label>
                   <span className="lesson-card-segment-field lesson-card-segment-field-readonly">
                     Final video start
                     <span aria-label={`Final video start time for segment ${segment.id}`}>
-                      {formatTimestamp(segmentOffsets[index])}
+                      {formatTimestampMs(segmentOffsets[index])}
                     </span>
                   </span>
                   <span className="lesson-card-segment-field lesson-card-segment-field-readonly">
                     Final video end
                     <span aria-label={`Final video end time for segment ${segment.id}`}>
-                      {formatTimestamp(segmentOffsets[index] + (segment.end - segment.start))}
+                      {formatTimestampMs(segmentOffsets[index] + (segment.end - segment.start))}
                     </span>
                   </span>
                   <div className="lesson-card-segment-actions">

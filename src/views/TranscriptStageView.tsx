@@ -14,6 +14,7 @@ import {
   type VideoProgress,
 } from "../db";
 import { useVideoProgress } from "../hooks/useVideoProgress";
+import { formatTimestamp } from "../lib/timestamp";
 
 interface TranscriptStageViewProps {
   projectId: string;
@@ -31,16 +32,6 @@ interface TranscriptStageViewProps {
 interface UndoableAction {
   undo: () => Promise<void>;
   redo: () => Promise<void>;
-}
-
-/** Seconds → `m:ss` / `h:mm:ss`, matching `ProjectDetailView`'s formatting. */
-function formatDuration(seconds: number): string {
-  const total = Math.round(seconds);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mmss = `${m}:${String(s).padStart(2, "0")}`;
-  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : mmss;
 }
 
 /** Friendly label for a `Stage` value (`src-tauri/src/progress.rs`).
@@ -295,7 +286,7 @@ export default function TranscriptStageView({
                     }
                   >
                     <span className="transcript-segment-time">
-                      {formatDuration(segment.start)}–{formatDuration(segment.end)}
+                      {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
                     </span>
                     <span className="transcript-segment-text">{segment.text}</span>
                     <label className="transcript-segment-keep">

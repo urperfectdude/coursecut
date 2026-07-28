@@ -8,9 +8,6 @@ interface LessonCardProps {
   isSelected: boolean;
   onSelect: (lessonId: string) => void;
   isBusy: boolean;
-  titleDraft: string | undefined;
-  onTitleDraftChange: (value: string) => void;
-  onCommitTitle: (lesson: Lesson) => void;
   onDelete: (lesson: Lesson) => void;
   next: Lesson | null;
   isNextBusy: boolean;
@@ -43,9 +40,6 @@ export default function LessonCard({
   isSelected,
   onSelect,
   isBusy,
-  titleDraft,
-  onTitleDraftChange,
-  onCommitTitle,
   onDelete,
   next,
   isNextBusy,
@@ -89,19 +83,9 @@ export default function LessonCard({
             onChange={() => onToggleExportSelection(lesson.id)}
             aria-label={`Select lesson ${lesson.title} for export`}
           />
-          <input
-            type="text"
-            className="lesson-title-input"
-            value={titleDraft ?? lesson.title}
-            disabled={isBusy}
-            onClick={(event) => event.stopPropagation()}
-            onChange={(event) => onTitleDraftChange(event.target.value)}
-            onBlur={() => onCommitTitle(lesson)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") event.currentTarget.blur();
-            }}
-            aria-label={`Rename lesson ${lesson.title}`}
-          />
+          {/* Read-only here — renaming lives on the lesson's own segments
+             page (`LessonSegmentsView`) now, not this grid tile. */}
+          <span className="lesson-card-title-text">{lesson.title}</span>
         </div>
         <div className="lesson-card-badge-row">
           <span className={`kind-badge kind-${lesson.kind} kind-badge-small`}>{lesson.kind}</span>

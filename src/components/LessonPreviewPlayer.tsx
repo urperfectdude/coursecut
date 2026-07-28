@@ -1,17 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { LessonSegment } from "../db";
-
-/** Seconds → `m:ss` / `h:mm:ss` — duplicated per-file rather than shared,
- * same convention as `LessonCard`'s and `SourceVideoPreview`'s own copies. */
-function formatDuration(seconds: number): string {
-  const total = Math.round(seconds);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mmss = `${m}:${String(s).padStart(2, "0")}`;
-  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : mmss;
-}
+import { formatTimestamp } from "../lib/timestamp";
 
 interface LessonPreviewPlayerProps {
   videoFilePath: string;
@@ -37,19 +27,14 @@ export default function LessonPreviewPlayer({
   lessonTitle,
   onTimeUpdate,
 }: LessonPreviewPlayerProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPaused, setIsPaused] = useState(true);
   const [playbackRate, setPlaybackRate] = useState(1);
-  // YouTube-style size modes: "small" is this component's normal inline
-  // size (unchanged), "wide" breaks it out of the surrounding layout into a
-  // fixed, centered, oversized overlay (see the CSS) — a lighter-weight
-  // "theater mode" than full screen. "Full screen" is the native browser
-  // API instead of a mode of its own, since it isn't something React state
-  // can drive directly — `isFullscreen` below just mirrors it for the
-  // button's pressed state.
-  const [sizeMode, setSizeMode] = useState<"small" | "wide">("small");
+  // A CSS-driven full-viewport overlay rather than the native browser
+  // Fullscreen API — Tauri's WKWebView on macOS doesn't support
+  // `element.requestFullscreen()` for arbitrary elements, so that call
+  // silently no-ops there.
   const [isFullscreen, setIsFullscreen] = useState(false);
   // Index (into `segments`, in `sort_order`) of the segment currently being
   // played/looped. Advances to the next segment once playback reaches the
@@ -81,23 +66,18 @@ export default function LessonPreviewPlayer({
     if (videoRef.current) videoRef.current.playbackRate = playbackRate;
   }, [playbackRate]);
 
-  // Mirrors the browser's actual full-screen state (rather than tracking
-  // one locally set-and-forget on click) so it also updates correctly when
-  // the user exits via Esc instead of the button.
+  // Esc also exits, matching native full-screen conventions.
   useEffect(() => {
-    function handleFullscreenChange() {
-      setIsFullscreen(document.fullscreenElement === containerRef.current);
+    if (!isFullscreen) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setIsFullscreen(false);
     }
-    document.addEventListener("fullscreenchange", handleFullscreenChange);
-    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
-  }, []);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [isFullscreen]);
 
   function toggleFullscreen() {
-    if (document.fullscreenElement) {
-      void document.exitFullscreen();
-    } else {
-      void containerRef.current?.requestFullscreen();
-    }
+    setIsFullscreen((value) => !value);
   }
 
   // A fresh `segments` array (new fetch, e.g. after an edit elsewhere)
@@ -185,14 +165,7 @@ export default function LessonPreviewPlayer({
   }
 
   return (
-    <div
-      ref={containerRef}
-      className={
-        "lesson-card-player" +
-        (sizeMode === "wide" ? " lesson-card-player-wide" : "") +
-        (isFullscreen ? " lesson-card-player-fullscreen" : "")
-      }
-    >
+    <div className={"lesson-card-player" + (isFullscreen ? " lesson-card-player-fullscreen" : "")}>
       <video
         ref={videoRef}
         src={convertFileSrc(videoFilePath)}
@@ -213,7 +186,7 @@ export default function LessonPreviewPlayer({
           {isPaused ? "▶" : "⏸"}
         </button>
         <span className="lesson-card-time-readout">
-          {formatDuration(virtualCurrentTime)} / {formatDuration(totalVirtualDuration)}
+          {formatTimestamp(virtualCurrentTime)} / {formatTimestamp(totalVirtualDuration)}
         </span>
         <select
           className="lesson-card-speed-select"
@@ -227,32 +200,15 @@ export default function LessonPreviewPlayer({
             </option>
           ))}
         </select>
-        <div className="lesson-card-size-controls">
-          <button
-            type="button"
-            aria-pressed={sizeMode === "small"}
-            aria-label="Small player"
-            onClick={() => setSizeMode("small")}
-          >
-            ▭
-          </button>
-          <button
-            type="button"
-            aria-pressed={sizeMode === "wide"}
-            aria-label="Wide player"
-            onClick={() => setSizeMode(sizeMode === "wide" ? "small" : "wide")}
-          >
-            ▬
-          </button>
-          <button
-            type="button"
-            aria-pressed={isFullscreen}
-            aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
-            onClick={toggleFullscreen}
-          >
-            {isFullscreen ? "⤢" : "⛶"}
-          </button>
-        </div>
+        <button
+          type="button"
+          className="lesson-card-fullscreen-button"
+          aria-pressed={isFullscreen}
+          aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
+          onClick={toggleFullscreen}
+        >
+          {isFullscreen ? "⤢" : "⛶"}
+        </button>
       </div>
 
       <input

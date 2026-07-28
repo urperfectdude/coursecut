@@ -443,6 +443,13 @@ body {
   border-radius: 3px;
 }
 
+.lesson-card-title-text {
+  font-weight: 600;
+  font-size: 0.9rem;
+  padding: 0.1rem 0.25rem;
+  flex: 1;
+}
+
 .lesson-summary-input {
   display: block;
   width: 100%;
@@ -502,6 +509,40 @@ body {
   font-variant-numeric: tabular-nums;
   font-size: 0.85rem;
   opacity: 0.75;
+}
+
+.source-preview-speed-select {
+  margin-left: auto;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.source-preview-fullscreen-button {
+  line-height: 1;
+  padding: 0.2rem 0.4rem;
+}
+
+.source-preview-fullscreen-button[aria-pressed="true"] {
+  background: rgba(127, 127, 127, 0.35);
+  border-radius: 4px;
+}
+
+.source-preview-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  max-width: none;
+  padding: 1rem;
+  background: #000;
+}
+
+.source-preview-fullscreen .source-preview-video {
+  height: auto;
+  max-height: 82vh;
+  width: 100%;
 }
 
 .source-preview-scrubber-wrapper {
@@ -710,50 +751,29 @@ body {
   position: relative;
 }
 
-/* "Theater mode" — breaks the player out of its normal spot in the layout
-   (grid tile or lesson page) into a large, centered fixed overlay, without
-   requiring the native full-screen API. */
-.lesson-card-player-wide {
-  position: fixed;
-  top: 4rem;
-  left: 50%;
-  transform: translateX(-50%);
-  width: min(94vw, 1400px);
-  z-index: 1000;
-  background: canvas;
-  padding: 1rem;
-  border-radius: 10px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
-}
-
-.lesson-card-player-wide .lesson-card-video {
-  max-height: 80vh;
-}
-
 .lesson-card-player-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
   display: flex;
   flex-direction: column;
   justify-content: center;
-  height: 100%;
   padding: 1rem;
   background: #000;
 }
 
 .lesson-card-player-fullscreen .lesson-card-video {
+  height: auto;
   max-height: 82vh;
+  width: 100%;
 }
 
-.lesson-card-size-controls {
-  display: flex;
-  gap: 0.25rem;
-}
-
-.lesson-card-size-controls button {
+.lesson-card-fullscreen-button {
   line-height: 1;
   padding: 0.2rem 0.4rem;
 }
 
-.lesson-card-size-controls button[aria-pressed="true"] {
+.lesson-card-fullscreen-button[aria-pressed="true"] {
   background: rgba(127, 127, 127, 0.35);
   border-radius: 4px;
 }
@@ -778,13 +798,21 @@ body {
   align-items: center;
   flex-wrap: wrap;
   gap: 0.75rem;
-  padding: 0.35rem 0;
+  padding: 0.35rem 0 0.35rem 0.6rem;
   border-bottom: 1px solid #ccc2;
   font-size: 0.85rem;
 }
 
 .lesson-card-segment-row:last-child {
   border-bottom: none;
+}
+
+/* Marks whichever segment the final (stitched) video is currently playing —
+ * see `isActiveSegment` in `LessonSegmentsView`. */
+.lesson-card-segment-row-active {
+  background: rgba(127, 127, 127, 0.15);
+  border-radius: 4px;
+  box-shadow: inset 2px 0 0 #4a90d9;
 }
 
 .lesson-card-segment-field {
@@ -803,6 +831,27 @@ body {
 .lesson-card-segment-field-readonly span {
   font-variant-numeric: tabular-nums;
   opacity: 0.7;
+}
+
+.lesson-card-segment-input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.2rem;
+}
+
+/* Nudge Start/End by ±10ms — restores the increment/decrement affordance
+ * the old plain-seconds `<input type="number">` had natively, which the
+ * switch to a colon-separated hh:mm:ss:fff text field otherwise dropped. */
+.lesson-card-segment-stepper {
+  display: flex;
+  flex-direction: column;
+}
+
+.lesson-card-segment-stepper button {
+  flex: 1;
+  line-height: 1;
+  padding: 0 0.3rem;
+  font-size: 0.65rem;
 }
 
 .lesson-card-segment-actions {
