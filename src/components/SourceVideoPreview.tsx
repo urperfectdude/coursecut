@@ -45,6 +45,14 @@ interface SourceVideoPreviewProps {
    * selected. Rejects (leaving the marks in place) on failure so the user
    * can retry rather than silently losing their marked range. */
   onAddSegment: (start: number, end: number) => Promise<void>;
+  /** Placement of the keyboard-shortcut hint + Mark In/Out/Add segment
+   * panel relative to the video. "side" (default) puts it in a column to
+   * the right, for the standalone Lesson Editor view where the preview has
+   * room to spare. "stacked" puts it below the video instead — used on
+   * `LessonSegmentsView`, where this preview already sits narrow beside the
+   * lesson's own preview player, so a side panel there would squeeze the
+   * video too far. */
+  controlsLayout?: "side" | "stacked";
 }
 
 /** Compact, always-visible player for the raw source video — replaces the
@@ -53,7 +61,14 @@ interface SourceVideoPreviewProps {
  * player: per-lesson preview now lives in `LessonCard`. */
 const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPreviewProps>(
   function SourceVideoPreview(
-    { filePath, selectedLessonSegments, hasSelectedLesson, onTimeUpdate, onAddSegment },
+    {
+      filePath,
+      selectedLessonSegments,
+      hasSelectedLesson,
+      onTimeUpdate,
+      onAddSegment,
+      controlsLayout = "side",
+    },
     ref,
   ) {
     const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -212,7 +227,12 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
             "source-preview-fullscreen fixed inset-0 z-[1000] flex max-w-none flex-col justify-center bg-black p-4",
         )}
       >
-        <div className="flex flex-wrap items-start gap-3">
+        <div
+          className={cn(
+            "flex gap-3",
+            controlsLayout === "side" ? "flex-wrap items-start" : "flex-col",
+          )}
+        >
           <div className="min-w-0 flex-1">
             <video
               ref={videoRef}
@@ -284,13 +304,27 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
             />
           </div>
 
-          <div className="flex w-full flex-col gap-1 sm:w-44 sm:shrink-0 sm:pt-1">
-            <p className="text-xs leading-relaxed opacity-60">Space: play/pause</p>
-            <p className="text-xs leading-relaxed opacity-60">←/→: step ~1 frame (1/30s)</p>
-            <p className="text-xs leading-relaxed opacity-60">Shift+←/→: step 1s</p>
+          <div
+            className={cn(
+              "flex flex-col gap-1",
+              controlsLayout === "side" && "w-full sm:w-44 sm:shrink-0 sm:pt-1",
+            )}
+          >
+            {controlsLayout === "side" && (
+              <>
+                <p className="text-xs leading-relaxed opacity-60">Space: play/pause</p>
+                <p className="text-xs leading-relaxed opacity-60">←/→: step ~1 frame (1/30s)</p>
+                <p className="text-xs leading-relaxed opacity-60">Shift+←/→: step 1s</p>
+              </>
+            )}
 
             {hasSelectedLesson ? (
-              <div className="mt-2 flex flex-col gap-2">
+              <div
+                className={cn(
+                  "flex items-center gap-2",
+                  controlsLayout === "side" ? "mt-2 flex-col items-stretch" : "flex-wrap",
+                )}
+              >
                 <div className="flex items-center gap-2">
                   <Button
                     type="button"

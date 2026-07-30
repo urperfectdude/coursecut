@@ -26,7 +26,7 @@ import {
 } from "../db";
 import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "../lib/timestamp";
 import { getSegmentDiffBadgeClassName } from "../lib/badge-variants";
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -57,6 +57,17 @@ import { cn } from "@/lib/utils";
  * `===` would flag a segment the model echoed back unchanged as "trimmed"
  * over a rounding fraction of a second. */
 const RANGE_MATCH_EPSILON_SECS = 0.01;
+
+/** Short example instructions the floating AI input cycles through as its
+ * placeholder while empty — kept to single, concrete asks rather than the
+ * old one-line "e.g. ... or ... or ..." list, which no longer fits the
+ * pill's shorter, single-line resting height. */
+const AI_INSTRUCTION_PLACEHOLDERS = [
+  "Cut the part about pricing",
+  "Split at 12:30",
+  "Trim everything after 4:15",
+  "Remove the intro",
+];
 
 function rangesApproximatelyEqual(a: LessonSegmentRange, b: LessonSegmentRange): boolean {
   return (
@@ -215,6 +226,13 @@ export default function LessonSegmentsView({
   const [titleDraft, setTitleDraft] = useState<string | undefined>(undefined);
   const [titleBusy, setTitleBusy] = useState(false);
 
+  // Title and summary render as static text with a pencil affordance;
+  // clicking it swaps in the draft input/textarea from above. Separate from
+  // `titleDraft`/`summaryDraft` being defined (which only tracks "has this
+  // been typed into") so a blur-triggered commit can also close edit mode.
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [isEditingSummary, setIsEditingSummary] = useState(false);
+
   // Real (source-file) current time, mirrored up from either preview player
   // — used for "at playhead" trim/split, which operate on the real time,
   // not `LessonPreviewPlayer`'s own virtual stitched-timeline one.
@@ -264,6 +282,12 @@ export default function LessonSegmentsView({
   const [aiApplyBusy, setAiApplyBusy] = useState(false);
   const [proposedSegments, setProposedSegments] = useState<LessonSegmentRange[] | null>(null);
   const [refineInstruction, setRefineInstruction] = useState("");
+
+  // Cycles the floating AI input's placeholder through a few short examples
+  // while it's empty, so the one-line hint doesn't have to fit every example
+  // at once. Pauses (via the `aiInstruction !== ""` effect guard below) once
+  // the user starts typing.
+  const [aiPlaceholderIndex, setAiPlaceholderIndex] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -370,6 +394,14 @@ export default function LessonSegmentsView({
       setAiPreviewBusy(false);
     }
   }, [aiPreviewBusy, aiInstruction, lessonId]);
+
+  useEffect(() => {
+    if (aiInstruction !== "") return;
+    const interval = setInterval(() => {
+      setAiPlaceholderIndex((index) => (index + 1) % AI_INSTRUCTION_PLACEHOLDERS.length);
+    }, 2500);
+    return () => clearInterval(interval);
+  }, [aiInstruction]);
 
   // The popup's "Update proposal": iterates on the *current* proposal
   // (passed as `baseline`), not the lesson's real DB rows.
@@ -801,7 +833,7 @@ export default function LessonSegmentsView({
   }, [segments]);
 
   return (
-    <div>
+    <div className="pb-32">
       <Breadcrumbs
         crumbs={[
           { label: "Projects", onClick: onNavigateHome },
@@ -835,20 +867,61 @@ export default function LessonSegmentsView({
 
       {video && lesson && (
         <>
-          <div className="flex items-start justify-between gap-4">
-            <Input
-              type="text"
-              className="min-w-32 flex-1 border-transparent bg-transparent px-1 py-0.5 text-[0.9rem] font-semibold shadow-none hover:border-input focus-visible:border-input dark:bg-transparent"
-              value={titleDraft ?? lesson.title}
-              disabled={titleBusy}
-              onChange={(event) => setTitleDraft(event.target.value)}
-              onBlur={() => void commitTitle()}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") event.currentTarget.blur();
-              }}
-              aria-label="Lesson title"
-            />
-            <div className="flex shrink-0 gap-2">
+          <div className="mt-4 flex items-start justify-between gap-4">
+            {isEditingTitle ? (
+              <Input
+                type="text"
+                autoFocus
+                className="min-w-32 flex-1 px-1 py-0.5 text-2xl font-semibold shadow-none dark:bg-transparent"
+                value={titleDraft ?? lesson.title}
+                disabled={titleBusy}
+                onChange={(event) => setTitleDraft(event.target.value)}
+                onBlur={() => {
+                  void commitTitle();
+                  setIsEditingTitle(false);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.currentTarget.blur();
+                  if (event.key === "Escape") {
+                    setTitleDraft(undefined);
+                    setIsEditingTitle(false);
+                  }
+                }}
+                aria-label="Lesson title"
+              />
+            ) : (
+              <h1 className="min-w-32 flex-1 text-2xl font-semibold">
+                {lesson.title}
+                <button
+                  type="button"
+                  className="ml-2 inline-flex align-middle text-muted-foreground opacity-70 transition-opacity hover:text-foreground hover:opacity-100"
+                  onClick={() => {
+                    setTitleDraft(lesson.title);
+                    setIsEditingTitle(true);
+                  }}
+                  aria-label="Edit lesson title"
+                >
+                  <Pencil className="h-4 w-4" />
+                </button>
+              </h1>
+            )}
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void handleUndo()}
+                disabled={undoStack.length === 0}
+              >
+                Undo
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void handleRedo()}
+                disabled={redoStack.length === 0}
+              >
+                Redo
+              </Button>
               <Button type="button" disabled={exporting} onClick={() => void handleExport()}>
                 {exporting ? "Queuing export…" : "Export"}
               </Button>
@@ -859,44 +932,48 @@ export default function LessonSegmentsView({
               <AlertDescription>{exportError}</AlertDescription>
             </Alert>
           )}
-          <Textarea
-            className="max-w-[40rem]"
-            value={summaryDraft ?? lesson.summary ?? ""}
-            disabled={summaryBusy}
-            onChange={(event) => setSummaryDraft(event.target.value)}
-            onBlur={() => void commitSummary()}
-            placeholder="Summary…"
-            rows={3}
-            aria-label={`Summary for lesson ${lesson.title}`}
-          />
-          <p className="text-xs text-muted-foreground">
-            {formatTimestamp(lesson.start)}–{formatTimestamp(lesson.end)}
-          </p>
 
-          <div className="my-3 flex max-w-xl flex-col gap-1.5">
-            <Textarea
-              value={aiInstruction}
-              disabled={aiPreviewBusy}
-              onChange={(event) => setAiInstruction(event.target.value)}
-              placeholder="Describe the change — e.g. &quot;cut the part about pricing&quot; or &quot;split at 12:30&quot; or &quot;trim everything after 4:15&quot;"
-              rows={2}
-              aria-label="Describe a change to this lesson's segments"
-            />
-            <p className="text-xs text-muted-foreground">
-              Exact timestamps (<code>m:ss</code>, <code>h:mm:ss</code>) in your instruction are
-              honored precisely.
-            </p>
-            <Button
-              type="button"
-              className="self-start"
-              disabled={aiPreviewBusy || aiInstruction.trim() === ""}
-              onClick={() => void handlePreviewEdit()}
-            >
-              {aiPreviewBusy && proposedSegments === null ? "Previewing…" : "Preview changes"}
-            </Button>
+          <div className="mt-4 w-full max-w-[80%]">
+            {isEditingSummary ? (
+              <Textarea
+                autoFocus
+                className="w-full"
+                value={summaryDraft ?? lesson.summary ?? ""}
+                disabled={summaryBusy}
+                onChange={(event) => setSummaryDraft(event.target.value)}
+                onBlur={() => {
+                  void commitSummary();
+                  setIsEditingSummary(false);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    setSummaryDraft(undefined);
+                    setIsEditingSummary(false);
+                  }
+                }}
+                placeholder="Summary…"
+                rows={3}
+                aria-label={`Summary for lesson ${lesson.title}`}
+              />
+            ) : (
+              <p className="w-full whitespace-pre-wrap text-base text-foreground/90">
+                {lesson.summary || "No summary yet."}
+                <button
+                  type="button"
+                  className="ml-2 inline-flex align-middle text-muted-foreground opacity-70 transition-opacity hover:text-foreground hover:opacity-100"
+                  onClick={() => {
+                    setSummaryDraft(lesson.summary ?? "");
+                    setIsEditingSummary(true);
+                  }}
+                  aria-label="Edit summary"
+                >
+                  <Pencil className="h-4 w-4" />
+                </button>
+              </p>
+            )}
           </div>
 
-          <div className="lesson-segments-preview-row flex flex-wrap items-start gap-6">
+          <div className="lesson-segments-preview-row mt-4 flex flex-wrap items-start gap-6">
             {/* The raw source video, alongside the lesson's own stitched
                preview — lets the user scrub the full original recording to
                find a boundary without leaving this page, rather than only
@@ -918,6 +995,7 @@ export default function LessonSegmentsView({
                 hasSelectedLesson
                 onTimeUpdate={setCurrentTime}
                 onAddSegment={handleAddSourceSegment}
+                controlsLayout="stacked"
               />
             </div>
 
@@ -946,29 +1024,7 @@ export default function LessonSegmentsView({
             </div>
           </div>
 
-          <div className="mb-3 flex items-center gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => void handleUndo()}
-              disabled={undoStack.length === 0}
-            >
-              Undo
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => void handleRedo()}
-              disabled={redoStack.length === 0}
-            >
-              Redo
-            </Button>
-            <span className="text-xs text-muted-foreground">Undo covers segment edits only.</span>
-          </div>
-
-          <ul className="m-0 flex list-none flex-col gap-2 p-0">
+          <ul className="m-0 mt-4 flex list-none flex-col gap-2 p-0">
             {segments.map((segment, index) => {
               const isSegmentBusy = segmentBusyIds.has(segment.id);
               const canSplitSegment = currentTime > segment.start && currentTime < segment.end;
@@ -1187,6 +1243,29 @@ export default function LessonSegmentsView({
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>
+
+          <div className="fixed inset-x-0 bottom-6 z-50 flex justify-center px-4">
+            <div className="relative w-full max-w-xl rounded-3xl border border-border bg-background/95 shadow-lg backdrop-blur supports-[backdrop-filter]:bg-background/80">
+              <Textarea
+                value={aiInstruction}
+                disabled={aiPreviewBusy}
+                onChange={(event) => setAiInstruction(event.target.value)}
+                placeholder={AI_INSTRUCTION_PLACEHOLDERS[aiPlaceholderIndex]}
+                className="min-h-9 resize-none rounded-none border-none bg-transparent py-3 pl-4 pr-32 shadow-none focus-visible:border-none focus-visible:ring-0 dark:bg-transparent dark:disabled:bg-transparent"
+                rows={1}
+                aria-label="Describe a change to this lesson's segments"
+              />
+              <Button
+                type="button"
+                size="sm"
+                className="absolute bottom-2 right-2 shrink-0 rounded-full"
+                disabled={aiPreviewBusy || aiInstruction.trim() === ""}
+                onClick={() => void handlePreviewEdit()}
+              >
+                {aiPreviewBusy && proposedSegments === null ? "Previewing…" : "Preview Changes"}
+              </Button>
+            </div>
+          </div>
         </>
       )}
     </div>
