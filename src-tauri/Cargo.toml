@@ -1,6 +1,6 @@
 [package]
 name = "coursecut"
-version = "1.4.1"
+version = "1.4.2"
 description = "AI Course Builder — local-first lecture-to-lesson editor"
 edition = "2021"
 
