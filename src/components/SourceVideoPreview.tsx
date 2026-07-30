@@ -201,7 +201,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
           // `.lesson-segments-source-preview .source-preview` for a
           // side-by-side max-width override — see styles.css and this
           // phase's report for why that's left alone rather than migrated.
-          "source-preview relative my-3 mb-5 max-w-lg",
+          "source-preview relative my-3 mb-5 max-w-2xl",
           // `source-preview-fullscreen` is a plain hook className (no styles
           // of its own) so styles.css can override `LessonSegmentsView`'s
           // shared-height rule below it — that rule is unlayered CSS and
@@ -212,116 +212,131 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
             "source-preview-fullscreen fixed inset-0 z-[1000] flex max-w-none flex-col justify-center bg-black p-4",
         )}
       >
-        <video
-          ref={videoRef}
-          src={convertFileSrc(filePath)}
-          // `source-preview-video` is likewise kept as a hook className —
-          // `LessonSegmentsView`'s stylesheet forces this element to a
-          // shared height alongside `LessonPreviewPlayer`'s video via
-          // `.lesson-segments-preview-row .source-preview-video`.
-          className={cn(
-            "source-preview-video block max-h-[30vh] w-full bg-black",
-            isFullscreen && "h-auto max-h-[82vh] w-full",
-          )}
-          onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
-          onTimeUpdate={handleTimeUpdate}
-          onPlay={() => setIsPaused(false)}
-          onPause={() => setIsPaused(true)}
-        />
+        <div className="flex flex-wrap items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <video
+              ref={videoRef}
+              src={convertFileSrc(filePath)}
+              // `source-preview-video` is likewise kept as a hook className —
+              // `LessonSegmentsView`'s stylesheet forces this element to a
+              // shared height alongside `LessonPreviewPlayer`'s video via
+              // `.lesson-segments-preview-row .source-preview-video`.
+              className={cn(
+                "source-preview-video block max-h-[30vh] w-full bg-black",
+                isFullscreen && "h-auto max-h-[82vh] w-full",
+              )}
+              onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
+              onTimeUpdate={handleTimeUpdate}
+              onPlay={() => setIsPaused(false)}
+              onPause={() => setIsPaused(true)}
+            />
 
-        {/* Replaces native `<video controls>` (dropped above — shadow DOM
-           controls can't carry the yellow segment-highlight overlay, see
-           the scrubber below). This is the only seekbar now. */}
-        <div className="mt-1.5 flex items-center gap-2.5">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            onClick={togglePlayPause}
-            aria-label={isPaused ? "Play" : "Pause"}
-          >
-            {isPaused ? <Play /> : <Pause />}
-          </Button>
-          <span className="text-sm tabular-nums opacity-75">
-            {formatTimestamp(currentTime)} / {formatTimestamp(duration)}
-          </span>
-          <Select value={String(playbackRate)} onValueChange={(value) => setPlaybackRate(Number(value))}>
-            <SelectTrigger size="sm" className="ml-auto" aria-label="Playback speed">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
-                <SelectItem key={rate} value={String(rate)}>
-                  {rate}x
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Button
-            type="button"
-            variant={isFullscreen ? "secondary" : "ghost"}
-            size="icon"
-            aria-pressed={isFullscreen}
-            aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
-            onClick={toggleFullscreen}
-          >
-            {isFullscreen ? <Minimize2 /> : <Maximize />}
-          </Button>
+            {/* Replaces native `<video controls>` (dropped above — shadow DOM
+               controls can't carry the yellow segment-highlight overlay, see
+               the scrubber below). This is the only seekbar now. */}
+            <div className="mt-1.5 flex items-center gap-2.5">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                onClick={togglePlayPause}
+                aria-label={isPaused ? "Play" : "Pause"}
+              >
+                {isPaused ? <Play /> : <Pause />}
+              </Button>
+              <span className="text-sm tabular-nums opacity-75">
+                {formatTimestamp(currentTime)} / {formatTimestamp(duration)}
+              </span>
+              <Select value={String(playbackRate)} onValueChange={(value) => setPlaybackRate(Number(value))}>
+                <SelectTrigger size="sm" className="ml-auto" aria-label="Playback speed">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+                    <SelectItem key={rate} value={String(rate)}>
+                      {rate}x
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                variant={isFullscreen ? "secondary" : "ghost"}
+                size="icon"
+                aria-pressed={isFullscreen}
+                aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
+                onClick={toggleFullscreen}
+              >
+                {isFullscreen ? <Minimize2 /> : <Maximize />}
+              </Button>
+            </div>
+
+            <SegmentedScrubber
+              className="mt-1.5"
+              min={0}
+              max={duration || 0}
+              step={FRAME_STEP_SECONDS}
+              value={Math.min(currentTime, duration || currentTime)}
+              onChange={handleScrub}
+              aria-label="Scrub source video"
+              segments={selectedLessonSegments}
+              duration={duration}
+            />
+          </div>
+
+          <div className="flex w-full flex-col gap-1 sm:w-44 sm:shrink-0 sm:pt-1">
+            <p className="text-xs leading-relaxed opacity-60">Space: play/pause</p>
+            <p className="text-xs leading-relaxed opacity-60">←/→: step ~1 frame (1/30s)</p>
+            <p className="text-xs leading-relaxed opacity-60">Shift+←/→: step 1s</p>
+
+            {hasSelectedLesson ? (
+              <div className="mt-2 flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setMarkIn(currentTime)}
+                  >
+                    Mark In
+                  </Button>
+                  <span className="text-sm tabular-nums opacity-75">
+                    {markIn !== null ? formatTimestamp(markIn) : "—"}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setMarkOut(currentTime)}
+                  >
+                    Mark Out
+                  </Button>
+                  <span className="text-sm tabular-nums opacity-75">
+                    {markOut !== null ? formatTimestamp(markOut) : "—"}
+                  </span>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={!canAddSegment}
+                  onClick={() => void handleAddSegment()}
+                >
+                  Add segment
+                </Button>
+              </div>
+            ) : (
+              <p className="mt-2 text-xs opacity-60">Select a lesson below to add a segment to it.</p>
+            )}
+
+            {addSegmentError && (
+              <Alert variant="destructive" className="mt-2">
+                <AlertDescription>{addSegmentError}</AlertDescription>
+              </Alert>
+            )}
+          </div>
         </div>
-
-        <SegmentedScrubber
-          className="mt-1.5"
-          min={0}
-          max={duration || 0}
-          step={FRAME_STEP_SECONDS}
-          value={Math.min(currentTime, duration || currentTime)}
-          onChange={handleScrub}
-          aria-label="Scrub source video"
-          segments={selectedLessonSegments}
-          duration={duration}
-        />
-
-        <p className="my-1.5 text-xs opacity-60">
-          Space: play/pause · ←/→: step ~1 frame (1/30s) · Shift+←/→: step 1s
-        </p>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={!hasSelectedLesson}
-            onClick={() => setMarkIn(currentTime)}
-          >
-            Mark In
-          </Button>
-          <span className="min-w-14 text-sm tabular-nums opacity-75">
-            {markIn !== null ? formatTimestamp(markIn) : "—"}
-          </span>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={!hasSelectedLesson}
-            onClick={() => setMarkOut(currentTime)}
-          >
-            Mark Out
-          </Button>
-          <span className="min-w-14 text-sm tabular-nums opacity-75">
-            {markOut !== null ? formatTimestamp(markOut) : "—"}
-          </span>
-          <Button type="button" size="sm" disabled={!canAddSegment} onClick={() => void handleAddSegment()}>
-            Add segment
-          </Button>
-        </div>
-        {!hasSelectedLesson && (
-          <p className="my-1.5 text-xs opacity-60">Select a lesson below to add a segment to it.</p>
-        )}
-        {addSegmentError && (
-          <Alert variant="destructive" className="mt-2">
-            <AlertDescription>{addSegmentError}</AlertDescription>
-          </Alert>
-        )}
       </div>
     );
   },

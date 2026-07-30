@@ -340,7 +340,16 @@ export default function LessonEditorView({
 
           <section>
             {sortedLessons.length > 0 && (
-              <div className="my-2 flex items-center gap-2">
+              <div className="my-2 flex items-center justify-end gap-2">
+                {exporting && <span className="text-sm text-muted-foreground">Queuing export…</span>}
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={exporting}
+                  onClick={() => void handleExport(sortedLessons.map((lesson) => lesson.id))}
+                >
+                  Export all lessons
+                </Button>
                 <Button
                   type="button"
                   disabled={exporting || selectedForExport.size === 0}
@@ -348,14 +357,6 @@ export default function LessonEditorView({
                 >
                   Export selected ({selectedForExport.size})
                 </Button>
-                <Button
-                  type="button"
-                  disabled={exporting}
-                  onClick={() => void handleExport(sortedLessons.map((lesson) => lesson.id))}
-                >
-                  Export all lessons
-                </Button>
-                {exporting && <span className="text-sm text-muted-foreground">Queuing export…</span>}
               </div>
             )}
             {exportError && (
