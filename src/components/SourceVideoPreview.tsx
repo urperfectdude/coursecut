@@ -6,6 +6,7 @@ import { formatTimestamp } from "../lib/timestamp";
 import SegmentedScrubber from "./SegmentedScrubber";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Kbd, KbdGroup } from "@/components/ui/kbd";
 import {
   Select,
   SelectContent,
@@ -31,11 +32,13 @@ interface SourceVideoPreviewProps {
   filePath: string;
   /** The currently selected lesson's segments (empty when nothing is
    * selected) — rendered as highlighted blocks on the overlay below the
-   * scrubber, per `docs/lesson-segments-plan.md`'s seek-bar overlay. */
-  selectedLessonSegments: LessonSegment[];
+   * scrubber, per `docs/lesson-segments-plan.md`'s seek-bar overlay. Unused
+   * in `"minimal"` layout, which has no lesson selection. */
+  selectedLessonSegments?: LessonSegment[];
   /** Whether a lesson is currently selected — gates the Mark In/Out/Add
-   * Segment controls, since a segment always needs a target lesson. */
-  hasSelectedLesson: boolean;
+   * Segment controls, since a segment always needs a target lesson. Unused
+   * in `"minimal"` layout, which doesn't render those controls at all. */
+  hasSelectedLesson?: boolean;
   /** Mirrors the video's `timeupdate` event up to the parent, which needs
    * it for the Transcript panel's active-segment highlighting (the
    * transcript belongs to the whole video, not a specific lesson, so it
@@ -43,16 +46,59 @@ interface SourceVideoPreviewProps {
   onTimeUpdate: (time: number) => void;
   /** Adds a new segment `[start, end)` to whichever lesson is currently
    * selected. Rejects (leaving the marks in place) on failure so the user
-   * can retry rather than silently losing their marked range. */
-  onAddSegment: (start: number, end: number) => Promise<void>;
+   * can retry rather than silently losing their marked range. Unused in
+   * `"minimal"` layout. */
+  onAddSegment?: (start: number, end: number) => Promise<void>;
   /** Placement of the keyboard-shortcut hint + Mark In/Out/Add segment
-   * panel relative to the video. "side" (default) puts it in a column to
-   * the right, for the standalone Lesson Editor view where the preview has
-   * room to spare. "stacked" puts it below the video instead — used on
+   * panel relative to the video. "side" puts it in a column to the right.
+   * "stacked" puts it below the video instead — used on
    * `LessonSegmentsView`, where this preview already sits narrow beside the
    * lesson's own preview player, so a side panel there would squeeze the
-   * video too far. */
-  controlsLayout?: "side" | "stacked";
+   * video too far. "minimal" (default) drops the Mark In/Out/Add segment
+   * controls entirely and shows only the keyboard-shortcut hints, as a
+   * single row above a centered video — used on `LessonEditorView`, where
+   * adding a segment now happens on a lesson's own `LessonSegmentsView`
+   * page instead. */
+  controlsLayout?: "side" | "stacked" | "minimal";
+}
+
+/** One "[key] [key]  label" hint, e.g. the Space/←→/Shift+←→ rows below —
+ * factored out since that same trio of hints is rendered twice (the "side"
+ * and "minimal" `controlsLayout`s each show their own copy). */
+function ShortcutHint({ keys, label }: { keys: React.ReactNode; label: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <KbdGroup>{keys}</KbdGroup>
+      <span className="text-xs opacity-60">{label}</span>
+    </div>
+  );
+}
+
+function KeyboardShortcutHints() {
+  return (
+    <>
+      <ShortcutHint keys={<Kbd>Space</Kbd>} label="play/pause" />
+      <ShortcutHint
+        keys={
+          <>
+            <Kbd>←</Kbd>
+            <Kbd>→</Kbd>
+          </>
+        }
+        label="step ~1 frame (1/30s)"
+      />
+      <ShortcutHint
+        keys={
+          <>
+            <Kbd>Shift</Kbd>
+            <Kbd>←</Kbd>
+            <Kbd>→</Kbd>
+          </>
+        }
+        label="step 1s"
+      />
+    </>
+  );
 }
 
 /** Compact, always-visible player for the raw source video — replaces the
@@ -63,11 +109,11 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
   function SourceVideoPreview(
     {
       filePath,
-      selectedLessonSegments,
-      hasSelectedLesson,
+      selectedLessonSegments = [],
+      hasSelectedLesson = false,
       onTimeUpdate,
       onAddSegment,
-      controlsLayout = "side",
+      controlsLayout = "minimal",
     },
     ref,
   ) {
@@ -153,7 +199,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
       hasSelectedLesson && markIn !== null && markOut !== null && markIn < markOut && !addingSegment;
 
     async function handleAddSegment() {
-      if (!canAddSegment || markIn === null || markOut === null) return;
+      if (!canAddSegment || markIn === null || markOut === null || !onAddSegment) return;
       setAddingSegment(true);
       setAddSegmentError(null);
       try {
@@ -217,6 +263,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
           // side-by-side max-width override — see styles.css and this
           // phase's report for why that's left alone rather than migrated.
           "source-preview relative my-3 mb-5 max-w-2xl",
+          controlsLayout === "minimal" && "mx-auto",
           // `source-preview-fullscreen` is a plain hook className (no styles
           // of its own) so styles.css can override `LessonSegmentsView`'s
           // shared-height rule below it — that rule is unlayered CSS and
@@ -227,6 +274,12 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
             "source-preview-fullscreen fixed inset-0 z-[1000] flex max-w-none flex-col justify-center bg-black p-4",
         )}
       >
+        {controlsLayout === "minimal" && (
+          <div className="mb-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-1">
+            <KeyboardShortcutHints />
+          </div>
+        )}
+
         <div
           className={cn(
             "flex gap-3",
@@ -304,72 +357,72 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
             />
           </div>
 
-          <div
-            className={cn(
-              "flex flex-col gap-1",
-              controlsLayout === "side" && "w-full sm:w-44 sm:shrink-0 sm:pt-1",
-            )}
-          >
-            {controlsLayout === "side" && (
-              <>
-                <p className="text-xs leading-relaxed opacity-60">Space: play/pause</p>
-                <p className="text-xs leading-relaxed opacity-60">←/→: step ~1 frame (1/30s)</p>
-                <p className="text-xs leading-relaxed opacity-60">Shift+←/→: step 1s</p>
-              </>
-            )}
+          {controlsLayout !== "minimal" && (
+            <div
+              className={cn(
+                "flex flex-col gap-1",
+                controlsLayout === "side" && "w-full sm:w-44 sm:shrink-0 sm:pt-1",
+              )}
+            >
+              {controlsLayout === "side" && (
+                <div className="mb-1 flex flex-col gap-1">
+                  <KeyboardShortcutHints />
+                </div>
+              )}
 
-            {hasSelectedLesson ? (
-              <div
-                className={cn(
-                  "flex items-center gap-2",
-                  controlsLayout === "side" ? "mt-2 flex-col items-stretch" : "flex-wrap",
-                )}
-              >
-                <div className="flex items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setMarkIn(currentTime)}
-                  >
-                    Mark In
-                  </Button>
-                  <span className="text-sm tabular-nums opacity-75">
-                    {markIn !== null ? formatTimestamp(markIn) : "—"}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setMarkOut(currentTime)}
-                  >
-                    Mark Out
-                  </Button>
-                  <span className="text-sm tabular-nums opacity-75">
-                    {markOut !== null ? formatTimestamp(markOut) : "—"}
-                  </span>
-                </div>
-                <Button
-                  type="button"
-                  size="sm"
-                  disabled={!canAddSegment}
-                  onClick={() => void handleAddSegment()}
+              {hasSelectedLesson ? (
+                <div
+                  className={cn(
+                    "flex items-center gap-2",
+                    controlsLayout === "side" ? "mt-2 flex-col items-stretch" : "flex-wrap",
+                  )}
                 >
-                  Add segment
-                </Button>
-              </div>
-            ) : (
-              <p className="mt-2 text-xs opacity-60">Select a lesson below to add a segment to it.</p>
-            )}
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setMarkIn(currentTime)}
+                    >
+                      Mark In
+                    </Button>
+                    <span className="text-sm tabular-nums opacity-75">
+                      {markIn !== null ? formatTimestamp(markIn) : "—"}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setMarkOut(currentTime)}
+                    >
+                      Mark Out
+                    </Button>
+                    <span className="text-sm tabular-nums opacity-75">
+                      {markOut !== null ? formatTimestamp(markOut) : "—"}
+                    </span>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={!canAddSegment}
+                    onClick={() => void handleAddSegment()}
+                  >
+                    Add segment
+                  </Button>
+                </div>
+              ) : (
+                <p className="mt-2 text-xs opacity-60">Select a lesson below to add a segment to it.</p>
+              )}
 
-            {addSegmentError && (
-              <Alert variant="destructive" className="mt-2">
-                <AlertDescription>{addSegmentError}</AlertDescription>
-              </Alert>
-            )}
-          </div>
+              {addSegmentError && (
+                <Alert variant="destructive" className="mt-2">
+                  <AlertDescription>{addSegmentError}</AlertDescription>
+                </Alert>
+              )}
+            </div>
+          )}
         </div>
       </div>
     );

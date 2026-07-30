@@ -6,16 +6,13 @@ import LessonCard from "../components/LessonCard";
 import SourceVideoPreview from "../components/SourceVideoPreview";
 import { basename } from "./ProjectDetailView";
 import {
-  addLessonSegment,
   deleteLesson,
   getProject,
   getVideo,
-  listLessonSegments,
   listLessons,
   mergeLessons,
   queueExport,
   type Lesson,
-  type LessonSegment,
   type Project,
   type Video,
 } from "../db";
@@ -76,23 +73,13 @@ export default function LessonEditorView({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Which lesson is "selected" — targets it for `SourceVideoPreview`'s Mark
-  // In/Out/Add Segment controls above the grid, and feeds that preview's
-  // seek-bar highlight overlay via `selectedLessonSegments` below. No
-  // longer doubles as expansion state — segment editing lives on its own
-  // page now (`LessonSegmentsView`, opened via `onOpenLessonSegments`), not
-  // inline in the grid tile (see `docs/lesson-segments-plan.md`).
-  const [selectedLessonId, setSelectedLessonId] = useState<string | null>(null);
-  const [selectedLessonSegments, setSelectedLessonSegments] = useState<LessonSegment[]>([]);
-
-  // Bumped after any segment-affecting mutation centrally owned here (add-
-  // segment from `SourceVideoPreview`'s mark in/out, merge), so that a
-  // `LessonCard`'s own locally-cached preview segments, and
-  // `selectedLessonSegments` below (feeding `SourceVideoPreview`'s
-  // overlay), know to refetch. Edits made on a lesson's own
-  // `LessonSegmentsView` page don't need to bump this — that page is a
-  // separate mount with no state shared back here, and this view refetches
-  // everything fresh whenever the user navigates back to it.
+  // Bumped after any segment-affecting mutation centrally owned here (merge)
+  // so that a `LessonCard`'s own locally-cached preview segments know to
+  // refetch. Edits made on a lesson's own `LessonSegmentsView` page (which
+  // now also owns adding segments — see `onOpenLessonSegments`) don't need
+  // to bump this — that page is a separate mount with no state shared back
+  // here, and this view refetches everything fresh whenever the user
+  // navigates back to it.
   const [segmentsRefreshKey, setSegmentsRefreshKey] = useState(0);
 
   // Per-row "in-flight" guards (same defensive pattern as
@@ -143,41 +130,10 @@ export default function LessonEditorView({
     };
   }, [projectId, videoId]);
 
-  // If the selected lesson is deleted or merged away, drop the now-dangling
-  // reference instead of pointing the overlay/selection at a lesson id that
-  // no longer exists.
-  useEffect(() => {
-    if (selectedLessonId && !lessons.some((lesson) => lesson.id === selectedLessonId)) {
-      setSelectedLessonId(null);
-    }
-  }, [lessons, selectedLessonId]);
-
-  // Feeds `SourceVideoPreview`'s seek-bar highlight overlay with the
-  // selected lesson's segments; re-fetched whenever the selection changes,
-  // or a centrally-owned mutation (`segmentsRefreshKey`) may have changed
-  // that lesson's segment list.
-  useEffect(() => {
-    if (!selectedLessonId) {
-      setSelectedLessonSegments([]);
-      return;
-    }
-    let cancelled = false;
-    listLessonSegments(selectedLessonId)
-      .then((rows) => {
-        if (!cancelled) setSelectedLessonSegments(rows);
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedLessonId, segmentsRefreshKey]);
-
   // ---------------------------------------------------------------------
-  // Lessons: split/merge/delete (see `docs/PRD.md` §8.1), and adding a
-  // segment from `SourceVideoPreview`'s mark in/out controls. Renaming lives
-  // on the lesson's own segments page (`LessonSegmentsView`) now, not here.
+  // Lessons: split/merge/delete (see `docs/PRD.md` §8.1). Renaming and
+  // adding segments both live on the lesson's own segments page
+  // (`LessonSegmentsView`) now, not here.
   // ---------------------------------------------------------------------
 
   async function refreshLessons() {
@@ -227,35 +183,6 @@ export default function LessonEditorView({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingDeleteLesson]);
-
-  // Adds a segment `[start, end)` to whichever lesson is currently
-  // selected — the target for `SourceVideoPreview`'s Mark In/Mark Out/Add
-  // Segment controls. Rethrows on failure (after recording it in the
-  // top-level `error` banner, same as every other mutation here) so
-  // `SourceVideoPreview` knows not to clear the user's marks.
-  const handleAddSegment = useCallback(
-    async (start: number, end: number) => {
-      if (!selectedLessonId) return;
-      if (lessonBusyRef.current.has(selectedLessonId)) {
-        throw new Error("Still saving a previous change to this lesson — try again in a moment.");
-      }
-      lessonBusyRef.current.add(selectedLessonId);
-      setLessonBusyIds(new Set(lessonBusyRef.current));
-      try {
-        await addLessonSegment(selectedLessonId, start, end);
-        await refreshLessons();
-        setSegmentsRefreshKey((key) => key + 1);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        throw err;
-      } finally {
-        lessonBusyRef.current.delete(selectedLessonId);
-        setLessonBusyIds(new Set(lessonBusyRef.current));
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [selectedLessonId],
-  );
 
   // ---------------------------------------------------------------------
   // Export queue (PRD §10-11, Milestone 7). "Export" (single lesson),
@@ -330,13 +257,7 @@ export default function LessonEditorView({
             </div>
           </div>
 
-          <SourceVideoPreview
-            filePath={video.file_path}
-            selectedLessonSegments={selectedLessonSegments}
-            hasSelectedLesson={selectedLessonId !== null}
-            onTimeUpdate={() => {}}
-            onAddSegment={handleAddSegment}
-          />
+          <SourceVideoPreview filePath={video.file_path} onTimeUpdate={() => {}} />
 
           <section>
             {sortedLessons.length > 0 && (
@@ -386,8 +307,6 @@ export default function LessonEditorView({
                       key={lesson.id}
                       lesson={lesson}
                       videoFilePath={video.file_path}
-                      isSelected={selectedLessonId === lesson.id}
-                      onSelect={(id) => setSelectedLessonId((prev) => (prev === id ? null : id))}
                       isBusy={lessonBusyIds.has(lesson.id)}
                       onDelete={handleDeleteLesson}
                       next={next}
@@ -396,8 +315,6 @@ export default function LessonEditorView({
                       onOpenSegments={(l) => onOpenLessonSegments(l.id)}
                       selectedForExport={selectedForExport.has(lesson.id)}
                       onToggleExportSelection={toggleExportSelection}
-                      exporting={exporting}
-                      onExport={handleExport}
                       segmentsRefreshKey={segmentsRefreshKey}
                     />
                   );

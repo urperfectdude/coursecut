@@ -7,14 +7,10 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
-import { cn } from "@/lib/utils";
-import { getLessonKindBadgeClassName } from "@/lib/badge-variants";
 
 interface LessonCardProps {
   lesson: Lesson;
   videoFilePath: string;
-  isSelected: boolean;
-  onSelect: (lessonId: string) => void;
   isBusy: boolean;
   onDelete: (lesson: Lesson) => void;
   next: Lesson | null;
@@ -26,8 +22,6 @@ interface LessonCardProps {
   onOpenSegments: (lesson: Lesson) => void;
   selectedForExport: boolean;
   onToggleExportSelection: (lessonId: string) => void;
-  exporting: boolean;
-  onExport: (lessonIds: string[]) => void;
   /** Bumped by the parent after any segment-affecting mutation (add-segment
    * from `SourceVideoPreview`, split, merge, or an edit made on this
    * lesson's own `LessonSegmentsView` page) — this card's own locally
@@ -35,18 +29,15 @@ interface LessonCardProps {
   segmentsRefreshKey: number;
 }
 
-/** One lesson's tile in the editor's grid (`.lesson-tile-grid`). Selecting a
- * card (`isSelected`) only targets it for `SourceVideoPreview`'s Mark
- * In/Out/Add Segment controls above the grid — it no longer expands this
- * tile in place; segment editing (start/end/trim/split/delete) lives on its
- * own page now, opened via "Edit segments" (see `onOpenSegments`). This tile
- * shows a read-only, always-visible preview of the lesson's own footage via
+/** One lesson's tile in the editor's grid (`.lesson-tile-grid`). No longer
+ * expands in place; segment editing (start/end/trim/split/delete, and
+ * adding new segments) lives on its own page now, opened via "Edit
+ * segments" (see `onOpenSegments`). This tile shows a read-only,
+ * always-visible preview of the lesson's own footage via
  * `LessonPreviewPlayer`. */
 export default function LessonCard({
   lesson,
   videoFilePath,
-  isSelected,
-  onSelect,
   isBusy,
   onDelete,
   next,
@@ -55,8 +46,6 @@ export default function LessonCard({
   onOpenSegments,
   selectedForExport,
   onToggleExportSelection,
-  exporting,
-  onExport,
   segmentsRefreshKey,
 }: LessonCardProps) {
   const [segments, setSegments] = useState<LessonSegment[]>([]);
@@ -83,9 +72,9 @@ export default function LessonCard({
 
   return (
     <li>
-      <Card size="sm" className={cn(isSelected && "ring-2 ring-primary")}>
-        <CardHeader className="cursor-pointer gap-1.5" onClick={() => onSelect(lesson.id)}>
-          <div className="flex flex-wrap items-center gap-2">
+      <Card size="sm">
+        <CardHeader className="cursor-pointer gap-1.5" onClick={() => onOpenSegments(lesson)}>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <Checkbox
               id={checkboxId}
               checked={selectedForExport}
@@ -101,39 +90,11 @@ export default function LessonCard({
               {lesson.title}
             </span>
           </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <Badge variant="outline" className={cn("capitalize", getLessonKindBadgeClassName(lesson.kind))}>
-              {lesson.kind}
-            </Badge>
-            {lesson.confidence !== null && (
-              <Badge variant="secondary">{Math.round(lesson.confidence * 100)}% confidence</Badge>
-            )}
-          </div>
         </CardHeader>
 
         <CardContent className="flex flex-wrap gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={(event) => {
-              event.stopPropagation();
-              onOpenSegments(lesson);
-            }}
-          >
+          <Button type="button" variant="outline" size="sm" onClick={() => onOpenSegments(lesson)}>
             Edit segments
-          </Button>
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            disabled={exporting}
-            onClick={(event) => {
-              event.stopPropagation();
-              onExport([lesson.id]);
-            }}
-          >
-            Export
           </Button>
           {next && (
             <Button
@@ -141,10 +102,7 @@ export default function LessonCard({
               variant="outline"
               size="sm"
               disabled={isBusy || isNextBusy}
-              onClick={(event) => {
-                event.stopPropagation();
-                onMergeWithNext(lesson, next);
-              }}
+              onClick={() => onMergeWithNext(lesson, next)}
             >
               Merge with next
             </Button>
@@ -156,10 +114,8 @@ export default function LessonCard({
             disabled={isBusy}
             aria-label={`Delete lesson ${lesson.title}`}
             title="Delete lesson"
-            onClick={(event) => {
-              event.stopPropagation();
-              onDelete(lesson);
-            }}
+            className="ml-auto"
+            onClick={() => onDelete(lesson)}
           >
             <Trash2 />
           </Button>
@@ -169,6 +125,15 @@ export default function LessonCard({
           <LessonPreviewPlayer videoFilePath={videoFilePath} segments={segments} lessonTitle={lesson.title} />
           {segmentsLoading && <p>Loading segments…</p>}
           {segmentsError && <p className="error">{segmentsError}</p>}
+        </CardContent>
+
+        <CardContent className="flex flex-wrap items-center justify-end gap-1.5">
+          <Badge variant="secondary" className="capitalize">
+            {lesson.kind}
+          </Badge>
+          {lesson.confidence !== null && (
+            <Badge variant="secondary">{Math.round(lesson.confidence * 100)}% confidence</Badge>
+          )}
         </CardContent>
       </Card>
     </li>

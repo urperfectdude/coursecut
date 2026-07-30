@@ -26,7 +26,7 @@ import {
 } from "../db";
 import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "../lib/timestamp";
 import { getSegmentDiffBadgeClassName } from "../lib/badge-variants";
-import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
+import { ChevronDown, ChevronUp, Pencil, Trash2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -1036,7 +1036,7 @@ export default function LessonSegmentsView({
                 <li
                   key={segment.id}
                   className={cn(
-                    "flex flex-wrap items-center gap-3 border-b border-border py-1.5 pl-2 text-sm last:border-b-0",
+                    "flex flex-wrap items-center gap-3 border-b border-border py-1.5 px-2 text-sm last:border-b-0",
                     isActiveSegment && "rounded-md bg-muted/60 ring-1 ring-inset ring-ring",
                   )}
                 >
@@ -1195,16 +1195,19 @@ export default function LessonSegmentsView({
                     >
                       Split at playhead
                     </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="destructive"
-                      disabled={isSegmentBusy}
-                      onClick={() => handleDeleteSegment(segment)}
-                    >
-                      Delete segment
-                    </Button>
                   </div>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="icon-sm"
+                    className="ml-auto"
+                    disabled={isSegmentBusy}
+                    aria-label={`Delete segment ${segment.id}`}
+                    title="Delete segment"
+                    onClick={() => handleDeleteSegment(segment)}
+                  >
+                    <Trash2 />
+                  </Button>
                 </li>
               );
             })}
