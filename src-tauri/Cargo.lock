@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "coursecut"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "chrono",
  "keyring",
