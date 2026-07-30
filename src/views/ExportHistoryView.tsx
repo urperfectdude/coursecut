@@ -11,6 +11,11 @@ import {
 } from "../db";
 import { ACTIVE_EXPORT_STATUSES } from "./LessonEditorView";
 import { basename, dirname, formatDuration } from "./ProjectDetailView";
+import { getExportStatusBadgeClassName } from "../lib/badge-variants";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 
 /** How often this view polls `listExports` while at least one export in
  * this project is still active (queued/paused/running) — same interval and
@@ -136,95 +141,118 @@ export default function ExportHistoryView({ projectId, onBack }: ExportHistoryVi
 
   return (
     <div>
-      <button type="button" className="back-button" onClick={onBack}>
+      <Button type="button" variant="ghost" onClick={onBack}>
         ← Back to project
-      </button>
+      </Button>
 
       <h1>Export History</h1>
 
       {loading && <p>Loading export history…</p>}
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <Alert variant="destructive" className="my-4">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
 
       {!loading && exports.length === 0 && <p>No exports yet for this project.</p>}
 
       {exports.length > 0 && (
-        <ul className="export-history-list">
+        <ul className="m-0 mt-4 flex list-none flex-col gap-3 p-0">
           {exports.map((row) => {
             const isBusy = actionBusyIds.has(row.id);
             const isActive = ACTIVE_EXPORT_STATUSES.has(row.status);
             const duration = row.lesson_end - row.lesson_start;
             return (
-              <li key={row.id} className="export-item export-history-item">
-                <div className="export-item-header">
-                  <span className="export-item-title">{row.lesson_title}</span>
-                  <span className={`status-badge export-status-badge status-${row.status}`}>
+              <li key={row.id} className="border-b border-border pb-3 last:border-b-0">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm font-semibold">{row.lesson_title}</span>
+                  <Badge variant="outline" className={getExportStatusBadgeClassName(row.status)}>
                     {row.status}
-                  </span>
+                  </Badge>
                 </div>
-                <div className="export-history-meta">
+                <div className="mt-1 flex flex-wrap gap-3 text-sm text-muted-foreground">
                   <span>{new Date(row.created_at).toLocaleString()}</span>
                   <span>{basename(row.video_file_path)}</span>
                   <span>{formatDuration(duration)}</span>
-                  <span className="export-history-path">{dirname(row.output_path)}</span>
+                  <span className="break-all">{dirname(row.output_path)}</span>
                 </div>
                 {isActive && (
-                  <div className="export-progress">
-                    <progress value={row.progress} max={1} />
-                    <span className="export-progress-label">{Math.round(row.progress * 100)}%</span>
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <Progress value={Math.round(row.progress * 100)} className="flex-1" />
+                    <span className="shrink-0 text-sm tabular-nums text-muted-foreground">
+                      {Math.round(row.progress * 100)}%
+                    </span>
                   </div>
                 )}
                 {row.status === "failed" && row.error && (
-                  <p className="error export-error">{row.error}</p>
+                  <Alert variant="destructive" className="mt-1.5">
+                    <AlertDescription>{row.error}</AlertDescription>
+                  </Alert>
                 )}
-                <div className="export-item-actions">
+                <div className="mt-1.5 flex gap-2">
                   {row.status === "queued" && (
-                    <button
+                    <Button
                       type="button"
+                      size="sm"
+                      variant="outline"
                       disabled={isBusy}
                       onClick={() => void handleAction(row.id, pauseExport)}
                     >
                       Pause
-                    </button>
+                    </Button>
                   )}
                   {row.status === "paused" && (
-                    <button
+                    <Button
                       type="button"
+                      size="sm"
+                      variant="outline"
                       disabled={isBusy}
                       onClick={() => void handleAction(row.id, resumeExport)}
                     >
                       Resume
-                    </button>
+                    </Button>
                   )}
                   {(row.status === "queued" || row.status === "paused" || row.status === "running") && (
-                    <button
+                    <Button
                       type="button"
+                      size="sm"
+                      variant="destructive"
                       disabled={isBusy}
                       onClick={() => void handleAction(row.id, cancelExport)}
                     >
                       Cancel
-                    </button>
+                    </Button>
                   )}
                   {(row.status === "failed" || row.status === "cancelled") && (
-                    <button
+                    <Button
                       type="button"
+                      size="sm"
+                      variant="secondary"
                       disabled={isBusy}
                       onClick={() => void handleAction(row.id, retryExport)}
                     >
                       Retry
-                    </button>
+                    </Button>
                   )}
                   {row.status === "done" && (
-                    <button type="button" onClick={() => void handleRevealInFolder(row)}>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void handleRevealInFolder(row)}
+                    >
                       Show in folder
-                    </button>
+                    </Button>
                   )}
-                  <button
+                  <Button
                     type="button"
+                    size="sm"
+                    variant="secondary"
                     disabled={isBusy || isActive}
                     onClick={() => void handleReExport(row)}
                   >
                     {isActive ? "Export in progress…" : "Re-export"}
-                  </button>
+                  </Button>
                 </div>
               </li>
             );

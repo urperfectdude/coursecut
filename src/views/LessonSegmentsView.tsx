@@ -25,6 +25,32 @@ import {
   type Video,
 } from "../db";
 import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "../lib/timestamp";
+import { getSegmentDiffBadgeClassName } from "../lib/badge-variants";
+import { ChevronDown, ChevronUp } from "lucide-react";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 
 /** Floating-point tolerance for comparing a proposed range against a current
  * one — segment bounds round-trip through JSON/the AI response, so an exact
@@ -213,6 +239,12 @@ export default function LessonSegmentsView({
   // Undo/redo stack for segment edits (see `UndoableAction` above for scope).
   const [undoStack, setUndoStack] = useState<UndoableAction[]>([]);
   const [redoStack, setRedoStack] = useState<UndoableAction[]>([]);
+
+  // Which segment (if any) is pending delete confirmation — a single shared
+  // `AlertDialog` driven by this state, same pattern as `HomeView`'s
+  // `pendingDelete` / `ProjectDetailView`'s `pendingRemove`, rather than one
+  // dialog per row.
+  const [pendingDeleteSegment, setPendingDeleteSegment] = useState<LessonSegment | null>(null);
 
   // Queuing this lesson's own export — same folder-picker-then-queue flow
   // as `LessonEditorView`'s per-lesson Export button; viewing/managing the
@@ -633,42 +665,52 @@ export default function LessonSegmentsView({
     [currentTime, segmentBusyIds, withSegmentUndo],
   );
 
+  /** Opens the shared delete-confirmation `AlertDialog` for `segment` — the
+   * actual delete happens in `handleConfirmDeleteSegment` once the user
+   * confirms (same split as `HomeView`'s `handleRemove`/`handleConfirmRemove`
+   * pair, replacing this function's old `window.confirm`). */
   const handleDeleteSegment = useCallback(
-    async (segment: LessonSegment) => {
+    (segment: LessonSegment) => {
       if (segmentBusyIds.has(segment.id)) return;
-      if (!window.confirm("Delete this segment? This cannot be undone.")) return;
-      setSegmentBusyIds((prev) => new Set(prev).add(segment.id));
-      try {
-        // Not routed through `withSegmentUndo` — a delete that takes the
-        // whole lesson down with it (see below) leaves nothing on this page
-        // to restore a snapshot into, so it must never push an undo entry.
-        const before = segments.map((s) => ({ start: s.start, end: s.end }));
-        const result = await deleteLessonSegment(segment.id);
-        if (result.lesson_deleted) {
-          // The lesson itself no longer exists — nothing left to edit here.
-          onNavigateLessons();
-          return;
-        }
-        const after = await listLessonSegments(lessonId);
-        setSegments(after);
-        const afterRanges = after.map((s) => ({ start: s.start, end: s.end }));
-        pushUndo({
-          undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
-          redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
-        });
-        setSegmentsError(null);
-      } catch (err) {
-        setSegmentsError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setSegmentBusyIds((prev) => {
-          const next = new Set(prev);
-          next.delete(segment.id);
-          return next;
-        });
-      }
+      setPendingDeleteSegment(segment);
     },
-    [segments, segmentBusyIds, lessonId, onNavigateLessons, pushUndo],
+    [segmentBusyIds],
   );
+
+  const handleConfirmDeleteSegment = useCallback(async () => {
+    const segment = pendingDeleteSegment;
+    if (!segment) return;
+    setPendingDeleteSegment(null);
+    setSegmentBusyIds((prev) => new Set(prev).add(segment.id));
+    try {
+      // Not routed through `withSegmentUndo` — a delete that takes the
+      // whole lesson down with it (see below) leaves nothing on this page
+      // to restore a snapshot into, so it must never push an undo entry.
+      const before = segments.map((s) => ({ start: s.start, end: s.end }));
+      const result = await deleteLessonSegment(segment.id);
+      if (result.lesson_deleted) {
+        // The lesson itself no longer exists — nothing left to edit here.
+        onNavigateLessons();
+        return;
+      }
+      const after = await listLessonSegments(lessonId);
+      setSegments(after);
+      const afterRanges = after.map((s) => ({ start: s.start, end: s.end }));
+      pushUndo({
+        undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
+        redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+      });
+      setSegmentsError(null);
+    } catch (err) {
+      setSegmentsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSegmentBusyIds((prev) => {
+        const next = new Set(prev);
+        next.delete(segment.id);
+        return next;
+      });
+    }
+  }, [segments, pendingDeleteSegment, lessonId, onNavigateLessons, pushUndo]);
 
   // Swaps `segments[index]` with its neighbor at `index + direction` (-1 =
   // up/earlier, +1 = down/later) — playback order only, doesn't touch any
@@ -771,23 +813,32 @@ export default function LessonSegmentsView({
       />
 
       {loading && <p>Loading lesson…</p>}
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
       {!loading && (!video || !lesson) && (
         <p>
           Lesson not found —{" "}
-          <button type="button" className="link-button" onClick={onNavigateLessons}>
+          <Button
+            type="button"
+            variant="link"
+            className="h-auto p-0 align-baseline"
+            onClick={onNavigateLessons}
+          >
             back to lessons
-          </button>
+          </Button>
           .
         </p>
       )}
 
       {video && lesson && (
         <>
-          <div className="project-header">
-            <input
+          <div className="flex items-start justify-between gap-4">
+            <Input
               type="text"
-              className="lesson-title-input"
+              className="min-w-32 flex-1 border-transparent bg-transparent px-1 py-0.5 text-[0.9rem] font-semibold shadow-none hover:border-input focus-visible:border-input dark:bg-transparent"
               value={titleDraft ?? lesson.title}
               disabled={titleBusy}
               onChange={(event) => setTitleDraft(event.target.value)}
@@ -797,20 +848,19 @@ export default function LessonSegmentsView({
               }}
               aria-label="Lesson title"
             />
-            <div className="project-header-actions">
-              <button
-                type="button"
-                className="export-history-button"
-                disabled={exporting}
-                onClick={() => void handleExport()}
-              >
+            <div className="flex shrink-0 gap-2">
+              <Button type="button" disabled={exporting} onClick={() => void handleExport()}>
                 {exporting ? "Queuing export…" : "Export"}
-              </button>
+              </Button>
             </div>
           </div>
-          {exportError && <p className="error">{exportError}</p>}
-          <textarea
-            className="lesson-summary-input lesson-segments-summary"
+          {exportError && (
+            <Alert variant="destructive" className="my-2">
+              <AlertDescription>{exportError}</AlertDescription>
+            </Alert>
+          )}
+          <Textarea
+            className="max-w-[40rem]"
             value={summaryDraft ?? lesson.summary ?? ""}
             disabled={summaryBusy}
             onChange={(event) => setSummaryDraft(event.target.value)}
@@ -819,13 +869,12 @@ export default function LessonSegmentsView({
             rows={3}
             aria-label={`Summary for lesson ${lesson.title}`}
           />
-          <p className="lesson-item-time">
+          <p className="text-xs text-muted-foreground">
             {formatTimestamp(lesson.start)}–{formatTimestamp(lesson.end)}
           </p>
 
-          <div className="lesson-segments-ai-panel">
-            <textarea
-              className="lesson-segments-ai-textarea"
+          <div className="my-3 flex max-w-xl flex-col gap-1.5">
+            <Textarea
               value={aiInstruction}
               disabled={aiPreviewBusy}
               onChange={(event) => setAiInstruction(event.target.value)}
@@ -833,20 +882,21 @@ export default function LessonSegmentsView({
               rows={2}
               aria-label="Describe a change to this lesson's segments"
             />
-            <p className="lesson-segments-ai-hint">
+            <p className="text-xs text-muted-foreground">
               Exact timestamps (<code>m:ss</code>, <code>h:mm:ss</code>) in your instruction are
               honored precisely.
             </p>
-            <button
+            <Button
               type="button"
+              className="self-start"
               disabled={aiPreviewBusy || aiInstruction.trim() === ""}
               onClick={() => void handlePreviewEdit()}
             >
               {aiPreviewBusy && proposedSegments === null ? "Previewing…" : "Preview changes"}
-            </button>
+            </Button>
           </div>
 
-          <div className="lesson-segments-preview-row">
+          <div className="lesson-segments-preview-row flex flex-wrap items-start gap-6">
             {/* The raw source video, alongside the lesson's own stitched
                preview — lets the user scrub the full original recording to
                find a boundary without leaving this page, rather than only
@@ -858,8 +908,10 @@ export default function LessonSegmentsView({
                `handleAddSourceSegment` to add new ones. Placed first (left)
                since it's the input the lesson preview (right) is derived
                from — the arrow between them reads that direction. */}
-            <div className="lesson-segments-source-preview">
-              <p className="lesson-segments-preview-label">Original video</p>
+            <div className="lesson-segments-source-preview flex-[1_1_22rem] max-w-[40rem]">
+              <p className="mb-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+                Original video
+              </p>
               <SourceVideoPreview
                 filePath={video.file_path}
                 selectedLessonSegments={segments}
@@ -869,12 +921,17 @@ export default function LessonSegmentsView({
               />
             </div>
 
-            <span className="lesson-segments-preview-arrow" aria-hidden="true">
+            <span
+              className="flex-none self-center text-3xl leading-none text-muted-foreground/60"
+              aria-hidden="true"
+            >
               »
             </span>
 
-            <div className="lesson-card-preview lesson-segments-preview">
-              <p className="lesson-segments-preview-label">Final video</p>
+            <div className="lesson-card-preview lesson-segments-preview flex-[1_1_22rem] max-w-[40rem]">
+              <p className="mb-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+                Final video
+              </p>
               <LessonPreviewPlayer
                 videoFilePath={video.file_path}
                 segments={segments}
@@ -889,17 +946,29 @@ export default function LessonSegmentsView({
             </div>
           </div>
 
-          <div className="undo-redo-bar">
-            <button type="button" onClick={() => void handleUndo()} disabled={undoStack.length === 0}>
+          <div className="mb-3 flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void handleUndo()}
+              disabled={undoStack.length === 0}
+            >
               Undo
-            </button>
-            <button type="button" onClick={() => void handleRedo()} disabled={redoStack.length === 0}>
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void handleRedo()}
+              disabled={redoStack.length === 0}
+            >
               Redo
-            </button>
-            <span className="undo-note">Undo covers segment edits only.</span>
+            </Button>
+            <span className="text-xs text-muted-foreground">Undo covers segment edits only.</span>
           </div>
 
-          <ul className="lesson-card-segment-list">
+          <ul className="m-0 flex list-none flex-col gap-2 p-0">
             {segments.map((segment, index) => {
               const isSegmentBusy = segmentBusyIds.has(segment.id);
               const canSplitSegment = currentTime > segment.start && currentTime < segment.end;
@@ -910,33 +979,38 @@ export default function LessonSegmentsView({
               return (
                 <li
                   key={segment.id}
-                  className={
-                    "lesson-card-segment-row" + (isActiveSegment ? " lesson-card-segment-row-active" : "")
-                  }
+                  className={cn(
+                    "flex flex-wrap items-center gap-3 border-b border-border py-1.5 pl-2 text-sm last:border-b-0",
+                    isActiveSegment && "rounded-md bg-muted/60 ring-1 ring-inset ring-ring",
+                  )}
                 >
-                  <div className="lesson-card-segment-order">
-                    <span className="lesson-card-segment-order-index">{index + 1}</span>
-                    <button
+                  <div className="flex flex-col items-center gap-0.5">
+                    <span className="text-xs text-muted-foreground">{index + 1}</span>
+                    <Button
                       type="button"
+                      variant="ghost"
+                      size="icon-sm"
                       disabled={isSegmentBusy || index === 0}
                       onClick={() => void handleMoveSegment(index, -1)}
                       aria-label="Move segment earlier"
                     >
-                      ▲
-                    </button>
-                    <button
+                      <ChevronUp />
+                    </Button>
+                    <Button
                       type="button"
+                      variant="ghost"
+                      size="icon-sm"
                       disabled={isSegmentBusy || index === segments.length - 1}
                       onClick={() => void handleMoveSegment(index, 1)}
                       aria-label="Move segment later"
                     >
-                      ▼
-                    </button>
+                      <ChevronDown />
+                    </Button>
                   </div>
-                  <label className="lesson-card-segment-field">
+                  <label className="flex flex-col gap-0.5 text-xs">
                     Start
-                    <div className="lesson-card-segment-input-row">
-                      <input
+                    <div className="relative">
+                      <Input
                         type="text"
                         inputMode="numeric"
                         pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
@@ -951,31 +1025,38 @@ export default function LessonSegmentsView({
                           if (event.key === "Enter") event.currentTarget.blur();
                         }}
                         aria-label={`Start time for segment ${segment.id}`}
+                        className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
                       />
-                      <div className="lesson-card-segment-stepper">
-                        <button
+                      <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
+                        <Button
                           type="button"
+                          variant="ghost"
+                          size="icon-xs"
                           disabled={isSegmentBusy}
                           onClick={() => void adjustSegmentBound(segment, "start", 1)}
                           aria-label={`Increase start time for segment ${segment.id}`}
+                          className="h-3 w-4 [&_svg]:size-2.5"
                         >
-                          ▲
-                        </button>
-                        <button
+                          <ChevronUp />
+                        </Button>
+                        <Button
                           type="button"
+                          variant="ghost"
+                          size="icon-xs"
                           disabled={isSegmentBusy}
                           onClick={() => void adjustSegmentBound(segment, "start", -1)}
                           aria-label={`Decrease start time for segment ${segment.id}`}
+                          className="h-3 w-4 [&_svg]:size-2.5"
                         >
-                          ▼
-                        </button>
+                          <ChevronDown />
+                        </Button>
                       </div>
                     </div>
                   </label>
-                  <label className="lesson-card-segment-field">
+                  <label className="flex flex-col gap-0.5 text-xs">
                     End
-                    <div className="lesson-card-segment-input-row">
-                      <input
+                    <div className="relative">
+                      <Input
                         type="text"
                         inputMode="numeric"
                         pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
@@ -990,69 +1071,83 @@ export default function LessonSegmentsView({
                           if (event.key === "Enter") event.currentTarget.blur();
                         }}
                         aria-label={`End time for segment ${segment.id}`}
+                        className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
                       />
-                      <div className="lesson-card-segment-stepper">
-                        <button
+                      <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
+                        <Button
                           type="button"
+                          variant="ghost"
+                          size="icon-xs"
                           disabled={isSegmentBusy}
                           onClick={() => void adjustSegmentBound(segment, "end", 1)}
                           aria-label={`Increase end time for segment ${segment.id}`}
+                          className="h-3 w-4 [&_svg]:size-2.5"
                         >
-                          ▲
-                        </button>
-                        <button
+                          <ChevronUp />
+                        </Button>
+                        <Button
                           type="button"
+                          variant="ghost"
+                          size="icon-xs"
                           disabled={isSegmentBusy}
                           onClick={() => void adjustSegmentBound(segment, "end", -1)}
                           aria-label={`Decrease end time for segment ${segment.id}`}
+                          className="h-3 w-4 [&_svg]:size-2.5"
                         >
-                          ▼
-                        </button>
+                          <ChevronDown />
+                        </Button>
                       </div>
                     </div>
                   </label>
-                  <span className="lesson-card-segment-field lesson-card-segment-field-readonly">
+                  <span className="flex flex-col gap-0.5 text-xs text-muted-foreground">
                     Final video start
-                    <span aria-label={`Final video start time for segment ${segment.id}`}>
+                    <span className="tabular-nums" aria-label={`Final video start time for segment ${segment.id}`}>
                       {formatTimestampMs(segmentOffsets[index])}
                     </span>
                   </span>
-                  <span className="lesson-card-segment-field lesson-card-segment-field-readonly">
+                  <span className="flex flex-col gap-0.5 text-xs text-muted-foreground">
                     Final video end
-                    <span aria-label={`Final video end time for segment ${segment.id}`}>
+                    <span className="tabular-nums" aria-label={`Final video end time for segment ${segment.id}`}>
                       {formatTimestampMs(segmentOffsets[index] + (segment.end - segment.start))}
                     </span>
                   </span>
-                  <div className="lesson-card-segment-actions">
-                    <button
+                  <div className="flex flex-wrap gap-1.5">
+                    <Button
                       type="button"
+                      size="sm"
+                      variant="outline"
                       disabled={isSegmentBusy}
                       onClick={() => void handleTrimSegmentStart(segment)}
                     >
                       Trim Start
-                    </button>
-                    <button
+                    </Button>
+                    <Button
                       type="button"
+                      size="sm"
+                      variant="outline"
                       disabled={isSegmentBusy}
                       onClick={() => void handleTrimSegmentEnd(segment)}
                     >
                       Trim End
-                    </button>
-                    <button
+                    </Button>
+                    <Button
                       type="button"
+                      size="sm"
+                      variant="outline"
                       disabled={!canSplitSegment || isSegmentBusy}
                       onClick={() => void handleSplitSegment(segment)}
                     >
                       Split at playhead
-                    </button>
-                    <button
+                    </Button>
+                    <Button
                       type="button"
-                      className="delete-button"
+                      size="sm"
+                      variant="destructive"
                       disabled={isSegmentBusy}
-                      onClick={() => void handleDeleteSegment(segment)}
+                      onClick={() => handleDeleteSegment(segment)}
                     >
                       Delete segment
-                    </button>
+                    </Button>
                   </div>
                 </li>
               );
@@ -1072,6 +1167,26 @@ export default function LessonSegmentsView({
               applyBusy={aiApplyBusy}
             />
           )}
+
+          <AlertDialog
+            open={pendingDeleteSegment !== null}
+            onOpenChange={(open) => {
+              if (!open) setPendingDeleteSegment(null);
+            }}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete this segment?</AlertDialogTitle>
+                <AlertDialogDescription>This cannot be undone.</AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction variant="destructive" onClick={() => void handleConfirmDeleteSegment()}>
+                  Delete
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </>
       )}
     </div>
@@ -1089,6 +1204,19 @@ interface LessonAiEditReviewModalProps {
   previewBusy: boolean;
   applyBusy: boolean;
 }
+
+/** Row-level tint for each diff row (background + left-border accent),
+ * keyed the same as `getSegmentDiffBadgeClassName` — the badge alone used to
+ * be the only colored element under the old CSS's `.lesson-segments-ai-diff-
+ * <kind>` rules, but those rules tinted the *whole row*, so this reuses the
+ * same color intent at row scope instead of shrinking it down to the badge. */
+const SEGMENT_DIFF_ROW_CLASS_NAMES: Record<"unchanged" | "trimmed" | "new" | "removed", string> = {
+  unchanged: "opacity-70",
+  trimmed: "border-l-2 border-amber-500/70 bg-amber-500/10 dark:border-amber-400/70 dark:bg-amber-400/10",
+  new: "border-l-2 border-emerald-500/70 bg-emerald-500/10 dark:border-emerald-400/70 dark:bg-emerald-400/10",
+  removed:
+    "border-l-2 border-red-500/70 bg-red-500/10 text-muted-foreground line-through dark:border-red-400/70 dark:bg-red-400/10",
+};
 
 /** Old-vs-new review popup for the AI segment edit prompt
  * (`docs/lesson-ai-edit-plan.md`) — opened by `LessonSegmentsView` whenever
@@ -1115,58 +1243,72 @@ function LessonAiEditReviewModal({
   const busy = previewBusy || applyBusy;
 
   return (
-    <div className="modal-overlay" onClick={onCancel}>
-      <div
-        className="modal-panel lesson-segments-ai-modal"
-        onClick={(event) => event.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-label="Review proposed segment changes"
-      >
-        <h2>Review proposed changes</h2>
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onCancel();
+      }}
+    >
+      <DialogContent className="sm:max-w-xl" aria-label="Review proposed segment changes">
+        <DialogHeader>
+          <DialogTitle>Review proposed changes</DialogTitle>
+        </DialogHeader>
 
         {isEmptyProposal ? (
-          <p>This would remove every segment in this lesson.</p>
+          <p className="text-sm text-muted-foreground">This would remove every segment in this lesson.</p>
         ) : (
           <>
-            <p className="lesson-segments-ai-diff-heading">Current segments</p>
-            <ul className="lesson-segments-ai-diff-list">
+            <p className="text-sm font-semibold">Current segments</p>
+            <ul className="m-0 flex max-h-[30vh] list-none flex-col gap-1 overflow-y-auto p-0">
               {currentSegments.map((segment, index) => (
-                <li key={`current-${index}`} className="lesson-segments-ai-diff-row">
+                <li
+                  key={`current-${index}`}
+                  className="flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums"
+                >
                   {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
                 </li>
               ))}
-              {currentSegments.length === 0 && <li>(no segments)</li>}
+              {currentSegments.length === 0 && <li className="text-sm text-muted-foreground">(no segments)</li>}
             </ul>
 
-            <p className="lesson-segments-ai-diff-heading">Proposed segments</p>
-            <ul className="lesson-segments-ai-diff-list">
+            <p className="text-sm font-semibold">Proposed segments</p>
+            <ul className="m-0 flex max-h-[30vh] list-none flex-col gap-1 overflow-y-auto p-0">
               {proposedRows.map((row, index) => (
                 <li
                   key={`proposed-${index}`}
-                  className={`lesson-segments-ai-diff-row lesson-segments-ai-diff-${row.kind}`}
+                  className={cn(
+                    "flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums",
+                    SEGMENT_DIFF_ROW_CLASS_NAMES[row.kind],
+                  )}
                 >
                   {formatTimestamp(row.start)}–{formatTimestamp(row.end)}
-                  <span className="lesson-segments-ai-diff-badge">{row.kind}</span>
+                  <Badge variant="outline" className={getSegmentDiffBadgeClassName(row.kind)}>
+                    {row.kind}
+                  </Badge>
                 </li>
               ))}
               {removed.map((segment, index) => (
                 <li
                   key={`removed-${index}`}
-                  className="lesson-segments-ai-diff-row lesson-segments-ai-diff-removed"
+                  className={cn(
+                    "flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums",
+                    SEGMENT_DIFF_ROW_CLASS_NAMES.removed,
+                  )}
                 >
                   {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
-                  <span className="lesson-segments-ai-diff-badge">removed</span>
+                  <Badge variant="outline" className={getSegmentDiffBadgeClassName("removed")}>
+                    removed
+                  </Badge>
                 </li>
               ))}
             </ul>
           </>
         )}
 
-        <label className="lesson-segments-ai-refine-field">
-          Refine this proposal
-          <textarea
-            className="lesson-segments-ai-textarea"
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="lesson-segments-ai-refine">Refine this proposal</Label>
+          <Textarea
+            id="lesson-segments-ai-refine"
             value={refineInstruction}
             disabled={busy}
             onChange={(event) => onRefineInstructionChange(event.target.value)}
@@ -1174,24 +1316,29 @@ function LessonAiEditReviewModal({
             rows={2}
             aria-label="Refine the proposed segment changes"
           />
-        </label>
-        <p className="lesson-segments-ai-hint">
+        </div>
+        <p className="text-sm text-muted-foreground">
           Exact timestamps (<code>m:ss</code>, <code>h:mm:ss</code>) in your instruction are
           honored precisely.
         </p>
-        <button type="button" disabled={busy || refineInstruction.trim() === ""} onClick={onRefine}>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={busy || refineInstruction.trim() === ""}
+          onClick={onRefine}
+        >
           {previewBusy ? "Updating…" : "Update proposal"}
-        </button>
+        </Button>
 
-        <div className="modal-actions">
-          <button type="button" onClick={onCancel} disabled={applyBusy}>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={onCancel} disabled={applyBusy}>
             Cancel
-          </button>
-          <button type="button" onClick={onApply} disabled={busy || isEmptyProposal}>
+          </Button>
+          <Button type="button" onClick={onApply} disabled={busy || isEmptyProposal}>
             {applyBusy ? "Applying…" : "Apply"}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

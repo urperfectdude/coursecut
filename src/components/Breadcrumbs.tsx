@@ -1,3 +1,13 @@
+import { Fragment } from "react";
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
+
 export interface Crumb {
   label: string;
   // Omitted for the current/last crumb — renders as plain text instead of
@@ -15,23 +25,25 @@ interface BreadcrumbsProps {
  * view union. */
 export default function Breadcrumbs({ crumbs }: BreadcrumbsProps) {
   return (
-    <nav className="breadcrumbs" aria-label="Breadcrumb">
-      {crumbs.map((crumb, index) => (
-        <span className="breadcrumb-item" key={index}>
-          {index > 0 && (
-            <span className="breadcrumb-separator" aria-hidden="true">
-              /
-            </span>
-          )}
-          {crumb.onClick ? (
-            <button type="button" className="breadcrumb-link" onClick={crumb.onClick}>
-              {crumb.label}
-            </button>
-          ) : (
-            <span className="breadcrumb-current">{crumb.label}</span>
-          )}
-        </span>
-      ))}
-    </nav>
+    <Breadcrumb aria-label="Breadcrumb">
+      <BreadcrumbList>
+        {crumbs.map((crumb, index) => (
+          <Fragment key={index}>
+            {index > 0 && <BreadcrumbSeparator />}
+            <BreadcrumbItem>
+              {crumb.onClick ? (
+                <BreadcrumbLink asChild>
+                  <button type="button" onClick={crumb.onClick}>
+                    {crumb.label}
+                  </button>
+                </BreadcrumbLink>
+              ) : (
+                <BreadcrumbPage>{crumb.label}</BreadcrumbPage>
+              )}
+            </BreadcrumbItem>
+          </Fragment>
+        ))}
+      </BreadcrumbList>
+    </Breadcrumb>
   );
 }

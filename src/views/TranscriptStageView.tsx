@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Loader2, RotateCw } from "lucide-react";
 import Breadcrumbs from "../components/Breadcrumbs";
 import { basename } from "./ProjectDetailView";
 import {
@@ -15,6 +16,13 @@ import {
 } from "../db";
 import { useVideoProgress } from "../hooks/useVideoProgress";
 import { formatTimestamp } from "../lib/timestamp";
+import { cn } from "@/lib/utils";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 
 interface TranscriptStageViewProps {
   projectId: string;
@@ -211,60 +219,78 @@ export default function TranscriptStageView({
       />
 
       {loading && <p>Loading transcript…</p>}
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <Alert variant="destructive" className="my-4">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
       {!loading && !video && <p>Video not found.</p>}
 
       {video && (
         <>
-          <h1>Transcript</h1>
-          <p className="video-path">{video.file_path}</p>
-
-          <div className="stage-actions">
-            <button type="button" onClick={() => void handleAnalyze()} disabled={analyzing}>
-              Analyze
-            </button>
-            {hasLessons && (
-              <button type="button" onClick={onOpenLessons}>
-                View lessons →
-              </button>
-            )}
-            {analyzing && (
-              <span className="video-progress">
-                <span
-                  className={
-                    videoProgress?.fraction == null ? "video-progress-spinner" : "video-progress-bar"
-                  }
-                  aria-hidden="true"
-                >
-                  {videoProgress?.fraction != null && (
-                    <span
-                      className="video-progress-bar-fill"
-                      style={{ width: `${Math.round(videoProgress.fraction * 100)}%` }}
+          <div className="my-3 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleUndo()}
+                disabled={undoStack.length === 0}
+              >
+                Undo
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleRedo()}
+                disabled={redoStack.length === 0}
+              >
+                Redo
+              </Button>
+            </div>
+            <div className="flex items-center gap-2">
+              {analyzing && (
+                <span className="flex items-center gap-1.5 text-sm opacity-85">
+                  {videoProgress?.fraction == null ? (
+                    <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Progress
+                      value={Math.round(videoProgress.fraction * 100)}
+                      className="h-1.5 w-16 shrink-0"
                     />
                   )}
+                  <span>
+                    {videoProgress ? stageLabel(videoProgress.stage) : "Working…"}
+                    {videoProgress?.detail && <> ({videoProgress.detail})</>}
+                  </span>
                 </span>
-                <span className="video-progress-label">
-                  {videoProgress ? stageLabel(videoProgress.stage) : "Working…"}
-                  {videoProgress?.detail && <> ({videoProgress.detail})</>}
-                </span>
-              </span>
-            )}
+              )}
+              <Button
+                type="button"
+                variant={hasLessons ? "outline" : "default"}
+                onClick={() => void handleAnalyze()}
+                disabled={analyzing}
+              >
+                {hasLessons && <RotateCw />}
+                {hasLessons ? "Analyze again" : "Analyze"}
+              </Button>
+              {hasLessons && (
+                <Button type="button" onClick={onOpenLessons}>
+                  View lessons →
+                </Button>
+              )}
+            </div>
           </div>
-          {analyzeError && <p className="error">{analyzeError}</p>}
+          {analyzeError && (
+            <Alert variant="destructive" className="my-2">
+              <AlertDescription>{analyzeError}</AlertDescription>
+            </Alert>
+          )}
 
-          <div className="undo-redo-bar">
-            <button type="button" onClick={() => void handleUndo()} disabled={undoStack.length === 0}>
-              Undo
-            </button>
-            <button type="button" onClick={() => void handleRedo()} disabled={redoStack.length === 0}>
-              Redo
-            </button>
-            <span className="undo-note">Undo covers keep/delete toggles only.</span>
-          </div>
-
-          <input
+          <Input
             type="search"
-            className="transcript-search-input"
+            className="my-2"
             placeholder="Search transcript…"
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.target.value)}
@@ -274,30 +300,31 @@ export default function TranscriptStageView({
           {filteredSegments.length === 0 ? (
             <p>No matching transcript segments.</p>
           ) : (
-            <ul className="transcript-segment-list editor-transcript-list">
+            <ul className="m-0 flex max-h-[60vh] list-none flex-col gap-1.5 overflow-y-auto p-0">
               {filteredSegments.map((segment) => {
                 const isBusy = segmentBusyIds.has(segment.id);
+                const checkboxId = `transcript-segment-keep-${segment.id}`;
                 return (
                   <li
                     key={segment.id}
-                    className={
-                      "transcript-segment editor-transcript-segment" +
-                      (segment.keep ? "" : " transcript-segment-deleted")
-                    }
+                    className={cn(
+                      "flex items-center gap-3 text-sm",
+                      !segment.keep && "opacity-45 line-through",
+                    )}
                   >
-                    <span className="transcript-segment-time">
+                    <span className="shrink-0 tabular-nums opacity-60">
                       {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
                     </span>
-                    <span className="transcript-segment-text">{segment.text}</span>
-                    <label className="transcript-segment-keep">
-                      <input
-                        type="checkbox"
+                    <span className="flex-1">{segment.text}</span>
+                    <div className="flex shrink-0 items-center gap-1 whitespace-nowrap text-xs">
+                      <Checkbox
+                        id={checkboxId}
                         checked={segment.keep}
                         disabled={isBusy}
-                        onChange={() => void handleToggleKeep(segment)}
+                        onCheckedChange={() => void handleToggleKeep(segment)}
                       />
-                      Keep
-                    </label>
+                      <Label htmlFor={checkboxId}>Keep</Label>
+                    </div>
                   </li>
                 );
               })}

@@ -19,6 +19,18 @@ import {
   type Project,
   type Video,
 } from "../db";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 
 /** Export statuses that mean "the worker (or the user) is still expected to
  * act on this row" — used by `ExportHistoryView` (PRD §11, Milestone 8) to
@@ -89,6 +101,11 @@ export default function LessonEditorView({
   // mutations against the same row.
   const lessonBusyRef = useRef<Set<string>>(new Set());
   const [lessonBusyIds, setLessonBusyIds] = useState<Set<string>>(new Set());
+
+  // Which lesson (if any) is pending Delete confirmation — a single piece of
+  // state driving one shared `AlertDialog`, same pattern as `HomeView`'s
+  // `pendingDelete` / `ProjectDetailView`'s `pendingRemove`.
+  const [pendingDeleteLesson, setPendingDeleteLesson] = useState<Lesson | null>(null);
 
   // Queuing exports (PRD §10-11, Milestone 7). `selectedForExport` drives
   // the per-lesson checkboxes used by "Export selected". This stage only
@@ -186,9 +203,17 @@ export default function LessonEditorView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoId]);
 
-  const handleDeleteLesson = useCallback(async (lesson: Lesson) => {
+  /** Opens the shared Delete confirmation dialog for `lesson` — the actual
+   * delete happens in `handleConfirmDeleteLesson` once the user confirms. */
+  const handleDeleteLesson = useCallback((lesson: Lesson) => {
     if (lessonBusyRef.current.has(lesson.id)) return;
-    if (!window.confirm(`Delete lesson "${lesson.title}"? This cannot be undone.`)) return;
+    setPendingDeleteLesson(lesson);
+  }, []);
+
+  const handleConfirmDeleteLesson = useCallback(async () => {
+    if (!pendingDeleteLesson) return;
+    const lesson = pendingDeleteLesson;
+    setPendingDeleteLesson(null);
     lessonBusyRef.current.add(lesson.id);
     setLessonBusyIds(new Set(lessonBusyRef.current));
     try {
@@ -201,7 +226,7 @@ export default function LessonEditorView({
       setLessonBusyIds(new Set(lessonBusyRef.current));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videoId]);
+  }, [pendingDeleteLesson]);
 
   // Adds a segment `[start, end)` to whichever lesson is currently
   // selected — the target for `SourceVideoPreview`'s Mark In/Mark Out/Add
@@ -285,31 +310,23 @@ export default function LessonEditorView({
       />
 
       {loading && <p>Loading editor…</p>}
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <Alert variant="destructive" className="my-4">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
       {!loading && !video && <p>Video not found.</p>}
 
       {video && (
         <>
-          <div className="project-header">
-            <div>
-              <h1>Lessons</h1>
-              <p className="video-path">{video.file_path}</p>
-            </div>
-            <div className="project-header-actions">
-              <button
-                type="button"
-                className="export-history-button"
-                onClick={() => onOpenExportHistory()}
-              >
+          <div className="flex items-start justify-end gap-4">
+            <div className="flex shrink-0 gap-2">
+              <Button type="button" variant="outline" onClick={() => onOpenExportHistory()}>
                 Exports
-              </button>
-              <button
-                type="button"
-                className="export-history-button"
-                onClick={() => setShowCreateLessonModal(true)}
-              >
+              </Button>
+              <Button type="button" variant="outline" onClick={() => setShowCreateLessonModal(true)}>
                 + Create lesson
-              </button>
+              </Button>
             </div>
           </div>
 
@@ -321,33 +338,42 @@ export default function LessonEditorView({
             onAddSegment={handleAddSegment}
           />
 
-          <section className="editor-panel">
+          <section>
             {sortedLessons.length > 0 && (
-              <div className="export-controls">
-                <button
+              <div className="my-2 flex items-center gap-2">
+                <Button
                   type="button"
                   disabled={exporting || selectedForExport.size === 0}
                   onClick={() => void handleExport([...selectedForExport])}
                 >
                   Export selected ({selectedForExport.size})
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
                   disabled={exporting}
                   onClick={() => void handleExport(sortedLessons.map((lesson) => lesson.id))}
                 >
                   Export all lessons
-                </button>
-                {exporting && <span className="import-status">Queuing export…</span>}
+                </Button>
+                {exporting && <span className="text-sm text-muted-foreground">Queuing export…</span>}
               </div>
             )}
-            {exportError && <p className="error">{exportError}</p>}
+            {exportError && (
+              <Alert variant="destructive" className="my-2">
+                <AlertDescription>{exportError}</AlertDescription>
+              </Alert>
+            )}
             {sortedLessons.length === 0 ? (
               <p>
                 No lessons yet —{" "}
-                <button type="button" className="link-button" onClick={onNavigateTranscript}>
+                <Button
+                  type="button"
+                  variant="link"
+                  className="h-auto p-0 align-baseline"
+                  onClick={onNavigateTranscript}
+                >
                   analyze this video's transcript
-                </button>{" "}
+                </Button>{" "}
                 first.
               </p>
             ) : (
@@ -391,6 +417,29 @@ export default function LessonEditorView({
           )}
         </>
       )}
+
+      <AlertDialog
+        open={pendingDeleteLesson !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteLesson(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete lesson?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDeleteLesson &&
+                `Delete lesson "${pendingDeleteLesson.title}"? This cannot be undone.`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={handleConfirmDeleteLesson}>
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

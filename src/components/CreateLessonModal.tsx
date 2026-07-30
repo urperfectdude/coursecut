@@ -1,6 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { createLesson, listTranscriptSegments, type LessonSegmentRange, type TranscriptSegment } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 /** Collapses `segments` (already in `start`/`id` order, per
  * `listTranscriptSegments`) into one `{start, end}` range per contiguous run
@@ -103,68 +115,77 @@ export default function CreateLessonModal({ videoId, onClose, onCreated }: Creat
   }
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div
-        className="modal-panel create-lesson-modal"
-        onClick={(event) => event.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-label="Create lesson"
-      >
-        <h2>Create lesson</h2>
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent className="sm:max-w-lg" aria-label="Create lesson">
+        <DialogHeader>
+          <DialogTitle>Create lesson</DialogTitle>
+        </DialogHeader>
 
-        <label className="create-lesson-title-field">
-          Title
-          <input
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="create-lesson-title">Title</Label>
+          <Input
+            id="create-lesson-title"
             type="text"
             value={title}
             onChange={(event) => setTitle(event.target.value)}
             autoFocus
             placeholder="Lesson title…"
           />
-        </label>
+        </div>
 
-        {loading && <p>Loading transcript…</p>}
-        {error && <p className="error">{error}</p>}
+        {loading && <p className="text-sm text-muted-foreground">Loading transcript…</p>}
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
         {!loading && segments.length === 0 && !error && (
-          <p>This video has no transcript segments yet.</p>
+          <p className="text-sm text-muted-foreground">This video has no transcript segments yet.</p>
         )}
 
         {segments.length > 0 && (
-          <ul className="create-lesson-segment-list">
-            {segments.map((segment) => (
-              <li key={segment.id} className="create-lesson-segment-row">
-                <label>
-                  <input
-                    type="checkbox"
+          <ul className="m-0 flex max-h-[60vh] list-none flex-col gap-1 overflow-y-auto p-0">
+            {segments.map((segment) => {
+              const checkboxId = `create-lesson-segment-${segment.id}`;
+              return (
+                <li key={segment.id} className="flex items-center gap-2 text-sm">
+                  <Checkbox
+                    id={checkboxId}
                     checked={checkedIds.has(segment.id)}
-                    onChange={() => toggleSegment(segment.id)}
+                    onCheckedChange={() => toggleSegment(segment.id)}
                   />
-                  <span className="create-lesson-segment-time">
-                    {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
-                  </span>
-                  <span className="create-lesson-segment-text">{segment.text}</span>
-                </label>
-              </li>
-            ))}
+                  <Label htmlFor={checkboxId} className="flex flex-1 items-center gap-2 font-normal">
+                    <span className="shrink-0 tabular-nums text-muted-foreground">
+                      {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
+                    </span>
+                    <span className="flex-1">{segment.text}</span>
+                  </Label>
+                </li>
+              );
+            })}
           </ul>
         )}
 
-        <p className="create-lesson-summary-hint">
+        <p className="text-sm text-muted-foreground">
           {segmentRanges.length > 0
             ? `${segmentRanges.length} segment${segmentRanges.length === 1 ? "" : "s"} selected.`
             : "Check transcript segments to include — non-contiguous checks become a multi-segment lesson."}
         </p>
 
-        <div className="modal-actions">
-          <button type="button" onClick={onClose} disabled={creating}>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={onClose} disabled={creating}>
             Cancel
-          </button>
-          <button type="button" onClick={() => void handleCreate()} disabled={!canCreate}>
+          </Button>
+          <Button type="button" onClick={() => void handleCreate()} disabled={!canCreate}>
             {creating ? "Creating…" : "Create lesson"}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

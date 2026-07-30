@@ -7,6 +7,11 @@ import {
   testOpenAiKey,
   type KeyStatus,
 } from "../db";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 
 interface SettingsViewProps {
   onBack: () => void;
@@ -92,9 +97,9 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
 
   return (
     <div>
-      <button type="button" className="back-button" onClick={onBack}>
+      <Button type="button" variant="ghost" onClick={onBack}>
         ← Back
-      </button>
+      </Button>
 
       <h1>Settings</h1>
 
@@ -108,28 +113,46 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
               : "No key saved."}
         </p>
 
-        <form onSubmit={handleSave} className="new-project-form">
-          <input
+        <form onSubmit={handleSave} className="my-4 flex gap-2">
+          <Label htmlFor="openai-api-key" className="sr-only">
+            OpenAI API key
+          </Label>
+          <Input
+            id="openai-api-key"
             type="password"
             value={keyInput}
             onChange={(event) => setKeyInput(event.target.value)}
             placeholder="sk-..."
-            aria-label="OpenAI API key"
           />
-          <button type="submit" disabled={!keyInput.trim() || saving}>
+          <Button type="submit" disabled={!keyInput.trim() || saving}>
             {saving ? "Saving…" : "Save"}
-          </button>
+          </Button>
         </form>
 
-        <button type="button" onClick={handleTest} disabled={testing}>
+        <Button type="button" variant="outline" onClick={handleTest} disabled={testing}>
           {testing ? "Testing…" : "Test Connection"}
-        </button>
+        </Button>
 
         {testResult && (
-          <p className={testResult.valid ? "success" : "error"}>{testResult.message}</p>
+          <Alert
+            variant={testResult.valid ? "default" : "destructive"}
+            className={
+              testResult.valid
+                ? "mt-4 border-emerald-600/40 bg-emerald-50 text-emerald-900 dark:border-emerald-400/40 dark:bg-emerald-950/40 dark:text-emerald-200"
+                : "mt-4"
+            }
+          >
+            <AlertDescription className={testResult.valid ? "text-inherit" : undefined}>
+              {testResult.message}
+            </AlertDescription>
+          </Alert>
         )}
 
-        {error && <p className="error">{error}</p>}
+        {error && (
+          <Alert variant="destructive" className="mt-4">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
       </section>
 
       <section>
@@ -141,8 +164,12 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
         </p>
 
         <form onSubmit={handleSaveInstructions}>
-          <textarea
-            className="analysis-instructions-input"
+          <Label htmlFor="analysis-instructions" className="sr-only">
+            Analysis instructions
+          </Label>
+          <Textarea
+            id="analysis-instructions"
+            className="my-2 block w-full max-w-2xl resize-y"
             value={instructionsInput}
             onChange={(event) => {
               setInstructionsInput(event.target.value);
@@ -153,17 +180,24 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
                 ? "Loading…"
                 : "Optional — tell the AI what to emphasize when splitting lessons, e.g. 'always separate Q&A sections'"
             }
-            aria-label="Analysis instructions"
             rows={5}
             disabled={instructionsLoading}
           />
-          <button type="submit" disabled={instructionsLoading || savingInstructions}>
+          <Button type="submit" disabled={instructionsLoading || savingInstructions}>
             {savingInstructions ? "Saving…" : "Save"}
-          </button>
+          </Button>
         </form>
 
-        {instructionsSaved && <p className="success">Saved.</p>}
-        {instructionsError && <p className="error">{instructionsError}</p>}
+        {instructionsSaved && (
+          <Alert className="mt-4 border-emerald-600/40 bg-emerald-50 text-emerald-900 dark:border-emerald-400/40 dark:bg-emerald-950/40 dark:text-emerald-200">
+            <AlertDescription className="text-inherit">Saved.</AlertDescription>
+          </Alert>
+        )}
+        {instructionsError && (
+          <Alert variant="destructive" className="mt-4">
+            <AlertDescription>{instructionsError}</AlertDescription>
+          </Alert>
+        )}
       </section>
     </div>
   );

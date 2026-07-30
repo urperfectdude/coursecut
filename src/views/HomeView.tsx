@@ -1,5 +1,19 @@
 import { useEffect, useState } from "react";
 import { createProject, deleteProject, getOpenAiKeyStatus, listProjects, type Project } from "../db";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 interface HomeViewProps {
   onOpenProject: (id: string) => void;
@@ -22,6 +36,11 @@ export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProp
   // would likely just fail the same way. Kept separate so that case gets
   // its own message instead of being presented as a plain missing-key banner.
   const [keyCheckError, setKeyCheckError] = useState<string | null>(null);
+  // Which project (if any) is currently pending delete confirmation — a
+  // single piece of state rather than one `AlertDialog` per row, since only
+  // one confirmation can be open at a time and this keeps the list rendering
+  // simple.
+  const [pendingDelete, setPendingDelete] = useState<Project | null>(null);
 
   async function refresh() {
     try {
@@ -61,10 +80,10 @@ export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProp
     }
   }
 
-  async function handleDelete(id: string, name: string) {
-    if (!window.confirm(`Delete project "${name}"? This cannot be undone.`)) {
-      return;
-    }
+  async function handleConfirmDelete() {
+    if (!pendingDelete) return;
+    const { id } = pendingDelete;
+    setPendingDelete(null);
     try {
       await deleteProject(id);
       await refresh();
@@ -77,72 +96,108 @@ export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProp
     <div>
       <h1>CourseCut</h1>
 
-      <form onSubmit={handleCreate} className="new-project-form">
-        <input
+      <form onSubmit={handleCreate} className="my-4 flex gap-2">
+        <Label htmlFor="new-project-name" className="sr-only">
+          Project name
+        </Label>
+        <Input
+          id="new-project-name"
           type="text"
           value={newName}
           onChange={(event) => setNewName(event.target.value)}
           placeholder="Project name"
-          aria-label="Project name"
         />
-        <button type="submit" disabled={!newName.trim()}>
+        <Button type="submit" disabled={!newName.trim()}>
           New Project
-        </button>
-        <button type="button" onClick={onOpenSettings}>
+        </Button>
+        <Button type="button" variant="outline" onClick={onOpenSettings}>
           Settings
-        </button>
+        </Button>
       </form>
 
       {keyCheckError ? (
-        <div className="key-banner" role="alert">
-          <p>Could not check your OpenAI API key status: {keyCheckError}</p>
-        </div>
+        <Alert className="my-4 border-amber-600/40 bg-amber-50 text-amber-900 dark:border-amber-400/40 dark:bg-amber-950/40 dark:text-amber-200">
+          <AlertDescription className="text-inherit">
+            Could not check your OpenAI API key status: {keyCheckError}
+          </AlertDescription>
+        </Alert>
       ) : (
         keyPresent === false && (
-          <div className="key-banner" role="alert">
-            <p>
+          <Alert className="my-4 flex items-center justify-between gap-4 border-amber-600/40 bg-amber-50 text-amber-900 dark:border-amber-400/40 dark:bg-amber-950/40 dark:text-amber-200">
+            <AlertDescription className="text-inherit">
               CourseCut is bring-your-own-key: transcription and analysis need an OpenAI API key.
               Nothing will process until one is saved.
-            </p>
-            <button type="button" onClick={onOpenSettings}>
+            </AlertDescription>
+            <Button type="button" onClick={onOpenSettings}>
               Add API key
-            </button>
-          </div>
+            </Button>
+          </Alert>
         )
       )}
 
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <Alert variant="destructive" className="my-4">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
 
       {loading ? (
         <p>Loading projects…</p>
       ) : projects.length === 0 ? (
         <p>No projects yet. Create one to get started.</p>
       ) : (
-        <ul className="project-list">
+        <ul className="m-0 list-none p-0">
           {projects.map((project) => (
-            <li key={project.id} className="project-list-item">
+            <li
+              key={project.id}
+              className="flex items-center justify-between gap-4 border-b border-border py-2"
+            >
               <button
                 type="button"
-                className="project-link"
+                className="flex flex-1 flex-col items-start gap-0.5 border-0 bg-transparent p-0 text-left text-inherit [font:inherit]"
                 onClick={() => onOpenProject(project.id)}
               >
-                <span className="project-name">{project.name}</span>
-                <span className="project-updated">
+                <span className="font-semibold">{project.name}</span>
+                <span className="text-sm opacity-70">
                   Updated {new Date(project.updated_at).toLocaleString()}
                 </span>
               </button>
-              <button
+              <Button
                 type="button"
-                className="delete-button"
-                onClick={() => handleDelete(project.id, project.name)}
+                variant="destructive"
+                size="sm"
+                onClick={() => setPendingDelete(project)}
                 aria-label={`Delete ${project.name}`}
               >
                 Delete
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
       )}
+
+      <AlertDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDelete(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete project?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDelete &&
+                `Delete project "${pendingDelete.name}"? This cannot be undone.`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={handleConfirmDelete}>
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

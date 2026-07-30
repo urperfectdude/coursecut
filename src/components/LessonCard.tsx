@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
+import { Trash2 } from "lucide-react";
 import { listLessonSegments, type Lesson, type LessonSegment } from "../db";
 import LessonPreviewPlayer from "./LessonPreviewPlayer";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
+import { getLessonKindBadgeClassName } from "@/lib/badge-variants";
 
 interface LessonCardProps {
   lesson: Lesson;
@@ -71,82 +79,98 @@ export default function LessonCard({
     void fetchSegments();
   }, [fetchSegments, segmentsRefreshKey]);
 
-  return (
-    <li className={"lesson-card" + (isSelected ? " lesson-card-selected" : "")}>
-      <div className="lesson-card-header" onClick={() => onSelect(lesson.id)}>
-        <div className="lesson-card-title-row">
-          <input
-            type="checkbox"
-            className="lesson-export-checkbox"
-            checked={selectedForExport}
-            onClick={(event) => event.stopPropagation()}
-            onChange={() => onToggleExportSelection(lesson.id)}
-            aria-label={`Select lesson ${lesson.title} for export`}
-          />
-          {/* Read-only here — renaming lives on the lesson's own segments
-             page (`LessonSegmentsView`) now, not this grid tile. */}
-          <span className="lesson-card-title-text">{lesson.title}</span>
-        </div>
-        <div className="lesson-card-badge-row">
-          <span className={`kind-badge kind-${lesson.kind} kind-badge-small`}>{lesson.kind}</span>
-          {lesson.confidence !== null && (
-            <span className="confidence-badge confidence-badge-small">
-              {Math.round(lesson.confidence * 100)}% confidence
-            </span>
-          )}
-        </div>
-      </div>
+  const checkboxId = `lesson-export-${lesson.id}`;
 
-      <div className="lesson-item-actions">
-        <button
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            onOpenSegments(lesson);
-          }}
-        >
-          Edit segments
-        </button>
-        <button
-          type="button"
-          disabled={exporting}
-          onClick={(event) => {
-            event.stopPropagation();
-            onExport([lesson.id]);
-          }}
-        >
-          Export
-        </button>
-        {next && (
-          <button
+  return (
+    <li>
+      <Card size="sm" className={cn(isSelected && "ring-2 ring-primary")}>
+        <CardHeader className="cursor-pointer gap-1.5" onClick={() => onSelect(lesson.id)}>
+          <div className="flex flex-wrap items-center gap-2">
+            <Checkbox
+              id={checkboxId}
+              checked={selectedForExport}
+              onClick={(event) => event.stopPropagation()}
+              onCheckedChange={() => onToggleExportSelection(lesson.id)}
+            />
+            <Label htmlFor={checkboxId} className="sr-only">
+              Select lesson {lesson.title} for export
+            </Label>
+            {/* Read-only here — renaming lives on the lesson's own segments
+               page (`LessonSegmentsView`) now, not this grid tile. */}
+            <span className="min-w-0 flex-1 truncate text-sm font-semibold" title={lesson.title}>
+              {lesson.title}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge variant="outline" className={cn("capitalize", getLessonKindBadgeClassName(lesson.kind))}>
+              {lesson.kind}
+            </Badge>
+            {lesson.confidence !== null && (
+              <Badge variant="secondary">{Math.round(lesson.confidence * 100)}% confidence</Badge>
+            )}
+          </div>
+        </CardHeader>
+
+        <CardContent className="flex flex-wrap gap-2">
+          <Button
             type="button"
-            disabled={isBusy || isNextBusy}
+            variant="outline"
+            size="sm"
             onClick={(event) => {
               event.stopPropagation();
-              onMergeWithNext(lesson, next);
+              onOpenSegments(lesson);
             }}
           >
-            Merge with next
-          </button>
-        )}
-        <button
-          type="button"
-          className="delete-button"
-          disabled={isBusy}
-          onClick={(event) => {
-            event.stopPropagation();
-            onDelete(lesson);
-          }}
-        >
-          Delete
-        </button>
-      </div>
+            Edit segments
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            disabled={exporting}
+            onClick={(event) => {
+              event.stopPropagation();
+              onExport([lesson.id]);
+            }}
+          >
+            Export
+          </Button>
+          {next && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={isBusy || isNextBusy}
+              onClick={(event) => {
+                event.stopPropagation();
+                onMergeWithNext(lesson, next);
+              }}
+            >
+              Merge with next
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="destructive"
+            size="icon-sm"
+            disabled={isBusy}
+            aria-label={`Delete lesson ${lesson.title}`}
+            title="Delete lesson"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDelete(lesson);
+            }}
+          >
+            <Trash2 />
+          </Button>
+        </CardContent>
 
-      <div className="lesson-card-preview">
-        <LessonPreviewPlayer videoFilePath={videoFilePath} segments={segments} lessonTitle={lesson.title} />
-        {segmentsLoading && <p>Loading segments…</p>}
-        {segmentsError && <p className="error">{segmentsError}</p>}
-      </div>
+        <CardContent className="lesson-card-preview">
+          <LessonPreviewPlayer videoFilePath={videoFilePath} segments={segments} lessonTitle={lesson.title} />
+          {segmentsLoading && <p>Loading segments…</p>}
+          {segmentsError && <p className="error">{segmentsError}</p>}
+        </CardContent>
+      </Card>
     </li>
   );
 }

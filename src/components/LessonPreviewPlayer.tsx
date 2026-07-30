@@ -1,7 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { Maximize, Minimize2, Pause, Play } from "lucide-react";
 import type { LessonSegment } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
+import SegmentedScrubber from "./SegmentedScrubber";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 
 interface LessonPreviewPlayerProps {
   videoFilePath: string;
@@ -165,55 +176,75 @@ export default function LessonPreviewPlayer({
   }
 
   return (
-    <div className={"lesson-card-player" + (isFullscreen ? " lesson-card-player-fullscreen" : "")}>
+    <div
+      className={cn(
+        "relative",
+        // `lesson-card-player-fullscreen` is a plain hook className (no
+        // styles of its own) so styles.css can override
+        // `LessonSegmentsView`'s shared-height rule below it — see the
+        // matching comment in `SourceVideoPreview.tsx`.
+        isFullscreen &&
+          "lesson-card-player-fullscreen fixed inset-0 z-[1000] flex max-w-none flex-col justify-center bg-black p-4",
+      )}
+    >
       <video
         ref={videoRef}
         src={convertFileSrc(videoFilePath)}
-        className="lesson-card-video"
+        // `lesson-card-video` is kept as a plain hook className (styled
+        // entirely via the Tailwind utilities alongside it) because
+        // `LessonSegmentsView`'s stylesheet forces this element to a shared
+        // height alongside `SourceVideoPreview`'s video via
+        // `.lesson-segments-preview-row .lesson-card-video` — see
+        // styles.css and this phase's report.
+        className={cn(
+          "lesson-card-video block max-h-[25vh] w-full bg-black",
+          isFullscreen && "h-auto max-h-[82vh] w-full",
+        )}
         onTimeUpdate={handleTimeUpdate}
         onPlay={() => setIsPaused(false)}
         onPause={() => setIsPaused(true)}
       />
 
-      <div className="lesson-card-controls-row">
-        <button
+      <div className="mt-1 flex items-center gap-2">
+        <Button
           type="button"
-          className="lesson-card-play-button"
+          variant="ghost"
+          size="icon"
           disabled={segments.length === 0}
           onClick={togglePlayPause}
           aria-label={isPaused ? "Play" : "Pause"}
         >
-          {isPaused ? "▶" : "⏸"}
-        </button>
-        <span className="lesson-card-time-readout">
+          {isPaused ? <Play /> : <Pause />}
+        </Button>
+        <span className="text-sm tabular-nums opacity-75">
           {formatTimestamp(virtualCurrentTime)} / {formatTimestamp(totalVirtualDuration)}
         </span>
-        <select
-          className="lesson-card-speed-select"
-          value={playbackRate}
-          onChange={(event) => setPlaybackRate(Number(event.target.value))}
-          aria-label="Playback speed"
-        >
-          {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
-            <option key={rate} value={rate}>
-              {rate}x
-            </option>
-          ))}
-        </select>
-        <button
+        <Select value={String(playbackRate)} onValueChange={(value) => setPlaybackRate(Number(value))}>
+          <SelectTrigger size="sm" className="ml-auto" aria-label="Playback speed">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+              <SelectItem key={rate} value={String(rate)}>
+                {rate}x
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button
           type="button"
-          className="lesson-card-fullscreen-button"
+          variant={isFullscreen ? "secondary" : "ghost"}
+          size="icon"
           aria-pressed={isFullscreen}
           aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
           onClick={toggleFullscreen}
         >
-          {isFullscreen ? "⤢" : "⛶"}
-        </button>
+          {isFullscreen ? <Minimize2 /> : <Maximize />}
+        </Button>
       </div>
 
-      <input
-        type="range"
-        className="lesson-card-scrubber"
+      <SegmentedScrubber
+        className="mt-1"
         min={0}
         max={totalVirtualDuration}
         step={0.01}

@@ -1,7 +1,19 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { Maximize, Minimize2, Pause, Play } from "lucide-react";
 import type { LessonSegment } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
+import SegmentedScrubber from "./SegmentedScrubber";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 
 // FFprobe isn't wired up for per-video frame rate in this codebase (see
 // `coursecut-architecture`), so there's no real FPS to step by. This
@@ -181,11 +193,36 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     }, []);
 
     return (
-      <div className={"source-preview" + (isFullscreen ? " source-preview-fullscreen" : "")}>
+      <div
+        className={cn(
+          // `source-preview` is kept as a plain hook className (styled
+          // entirely via the Tailwind utilities alongside it) because
+          // `LessonSegmentsView`'s stylesheet still targets it directly via
+          // `.lesson-segments-source-preview .source-preview` for a
+          // side-by-side max-width override — see styles.css and this
+          // phase's report for why that's left alone rather than migrated.
+          "source-preview relative my-3 mb-5 max-w-lg",
+          // `source-preview-fullscreen` is a plain hook className (no styles
+          // of its own) so styles.css can override `LessonSegmentsView`'s
+          // shared-height rule below it — that rule is unlayered CSS and
+          // would otherwise always beat the Tailwind `max-h-[82vh]` utility
+          // on the <video> regardless of specificity (CSS cascade layers:
+          // unlayered author styles win over any `@layer`-declared ones).
+          isFullscreen &&
+            "source-preview-fullscreen fixed inset-0 z-[1000] flex max-w-none flex-col justify-center bg-black p-4",
+        )}
+      >
         <video
           ref={videoRef}
           src={convertFileSrc(filePath)}
-          className="source-preview-video"
+          // `source-preview-video` is likewise kept as a hook className —
+          // `LessonSegmentsView`'s stylesheet forces this element to a
+          // shared height alongside `LessonPreviewPlayer`'s video via
+          // `.lesson-segments-preview-row .source-preview-video`.
+          className={cn(
+            "source-preview-video block max-h-[30vh] w-full bg-black",
+            isFullscreen && "h-auto max-h-[82vh] w-full",
+          )}
           onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
           onTimeUpdate={handleTimeUpdate}
           onPlay={() => setIsPaused(false)}
@@ -195,88 +232,96 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
         {/* Replaces native `<video controls>` (dropped above — shadow DOM
            controls can't carry the yellow segment-highlight overlay, see
            the scrubber below). This is the only seekbar now. */}
-        <div className="source-preview-controls-row">
-          <button
+        <div className="mt-1.5 flex items-center gap-2.5">
+          <Button
             type="button"
+            variant="ghost"
+            size="icon"
             onClick={togglePlayPause}
             aria-label={isPaused ? "Play" : "Pause"}
-            className="source-preview-play-button"
           >
-            {isPaused ? "▶" : "⏸"}
-          </button>
-          <span className="source-preview-time-readout">
+            {isPaused ? <Play /> : <Pause />}
+          </Button>
+          <span className="text-sm tabular-nums opacity-75">
             {formatTimestamp(currentTime)} / {formatTimestamp(duration)}
           </span>
-          <select
-            className="source-preview-speed-select"
-            value={playbackRate}
-            onChange={(event) => setPlaybackRate(Number(event.target.value))}
-            aria-label="Playback speed"
-          >
-            {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
-              <option key={rate} value={rate}>
-                {rate}x
-              </option>
-            ))}
-          </select>
-          <button
+          <Select value={String(playbackRate)} onValueChange={(value) => setPlaybackRate(Number(value))}>
+            <SelectTrigger size="sm" className="ml-auto" aria-label="Playback speed">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+                <SelectItem key={rate} value={String(rate)}>
+                  {rate}x
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button
             type="button"
-            className="source-preview-fullscreen-button"
+            variant={isFullscreen ? "secondary" : "ghost"}
+            size="icon"
             aria-pressed={isFullscreen}
             aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
             onClick={toggleFullscreen}
           >
-            {isFullscreen ? "⤢" : "⛶"}
-          </button>
+            {isFullscreen ? <Minimize2 /> : <Maximize />}
+          </Button>
         </div>
 
-        <div className="source-preview-scrubber-wrapper">
-          <input
-            type="range"
-            className="source-preview-scrubber"
-            min={0}
-            max={duration || 0}
-            step={FRAME_STEP_SECONDS}
-            value={Math.min(currentTime, duration || currentTime)}
-            onChange={handleScrub}
-            aria-label="Scrub source video"
-          />
-          <div className="source-preview-overlay" aria-hidden="true">
-            {duration > 0 &&
-              selectedLessonSegments.map((segment) => (
-                <span
-                  key={segment.id}
-                  className="source-preview-segment-highlight"
-                  style={{
-                    left: `${(segment.start / duration) * 100}%`,
-                    width: `${((segment.end - segment.start) / duration) * 100}%`,
-                  }}
-                />
-              ))}
-          </div>
-        </div>
+        <SegmentedScrubber
+          className="mt-1.5"
+          min={0}
+          max={duration || 0}
+          step={FRAME_STEP_SECONDS}
+          value={Math.min(currentTime, duration || currentTime)}
+          onChange={handleScrub}
+          aria-label="Scrub source video"
+          segments={selectedLessonSegments}
+          duration={duration}
+        />
 
-        <p className="source-preview-hint">
+        <p className="my-1.5 text-xs opacity-60">
           Space: play/pause · ←/→: step ~1 frame (1/30s) · Shift+←/→: step 1s
         </p>
 
-        <div className="source-preview-mark-controls">
-          <button type="button" disabled={!hasSelectedLesson} onClick={() => setMarkIn(currentTime)}>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={!hasSelectedLesson}
+            onClick={() => setMarkIn(currentTime)}
+          >
             Mark In
-          </button>
-          <span className="source-preview-mark-value">{markIn !== null ? formatTimestamp(markIn) : "—"}</span>
-          <button type="button" disabled={!hasSelectedLesson} onClick={() => setMarkOut(currentTime)}>
+          </Button>
+          <span className="min-w-14 text-sm tabular-nums opacity-75">
+            {markIn !== null ? formatTimestamp(markIn) : "—"}
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={!hasSelectedLesson}
+            onClick={() => setMarkOut(currentTime)}
+          >
             Mark Out
-          </button>
-          <span className="source-preview-mark-value">{markOut !== null ? formatTimestamp(markOut) : "—"}</span>
-          <button type="button" disabled={!canAddSegment} onClick={() => void handleAddSegment()}>
+          </Button>
+          <span className="min-w-14 text-sm tabular-nums opacity-75">
+            {markOut !== null ? formatTimestamp(markOut) : "—"}
+          </span>
+          <Button type="button" size="sm" disabled={!canAddSegment} onClick={() => void handleAddSegment()}>
             Add segment
-          </button>
+          </Button>
         </div>
         {!hasSelectedLesson && (
-          <p className="source-preview-hint">Select a lesson below to add a segment to it.</p>
+          <p className="my-1.5 text-xs opacity-60">Select a lesson below to add a segment to it.</p>
         )}
-        {addSegmentError && <p className="error">{addSegmentError}</p>}
+        {addSegmentError && (
+          <Alert variant="destructive" className="mt-2">
+            <AlertDescription>{addSegmentError}</AlertDescription>
+          </Alert>
+        )}
       </div>
     );
   },

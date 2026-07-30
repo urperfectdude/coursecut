@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { Loader2 } from "lucide-react";
 import Breadcrumbs from "../components/Breadcrumbs";
 import {
   deleteVideo,
@@ -18,6 +19,22 @@ import {
 } from "../db";
 import { useVideoProgress } from "../hooks/useVideoProgress";
 import { formatTimestamp } from "../lib/timestamp";
+import { getVideoStatusBadgeClassName } from "../lib/badge-variants";
+import { cn } from "@/lib/utils";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 
 const NO_KEY_MESSAGE =
   "No OpenAI API key saved yet — add one in Settings, then use Retry to transcribe this video.";
@@ -96,6 +113,10 @@ export default function ProjectDetailView({
   // instead of the page-level `error` banner above — one bad video
   // shouldn't read as a whole-page failure.
   const [videoErrors, setVideoErrors] = useState<Record<string, string>>({});
+  // Which video (if any) is pending Remove confirmation — a single piece of
+  // state driving one shared `AlertDialog`, rather than one dialog per row,
+  // same pattern as `HomeView`'s `pendingDelete`.
+  const [pendingRemove, setPendingRemove] = useState<Video | null>(null);
   // Mirrors `importing` for the drag-drop listener and button handlers,
   // which would otherwise close over a stale value — one import at a time.
   const importingRef = useRef(false);
@@ -266,34 +287,34 @@ export default function ProjectDetailView({
     [processVideo],
   );
 
-  /** Removes a video from the project entirely (distinct from Retry — this
-   * deletes the row). Does not touch the cached extracted-audio WAV file,
-   * since it's content-hash-keyed and may be shared with other videos. */
-  const handleRemove = useCallback(
-    async (video: Video) => {
-      if (inFlightRef.current.has(video.id)) return;
-      if (
-        !window.confirm(
-          `Remove "${basename(video.file_path)}" from this project? This cannot be undone.`,
-        )
-      ) {
-        return;
-      }
-      try {
-        await deleteVideo(video.id);
-        setVideos(await listVideos(projectId));
-        setVideoErrors((prev) => {
-          if (!(video.id in prev)) return prev;
-          const next = { ...prev };
-          delete next[video.id];
-          return next;
-        });
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      }
-    },
-    [projectId],
-  );
+  /** Opens the shared Remove confirmation dialog for `video` — the actual
+   * delete happens in `handleConfirmRemove` once the user confirms. */
+  const handleRemove = useCallback((video: Video) => {
+    if (inFlightRef.current.has(video.id)) return;
+    setPendingRemove(video);
+  }, []);
+
+  /** Removes `pendingRemove` from the project entirely (distinct from Retry
+   * — this deletes the row). Does not touch the cached extracted-audio WAV
+   * file, since it's content-hash-keyed and may be shared with other
+   * videos. */
+  const handleConfirmRemove = useCallback(async () => {
+    if (!pendingRemove) return;
+    const video = pendingRemove;
+    setPendingRemove(null);
+    try {
+      await deleteVideo(video.id);
+      setVideos(await listVideos(projectId));
+      setVideoErrors((prev) => {
+        if (!(video.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[video.id];
+        return next;
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [pendingRemove, projectId]);
 
   // Tauri delivers OS drag & drop through the webview event, not DOM events.
   useEffect(() => {
@@ -357,54 +378,61 @@ export default function ProjectDetailView({
       />
 
       {loading && <p>Loading project…</p>}
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <Alert variant="destructive" className="my-4">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
       {!loading && !error && !project && <p>Project not found.</p>}
 
       {project && (
         <>
-          <div className="project-header">
-            <div>
-              <h1>{project.name}</h1>
-              <p>
-                Created {new Date(project.created_at).toLocaleString()} · Updated{" "}
-                {new Date(project.updated_at).toLocaleString()}
-              </p>
-            </div>
-            <button type="button" className="export-history-button" onClick={onOpenExportHistory}>
+          <div className="flex items-start justify-end gap-4">
+            <Button type="button" variant="outline" className="shrink-0" onClick={onOpenExportHistory}>
               Export History
-            </button>
+            </Button>
           </div>
 
-          <div className="import-actions">
-            <button type="button" onClick={handleImportFiles} disabled={importing}>
+          <div className="my-4 flex items-center gap-2">
+            <Button type="button" onClick={handleImportFiles} disabled={importing}>
               Import videos
-            </button>
-            <button type="button" onClick={handleImportFolder} disabled={importing}>
+            </Button>
+            <Button type="button" onClick={handleImportFolder} disabled={importing}>
               Import folder
-            </button>
-            {importing && <span className="import-status">Importing…</span>}
+            </Button>
+            {importing && <span className="text-sm text-muted-foreground">Importing…</span>}
           </div>
 
-          <div className={dragging ? "drop-zone drop-zone-active" : "drop-zone"}>
+          <div
+            className={cn(
+              "mb-4 rounded-md border-2 border-dashed p-5 text-center text-sm transition-colors",
+              dragging ? "border-primary bg-primary/5" : "border-border text-muted-foreground",
+            )}
+          >
             {dragging ? "Drop to import" : "Or drag & drop video files or folders here"}
           </div>
 
-          {importMessage && <p className="import-message">{importMessage}</p>}
+          {importMessage && (
+            <Badge variant="secondary" className="mb-4">
+              {importMessage}
+            </Badge>
+          )}
 
           {videos.length === 0 ? (
             <p>No videos imported yet.</p>
           ) : (
-            <ul className="video-list">
+            <ul className="m-0 list-none p-0">
               {videos.map((video) => {
                 const canShowTranscript = !PRE_TRANSCRIPT_STATUSES.has(video.transcript_status);
                 const isInFlight = inFlightIds.has(video.id);
                 const videoProgress = progress[video.id];
                 return (
-                  <li key={video.id} className="video-list-entry">
+                  <li key={video.id} className="border-b border-border py-2">
                     <div
-                      className={
-                        canShowTranscript ? "video-list-item video-list-item-clickable" : "video-list-item"
-                      }
+                      className={cn(
+                        "flex items-center gap-4",
+                        canShowTranscript && "cursor-pointer",
+                      )}
                       onClick={canShowTranscript ? () => onOpenVideo(video.id) : undefined}
                       role={canShowTranscript ? "button" : undefined}
                       tabIndex={canShowTranscript ? 0 : undefined}
@@ -419,32 +447,32 @@ export default function ProjectDetailView({
                           : undefined
                       }
                     >
-                      <div className="video-info">
-                        <span className="video-name">{basename(video.file_path)}</span>
-                        <span className="video-path">{video.file_path}</span>
+                      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                        <span className="font-semibold">{basename(video.file_path)}</span>
+                        <span className="overflow-hidden text-ellipsis whitespace-nowrap text-sm opacity-60">
+                          {video.file_path}
+                        </span>
                       </div>
-                      <span className="video-duration">{formatDuration(video.duration)}</span>
-                      <span className={`status-badge status-${video.transcript_status}`}>
-                        {video.transcript_status}
+                      <span className="text-sm tabular-nums opacity-70">
+                        {formatDuration(video.duration)}
                       </span>
+                      <Badge
+                        variant="outline"
+                        className={getVideoStatusBadgeClassName(video.transcript_status)}
+                      >
+                        {video.transcript_status}
+                      </Badge>
                       {isInFlight && (
-                        <span className="video-progress">
-                          <span
-                            className={
-                              videoProgress?.fraction == null
-                                ? "video-progress-spinner"
-                                : "video-progress-bar"
-                            }
-                            aria-hidden="true"
-                          >
-                            {videoProgress?.fraction != null && (
-                              <span
-                                className="video-progress-bar-fill"
-                                style={{ width: `${Math.round(videoProgress.fraction * 100)}%` }}
-                              />
-                            )}
-                          </span>
-                          <span className="video-progress-label">
+                        <span className="flex items-center gap-1.5 text-sm opacity-85">
+                          {videoProgress?.fraction == null ? (
+                            <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden="true" />
+                          ) : (
+                            <Progress
+                              value={Math.round(videoProgress.fraction * 100)}
+                              className="h-1.5 w-16 shrink-0"
+                            />
+                          )}
+                          <span>
                             {videoProgress ? stageLabel(videoProgress.stage) : "Working…"}
                             {videoProgress && videoProgress.attempt > 1 && (
                               <> — Retrying ({videoProgress.attempt})…</>
@@ -454,33 +482,37 @@ export default function ProjectDetailView({
                         </span>
                       )}
                       {video.transcript_status === "error" && !isInFlight && (
-                        <button
+                        <Button
                           type="button"
-                          className="retry-button"
+                          size="sm"
+                          variant="outline"
                           onClick={(event) => {
                             event.stopPropagation();
                             void handleRetry(video);
                           }}
                         >
                           Retry
-                        </button>
+                        </Button>
                       )}
-                      <button
+                      <Button
                         type="button"
-                        className="delete-button"
+                        size="sm"
+                        variant="destructive"
                         onClick={(event) => {
                           event.stopPropagation();
-                          void handleRemove(video);
+                          handleRemove(video);
                         }}
                         disabled={isInFlight}
                         aria-label={`Remove ${basename(video.file_path)}`}
                       >
                         Remove
-                      </button>
+                      </Button>
                     </div>
 
                     {videoErrors[video.id] && (
-                      <p className="error video-error">{videoErrors[video.id]}</p>
+                      <Alert variant="destructive" className="mt-1">
+                        <AlertDescription>{videoErrors[video.id]}</AlertDescription>
+                      </Alert>
                     )}
                   </li>
                 );
@@ -489,6 +521,29 @@ export default function ProjectDetailView({
           )}
         </>
       )}
+
+      <AlertDialog
+        open={pendingRemove !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingRemove(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove video?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingRemove &&
+                `Remove "${basename(pendingRemove.file_path)}" from this project? This cannot be undone.`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={handleConfirmRemove}>
+              Remove
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
