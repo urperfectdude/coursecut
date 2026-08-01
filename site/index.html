@@ -6,11 +6,23 @@
 <title>CourseCut — lecture recordings into lessons</title>
 <meta name="description" content="CourseCut transcribes your lecture recording, finds where each topic begins and ends, and exports clean lesson videos. Local-first, for macOS and Windows.">
 <meta name="theme-color" content="#ffffff">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23101114'/%3E%3Crect x='7' y='3' width='2' height='10' fill='%231B3CF0'/%3E%3C/svg%3E">
+
+<!-- The real app icon, not a stand-in. These are generated from `coursecut.png`
+     at the repo root — the same artwork `src-tauri/icons/` is built from — so
+     the tab, the download page and the installed app all show one mark. -->
+<link rel="icon" href="assets/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/icon-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/icon-180.png">
 
 <meta property="og:type" content="website">
 <meta property="og:title" content="CourseCut — lecture recordings into lessons">
 <meta property="og:description" content="Turn a three-hour lecture into the lessons it was always made of. Local-first, for macOS and Windows.">
+<meta property="og:image" content="assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The CourseCut app icon: a film strip being cut.">
+<meta name="twitter:card" content="summary_large_image">
 
 <style>
   /* ---- reset ----------------------------------------------------------- */
@@ -88,7 +100,9 @@
 
   .wordmark {
     display: flex;
-    align-items: baseline;
+    /* Centred, not baseline-aligned: the mark is a square tile with no
+       baseline of its own, so baseline alignment would hang it low. */
+    align-items: center;
     gap: 0.5rem;
     font-size: var(--step-1);
     font-weight: 600;
@@ -96,6 +110,15 @@
     text-decoration: none;
   }
   .wordmark .slash { color: var(--accent); font-weight: 400; }
+
+  /* The app icon itself. Its own background is white, which is this page's
+     background too, so on screen it reads as the bare glyph — deliberate. */
+  .wordmark img {
+    width: 1.75rem;
+    height: 1.75rem;
+    /* Nudges the optical gap in, since the artwork carries its own padding. */
+    margin-left: -0.125rem;
+  }
 
   h1 {
     font-size: var(--step-3);
@@ -249,7 +272,10 @@
 <div class="page">
 
   <header class="masthead">
-    <a class="wordmark" href="/">Course<span class="slash">/</span>Cut</a>
+    <a class="wordmark" href="/">
+      <img src="assets/icon-192.png" alt="" width="192" height="192" decoding="async">
+      <span>Course<span class="slash">/</span>Cut</span>
+    </a>
     <p class="eyebrow">Desktop app · macOS &amp; Windows</p>
     <h1>Turn a three-hour lecture into the lessons it was always made of.</h1>
     <p class="lede">

@@ -139,6 +139,23 @@ services:
       # config — so a blank one takes the site down. Failing the deploy here is
       # the better half of that trade.
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      # The database UI's own hostname. A DuckDNS name resolves every
+      # subdomain to the same address, so this needs no DNS record of its own.
+      DB_DOMAIN: ${DB_DOMAIN:?set DB_DOMAIN in .env}
+    env_file:
+      # Only the two basic-auth values, in their own file rather than in
+      # `.env` — so Caddy is not handed the OpenAI key and the bucket
+      # credentials for the sake of two variables (the same reasoning
+      # `backup` uses).
+      #
+      # **Every `$` in the bcrypt hash must be written `$$` in that file.**
+      # Compose interpolates `env_file` values, so a hash stored literally
+      # loses `$2a$14$SG9…` to an unset-variable expansion and arrives as
+      # `$2a$14.6B.` — which is not a valid hash, so every password is
+      # rejected and the failure looks like a wrong password rather than a
+      # mangled config. Confirmed by `printenv` inside the container, which
+      # is the way to check it.
+      - db-ui.env
     ports:
       - "80:80"
       - "443:443"
@@ -155,6 +172,28 @@ services:
     depends_on:
       api:
         condition: service_started
+
+  # A browser SQL client for the production database, at `DB_DOMAIN`.
+  #
+  # **No published ports**, exactly like postgres and api: Caddy reaches it on
+  # the compose network and is the only way in, so the basic-auth in front of
+  # it cannot be walked around by hitting a port directly.
+  #
+  # It is given no environment beyond which server to prefill. Adminer holds no
+  # credentials of its own — whoever opens it types the database user and
+  # password into its login form, so a compromise of this container leaks a
+  # hostname rather than a way in.
+  adminer:
+    image: adminer:5
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    expose:
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # The one service that does not take `env_file: .env`. It is given exactly
   # the six variables it needs, because the point of the backup bucket having

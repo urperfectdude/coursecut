@@ -94,7 +94,12 @@ export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProp
 
   return (
     <div>
-      <h1>CourseCut</h1>
+      {/* `alt=""` on the mark: the heading beside it already reads
+          "CourseCut", so naming it again is duplication to a screen reader. */}
+      <h1 className="flex items-center gap-2">
+        <img src="/icon-192.png" alt="" width={192} height={192} className="size-7" />
+        CourseCut
+      </h1>
 
       <form onSubmit={handleCreate} className="my-4 flex gap-2">
         <Label htmlFor="new-project-name" className="sr-only">

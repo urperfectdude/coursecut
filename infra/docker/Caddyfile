@@ -104,3 +104,46 @@
 		# in a URL.
 	}
 }
+
+# The database UI (Adminer), on its own hostname.
+#
+# This is the only thing in the deployment that puts a database in front of a
+# browser, so it is worth being explicit about what stands between the internet
+# and the data:
+#
+#   1. **Basic auth here**, checked by Caddy before the request ever reaches
+#      Adminer. The password is bcrypt-hashed and lives in `db-ui.env` on the
+#      droplet, never in this file and never in the repo.
+#   2. **The database's own credentials**, typed into Adminer's login form.
+#      Adminer stores none of them, so this container holds nothing worth
+#      stealing.
+#   3. **No published port.** Adminer is reachable only on the compose network,
+#      so there is no way to reach it that skips step 1.
+#
+# It is still the largest piece of attack surface in the stack. If it is not
+# being used, comment this block out and `deploy.sh` — an SSH tunnel to
+# `psql` costs one more command and exposes nothing.
+{$DB_DOMAIN} {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		# `no-referrer` rather than the app's `strict-origin-when-cross-origin`:
+		# an Adminer URL carries the table and often the query, and none of
+		# that belongs in a Referer header to anywhere.
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		-Server
+	}
+
+	basic_auth {
+		{$DB_UI_USER} {$DB_UI_PASSWORD_HASH}
+	}
+
+	reverse_proxy adminer:8080
+
+	log {
+		output stdout
+		format json
+	}
+}

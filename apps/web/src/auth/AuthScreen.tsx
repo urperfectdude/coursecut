@@ -44,6 +44,19 @@ interface AuthScreenProps {
   onAuthenticated: () => void;
 }
 
+/** The app icon beside the product name — the first thing on the first screen
+ * a visitor sees, and the same artwork as the favicon and the desktop app's
+ * dock icon. `alt=""` because the title right next to it already says
+ * "CourseCut"; announcing it twice is noise to a screen reader. */
+function Wordmark() {
+  return (
+    <div className="flex items-center gap-2">
+      <img src="/icon-192.png" alt="" width={192} height={192} className="size-7" />
+      <CardTitle className="text-xl">CourseCut</CardTitle>
+    </div>
+  );
+}
+
 export default function AuthScreen({ hasPendingInvitation, onAuthenticated }: AuthScreenProps) {
   // A reset token in the URL means the visitor followed a link from their
   // mail, so that screen wins over whichever one they would otherwise land on.
@@ -160,7 +173,7 @@ export default function AuthScreen({ hasPendingInvitation, onAuthenticated }: Au
       <div className="flex min-h-dvh items-center justify-center p-6">
         <Card className="w-full max-w-sm">
           <CardHeader>
-            <CardTitle className="text-xl">CourseCut</CardTitle>
+            <Wordmark />
             <CardDescription>{description}</CardDescription>
           </CardHeader>
 
@@ -235,7 +248,7 @@ export default function AuthScreen({ hasPendingInvitation, onAuthenticated }: Au
     <div className="flex min-h-dvh items-center justify-center p-6">
       <Card className="w-full max-w-sm">
         <CardHeader>
-          <CardTitle className="text-xl">CourseCut</CardTitle>
+          <Wordmark />
           <CardDescription>{description}</CardDescription>
         </CardHeader>
 

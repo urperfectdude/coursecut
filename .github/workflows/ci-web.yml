@@ -185,6 +185,7 @@ jobs:
           # is a Caddyfile syntax error, so `compose.prod.yml` marks it `:?`
           # and the site never comes up without it.
           ACME_EMAIL: ci@example.com
+          DB_DOMAIN: db.ci.example.com
           BACKUP_DATABASE_URL: postgres://postgres:ci@postgres:5432/coursecut
           BACKUP_S3_ENDPOINT: https://example.invalid
           BACKUP_S3_BUCKET: ci
@@ -194,17 +195,31 @@ jobs:
           # `env_file: .env` refers to a file that only exists on the droplet.
           # An empty one is enough for `config` to resolve, and creating it
           # here keeps the compose file honest about needing it.
+          #
+          # `db-ui.env` is the same story with a sharper edge: a *missing*
+          # env_file is an error rather than an empty environment, so caddy's
+          # reference to it has to be satisfied here or this step fails on the
+          # file rather than on anything about the config.
           : > .env
+          printf 'DB_UI_USER=ci\nDB_UI_PASSWORD_HASH=ci\n' > db-ui.env
           docker compose -f compose.prod.yml config -q
-          rm -f .env
+          rm -f .env db-ui.env
 
       - name: Check the Caddyfile
         working-directory: infra/docker
         env:
           APP_DOMAIN: ci.example.com
           ACME_EMAIL: ci@example.com
+          # The database UI's site block. An unset `DB_DOMAIN` leaves an
+          # address-less block, which is a different error than the one this
+          # step is looking for — and `basic_auth` wants both of its arguments
+          # to be there before it will parse.
+          DB_DOMAIN: db.ci.example.com
+          DB_UI_USER: ci
+          DB_UI_PASSWORD_HASH: $2a$14$0123456789012345678901
         run: |
           docker run --rm -e APP_DOMAIN -e ACME_EMAIL \
+            -e DB_DOMAIN -e DB_UI_USER -e DB_UI_PASSWORD_HASH \
             -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
             caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile
 

@@ -8,6 +8,28 @@
          already dark, rather than flashing white on load. -->
     <meta name="color-scheme" content="dark" />
     <title>CourseCut</title>
+
+    <!-- Icons. The source of truth is `coursecut.png` at the repo root — the
+         same artwork `src-tauri/icons/` is generated from, so the browser tab
+         and the desktop app's dock icon are one mark, not two. Regenerate the
+         sizes here from that file rather than editing them individually. -->
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <!-- Matches `--background` in src/styles.css (oklch(0.145 0 0)), so the
+         mobile browser chrome continues the app rather than framing it. -->
+    <meta name="theme-color" content="#0a0a0a" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="CourseCut" />
+    <meta
+      property="og:description"
+      content="Turn a long lecture recording into the lessons it was always made of."
+    />
+    <meta property="og:image" content="/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
   </head>
   <body>
     <div id="root"></div>

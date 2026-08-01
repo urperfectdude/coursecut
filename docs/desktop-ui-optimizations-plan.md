@@ -188,6 +188,8 @@ No change to what leaves the device. The rewritten instruction is still text, st
 
 This section is the dock. When each change below lands on desktop, it becomes a pending port; `scripts/ui-drift.sh` will flag the upstream commits against the copied files' provenance headers, and this table says what the port actually involves.
 
+**Status: all three ported.** They landed on desktop at `dad013b` and were carried into `apps/web` immediately after, with the copied files re-stamped at that SHA. Two notes against the table below, both corrections: #3 needed no `apps/api` work at all (the conversion is entirely frontend, so `lib/timeline.ts` is a straight copy), and #2's flagged risk did not materialise — the web shell adds a row in normal flow rather than a scroll container, so `top-0` behaves as it does on desktop.
+
 | # | Desktop change | Upstream files | Web port notes |
 |---|---|---|---|
 | 1 | Dark theme only | `src/styles.css`, `index.html`, `src-tauri/tauri.conf.json` | Ports cleanly; `apps/web` has its own `styles.css` copy. The `tauri.conf.json` step has no web counterpart — the browser equivalent is the `color-scheme: dark` in `:root` plus the `<meta name="color-scheme">`, both of which carry over |
