@@ -181,6 +181,10 @@ jobs:
           IMAGE_TAG: ci
           POSTGRES_PASSWORD: ci
           APP_DOMAIN: ci.example.com
+          # Required, and the reason this step exists: an empty `ACME_EMAIL`
+          # is a Caddyfile syntax error, so `compose.prod.yml` marks it `:?`
+          # and the site never comes up without it.
+          ACME_EMAIL: ci@example.com
           BACKUP_DATABASE_URL: postgres://postgres:ci@postgres:5432/coursecut
           BACKUP_S3_ENDPOINT: https://example.invalid
           BACKUP_S3_BUCKET: ci

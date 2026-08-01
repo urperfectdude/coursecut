@@ -1,5 +1,3 @@
-/// <reference types="vite/client" />
-//
 // M3's acceptance criterion, literally: "`apps/web`'s `db.ts` passes contract
 // tests against the real API" (plan §7).
 //

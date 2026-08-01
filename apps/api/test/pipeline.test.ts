@@ -1,5 +1,3 @@
-/// <reference types="vite/client" />
-//
 // M5's acceptance criterion, end to end: "a video uploaded in the browser
 // produces lessons and a downloadable MP4" (plan §7).
 //

@@ -1,5 +1,3 @@
-/// <reference types="vite/client" />
-//
 // M7's acceptance criterion: "a second org can be onboarded safely" (plan §7).
 //
 // Safely means three separable things, and this suite is organised as those
