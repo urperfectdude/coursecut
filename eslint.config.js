@@ -27,6 +27,10 @@ export default [
     },
   },
   {
-    ignores: ["dist/", "src-tauri/", "node_modules/"],
+    // `apps/` is the web app (docs/web-app-plan.md §2) — it has its own
+    // eslint config, its own dependencies, and its own CI job. Linting it
+    // from here would run these rules against a tree they don't describe,
+    // starting with its build output.
+    ignores: ["dist/", "src-tauri/", "node_modules/", "apps/"],
   },
 ];

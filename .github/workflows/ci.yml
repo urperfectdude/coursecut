@@ -1,9 +1,37 @@
-name: CI
+name: CI (desktop)
 
+# Path-scoped so web work never runs the desktop pipeline, and vice versa —
+# see docs/web-app-plan.md §2. `apps/**` is deliberately absent: nothing the
+# desktop app builds from lives there. The two lists below are duplicated
+# because GitHub Actions doesn't support YAML anchors — keep them in step.
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+      - 'vite.config.ts'
+      - 'eslint.config.js'
+      - 'components.json'
+      - 'scripts/fetch-ffmpeg.sh'
+      - '.github/workflows/ci.yml'
   pull_request:
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+      - 'vite.config.ts'
+      - 'eslint.config.js'
+      - 'components.json'
+      - 'scripts/fetch-ffmpeg.sh'
+      - '.github/workflows/ci.yml'
 
 jobs:
   frontend:
