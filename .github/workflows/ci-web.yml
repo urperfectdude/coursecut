@@ -1,0 +1,212 @@
+name: CI (web)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'infra/**'
+      - 'scripts/ui-drift.sh'
+      - '.github/workflows/ci-web.yml'
+  pull_request:
+    paths:
+      - 'apps/**'
+      - 'infra/**'
+      - 'scripts/ui-drift.sh'
+      - '.github/workflows/ci-web.yml'
+      # The web app carries a copy of the desktop UI, so a desktop UI change
+      # is a web concern too — it is what `ui-drift.sh` exists to catch.
+      - 'src/**'
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+
+    env:
+      # Two roles, and CI is where a mistake here gets caught: the app role is
+      # created by `db:bootstrap` and has neither superuser nor BYPASSRLS, so
+      # if these two URLs were ever collapsed into one the suite's first test
+      # fails rather than every other test passing for the wrong reason.
+      DATABASE_URL: postgres://coursecut_app:ci_app_password@localhost:5432/coursecut
+      DATABASE_ADMIN_URL: postgres://postgres:postgres@localhost:5432/coursecut
+      APP_DB_USER: coursecut_app
+      APP_DB_PASSWORD: ci_app_password
+
+      # M3. The contract suite boots the real app, so it needs the same
+      # environment a running API does. None of this is a secret: the session
+      # secret is a throwaway for a process that lives for one job, and the
+      # storage credentials belong to a MinIO container on the runner.
+      # Production values come from the droplet's env file and Actions
+      # secrets, never from here (plan §8).
+      AUTH_SECRET: ci_only_not_a_secret_0123456789abcdef
+      APP_URL: http://localhost:5173
+      S3_ENDPOINT: http://localhost:9000
+      S3_REGION: auto
+      S3_BUCKET: coursecut
+      S3_ACCESS_KEY_ID: coursecut
+      S3_SECRET_ACCESS_KEY: coursecut_dev_secret
+      S3_FORCE_PATH_STYLE: "true"
+
+      # M5. The pipeline suite points `OPENAI_BASE_URL` at a stub it starts
+      # itself, so no key is ever used and no request leaves the runner — but
+      # `env.ts` requires the variable to exist, and a placeholder here is what
+      # makes "the worker refuses to boot without a key" testable without
+      # putting a real one in Actions secrets.
+      OPENAI_API_KEY: sk-ci-not-a-real-key
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 22, not 20: `process.loadEnvFile` (src/env.ts) needs 20.12+, and
+          # pinning to the next LTS avoids depending on a minor version.
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/api/package-lock.json
+
+      # The developer's own stack, not a re-description of it in service
+      # containers. Two reasons this is worth a step instead:
+      #
+      #   * M3's tests move real bytes through S3 (presigned PUT, multipart,
+      #     presigned GET), so MinIO has to be here — and MinIO cannot be a
+      #     service container, because its image needs a `server /data`
+      #     command and `services:` has nowhere to put one.
+      #   * The isolation suite is worthless against a fake, and so is a
+      #     compose file CI never runs. Booting the real one means a change to
+      #     it is caught here rather than on the next developer's machine.
+      #
+      # `minio-init` runs separately because it exits when it is done, which
+      # `--wait` treats as a failed service.
+      - name: Start Postgres + MinIO
+        working-directory: .
+        run: |
+          docker compose -f infra/postgres/compose.yml up -d --wait postgres minio
+          docker compose -f infra/postgres/compose.yml run --rm minio-init
+
+      # ffmpeg is not on the runner image, and M5's tests are worthless
+      # without it: they cut and concatenate a real MP4 and read the result
+      # back with ffprobe. Installing it here is what keeps the export path
+      # covered by something other than a mock of ourselves.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+
+      # The worker is its own package (plan §2), and its typecheck covers
+      # `apps/api/src` too — so a schema change that breaks the worker fails
+      # here rather than against a real job.
+      - name: Worker typecheck and lint
+        working-directory: apps/worker
+        run: npm ci && npm run typecheck && npm run lint
+
+      # Bootstrap → migrate → seed, exactly as a developer runs it locally.
+      - run: npm run db:bootstrap
+      - run: npm run db:migrate
+
+      # Five suites, all against the real thing:
+      #
+      #   tenant-isolation  M2's acceptance criterion — cross-tenant reads come
+      #                     back empty and cross-tenant writes are rejected
+      #   contract          M3's — `apps/web/src/db.ts`, the shipped client,
+      #                     driven against this API, this Postgres and this
+      #                     MinIO, including a multipart upload
+      #   pipeline          M5's — an uploaded MP4 through extract, transcribe,
+      #                     analyze and export, with real ffmpeg and a stubbed
+      #                     OpenAI, ending in a downloadable file ffprobe agrees
+      #                     is the length the lesson asked for
+      #   quotas            M7's — the gates that bound what a tenant can spend
+      #                     (including the ways round one: understating a file's
+      #                     size, deleting a video to refund the month, signing
+      #                     up again for a fresh allowance) and the retention
+      #                     sweep, against real rows and real objects
+      #   openai            the parsers and the WAV splitter, ported case for
+      #                     case from the Rust unit tests
+      #
+      # `db:seed` runs inside each suite, so none needs a seed step.
+      - run: npm test
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `ui-drift.sh` walks git history between the recorded sync SHA and
+          # HEAD; a shallow clone would make that lookup fail.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+
+      # Runs last so a genuine build failure isn't buried under a drift
+      # report. This is the substitute for the compile error a shared UI
+      # package would have produced — see docs/web-app-plan.md §7.1.
+      - name: Check for unported desktop UI changes
+        working-directory: .
+        run: scripts/ui-drift.sh
+
+  # M6's deployment description, checked without deploying anything. None of
+  # this is covered by the two jobs above: the prod compose file, the Caddyfile
+  # and the deploy scripts are the parts of the system that are only exercised
+  # in production, which is the worst place to find a typo in them.
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `config` resolves interpolation, `env_file`, anchors and
+      # `depends_on` — so a `${VAR:?}` with no value, a malformed service or a
+      # dangling dependency fails here rather than mid-deploy. The values are
+      # placeholders; the file is being parsed, not run.
+      - name: Validate the production compose file
+        working-directory: infra/docker
+        env:
+          REGISTRY: registry.example.com/coursecut
+          IMAGE_TAG: ci
+          POSTGRES_PASSWORD: ci
+          APP_DOMAIN: ci.example.com
+          BACKUP_DATABASE_URL: postgres://postgres:ci@postgres:5432/coursecut
+          BACKUP_S3_ENDPOINT: https://example.invalid
+          BACKUP_S3_BUCKET: ci
+          BACKUP_S3_ACCESS_KEY_ID: ci
+          BACKUP_S3_SECRET_ACCESS_KEY: ci
+        run: |
+          # `env_file: .env` refers to a file that only exists on the droplet.
+          # An empty one is enough for `config` to resolve, and creating it
+          # here keeps the compose file honest about needing it.
+          : > .env
+          docker compose -f compose.prod.yml config -q
+          rm -f .env
+
+      - name: Check the Caddyfile
+        working-directory: infra/docker
+        env:
+          APP_DOMAIN: ci.example.com
+          ACME_EMAIL: ci@example.com
+        run: |
+          docker run --rm -e APP_DOMAIN -e ACME_EMAIL \
+            -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile
+
+      - name: Check the shell scripts
+        run: |
+          bash -n infra/docker/deploy.sh
+          sh -n infra/docker/backup.sh
+          bash -n infra/docker/bootstrap-droplet.sh
+          shellcheck infra/docker/deploy.sh infra/docker/backup.sh infra/docker/bootstrap-droplet.sh

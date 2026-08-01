@@ -1,0 +1,31 @@
+{
+  // Same options as `apps/api`'s, and for the same reasons — no `DOM`, strict,
+  // no emit (tsx runs the TypeScript directly). Copied rather than extended
+  // because each app under `apps/` installs its own dependencies (plan §2),
+  // and a config that reaches across package boundaries for its *own* settings
+  // is the kind of coupling that makes one package's install break another's
+  // build.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true
+  },
+  // `../api/src` is here because the worker imports this repo's schema,
+  // storage, events and OpenAI modules directly — one definition of the data
+  // model, not two. Typechecking those files from here is what keeps that
+  // honest: a change to `apps/api`'s schema that breaks the worker fails the
+  // worker's own typecheck rather than at 3am against a real job.
+  "include": ["src", "../api/src"]
+}

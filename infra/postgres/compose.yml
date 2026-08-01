@@ -1,0 +1,108 @@
+# Local development stack (docs/web-app-plan.md §5). Everything runs on the
+# dev machine; nothing here touches the droplet — that is M6's business.
+#
+#   docker compose -f infra/postgres/compose.yml up -d --wait
+#   cd apps/api && npm run db:reset      # bootstrap + migrate + seed
+#
+# If 5432 or 9000 is already taken on your machine (an SSH tunnel to a remote
+# Postgres is the usual culprit), override the host port rather than editing
+# this file, and point apps/api/.env at the same number:
+#
+#   POSTGRES_PORT=55432 docker compose -f infra/postgres/compose.yml up -d --wait
+#
+# Two services, where self-hosted Supabase wanted eight:
+#
+#   postgres  the database, and the job queue too — graphile-worker is
+#             Postgres-backed, so there is no Redis here and never will be
+#   minio     stands in for Cloudflare R2. Both speak S3, so the only
+#             difference between this and production is the endpoint and
+#             credentials (plan §3.4)
+#
+# Both bind to 127.0.0.1 explicitly. On a laptop that is merely tidy; the
+# habit is what matters, because plan §8 makes "Postgres must never be
+# exposed publicly" a hard rule for the droplet.
+
+name: coursecut
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # Dev-only credentials for a localhost-bound database. Production
+      # values come from the droplet's env file (plan §8).
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: coursecut
+    ports:
+      # Overridable because 5432 is a popular port — an SSH tunnel to a remote
+      # database will already own it, and the failure ("port is already
+      # allocated") is far less obvious than it sounds when it appears in the
+      # middle of a compose run. Set POSTGRES_PORT and update DATABASE_URL /
+      # DATABASE_ADMIN_URL in apps/api/.env to match.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Role creation deliberately does NOT live in /docker-entrypoint-initdb.d.
+    # That directory only runs on a first-boot empty volume, which makes it
+    # invisible to CI (where Postgres is a service container) and silently
+    # skipped for anyone who already has a volume. `npm run db:bootstrap` is
+    # idempotent and runs everywhere, so it is the single source of truth.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d coursecut"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: coursecut
+      MINIO_ROOT_PASSWORD: coursecut_dev_secret
+      # CORS, and it has to be here rather than on the bucket: the browser
+      # PUTs video straight to storage instead of through the API (plan §3.2),
+      # so uploads are cross-origin from the Vite dev server, and without this
+      # every one of them fails in the browser while working fine from curl.
+      #
+      # MinIO does not implement S3's per-bucket PutBucketCors — `mc cors set`
+      # returns "functionality that is not implemented" — so CORS is
+      # server-wide and configured here. Cloudflare R2 *does* take a
+      # per-bucket policy, so M6 configures the equivalent rule (this origin,
+      # GET/PUT/HEAD, ETag exposed) on the real bucket instead. That is a
+      # deployment difference, not a code one: nothing in `apps/api` or
+      # `apps/web` changes.
+      #
+      # Named explicitly rather than left at MinIO's `*` default so a stray
+      # page on another origin cannot drive this bucket from a dev browser.
+      MINIO_API_CORS_ALLOW_ORIGIN: http://localhost:5173
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000" # S3 API
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001" # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Creates the bucket, then exits. ETag is already in MinIO's default
+  # `Access-Control-Expose-Headers`, which multipart upload (M3) needs in
+  # order to read each part's ETag, so there is nothing further to configure.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 coursecut coursecut_dev_secret &&
+      mc mb --ignore-existing local/coursecut &&
+      echo 'bucket coursecut ready'
+      "
+
+volumes:
+  postgres-data:
+  minio-data:

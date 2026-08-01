@@ -1,0 +1,16 @@
+{
+  // The tests, separately from `src`, for one reason: `contract.test.ts`
+  // imports `apps/web/src/db.ts` — the real shipped client — and that file is
+  // browser code. It reaches for `fetch`, `Blob`, `File` and (in
+  // `revealInFolder`, D6) `window.open`.
+  //
+  // Rather than adding `DOM` to the server's own lib and letting a route
+  // handler reference `document` without complaint, the browser-facing half
+  // of this package typechecks here. `test/browser.ts` supplies the runtime
+  // side of the same story.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"]
+  },
+  "include": ["test", "vitest.config.ts"]
+}

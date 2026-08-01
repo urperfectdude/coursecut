@@ -1,0 +1,46 @@
+{
+  "name": "coursecut-api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "dev:api": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "auth:generate": "better-auth-cli generate --config better-auth.config.ts",
+    "db:bootstrap": "tsx src/db/bootstrap.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:seed": "tsx src/db/seed.ts",
+    "db:reset": "npm run db:bootstrap && npm run db:migrate && npm run db:seed",
+    "storage:cors": "tsx src/tools/bucket-cors.ts",
+    "retention:sweep": "tsx src/tools/retention.ts",
+    "org:purge": "tsx src/tools/purge-org.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1099.0",
+    "@aws-sdk/lib-storage": "^3.1100.0",
+    "@aws-sdk/s3-request-presigner": "^3.1099.0",
+    "@hono/node-server": "^2.0.12",
+    "better-auth": "^1.6.25",
+    "drizzle-orm": "^0.45.2",
+    "graphile-worker": "^0.17.3",
+    "hono": "^4.12.32",
+    "pg": "^8.16.3",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@better-auth/cli": "^1.4.21",
+    "@eslint/js": "^9.14.0",
+    "@types/node": "^22.10.1",
+    "@types/pg": "^8.15.6",
+    "@typescript-eslint/eslint-plugin": "^8.15.0",
+    "@typescript-eslint/parser": "^8.15.0",
+    "drizzle-kit": "^0.31.10",
+    "eslint": "^9.14.0",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  }
+}

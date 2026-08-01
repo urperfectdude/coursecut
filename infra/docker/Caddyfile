@@ -1,0 +1,106 @@
+# TLS termination, the SPA, and the one reverse proxy (plan §3.1).
+#
+# Bind-mounted at `/etc/caddy/Caddyfile` rather than baked into the web image,
+# so a header or TLS change is `caddy reload` instead of a rebuild-and-push.
+# The bundle it serves *is* baked in, at `/srv` (see `web.Dockerfile`).
+#
+# The whole reason Caddy is here rather than a bare Node server: it terminates
+# TLS with an automatic Let's Encrypt certificate, and it serves the SPA and
+# the API **on one origin**. That second part is not cosmetic — `apps/api`'s
+# session cookie is a plain first-party httpOnly cookie precisely because the
+# SPA is same-origin with it (see `app.ts`). Splitting them across two
+# hostnames would mean SameSite=None, CORS preflights and a class of auth bug
+# that only appears in production.
+#
+# Video bytes never come through here. The browser PUTs to R2 with a presigned
+# URL and reads back the same way (plan §3.2), so this process proxies JSON,
+# an SSE stream, and a few hundred kilobytes of static assets. That is why a
+# single Caddy on a small droplet is enough.
+
+{
+	# Let's Encrypt's contact address, used for expiry and revocation notices.
+	#
+	# **It must have a value.** `email` with an empty argument is not "no
+	# email", it is a syntax error, and Caddy refuses the entire config — so an
+	# unset `ACME_EMAIL` takes the site down rather than degrading. That is why
+	# `compose.prod.yml` makes it required instead of defaulting it to blank.
+	email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+	# Applied to every response, static and API alike.
+	header {
+		# HSTS. Caddy redirects http→https on its own; this is what stops a
+		# browser from making the plaintext request in the first place. No
+		# `preload` — that is a one-way door and belongs to a deliberate
+		# decision, not to a default.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Nothing here needs a camera, a microphone or a location.
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		# Caddy advertises itself by default; there is no reason to tell a
+		# scanner which server and version it is talking to.
+		-Server
+	}
+
+	# `handle` blocks are mutually exclusive, so the first match wins and the
+	# static handler below never sees an API request.
+	handle /api/* {
+		reverse_proxy api:3000 {
+			# **Load-bearing for D4.** Without it Caddy buffers the response
+			# and the SSE progress stream arrives in one lump when the
+			# connection closes — which for a 40-minute transcode means the
+			# progress bar moves once, at the end. `-1` flushes immediately.
+			flush_interval -1
+		}
+
+		# Uploads bypass this proxy entirely, so nothing legitimate posts a
+		# large body here — the biggest is a transcript edit's context. A cap
+		# means a request that *is* huge is a bug or an attack, and it is
+		# refused at the edge instead of in Node's heap.
+		request_body {
+			max_size 32MB
+		}
+	}
+
+	handle {
+		root * /srv
+
+		# Only the static side. API responses are deliberately left alone:
+		# compressing an SSE stream is another place for it to get buffered.
+		encode zstd gzip
+
+		# Vite fingerprints everything under /assets, so those are immutable
+		# and cached hard...
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+
+		# ...while index.html must not be, or a deploy leaves browsers asking
+		# for the previous build's asset names until their cache expires.
+		header /index.html Cache-Control "no-cache"
+
+		# Client-side routing: any path that is not a real file is the SPA.
+		try_files {path} /index.html
+		file_server
+	}
+
+	# Deliberately permissive where the app genuinely reaches across origins,
+	# and closed everywhere else. `connect-src` and `media-src` have to allow
+	# https: because presigned storage URLs are exactly that — a cross-origin
+	# PUT to upload and a cross-origin GET to play back — and the hostname is
+	# an account-specific R2 endpoint that would have to be templated in here
+	# to be named. `unsafe-inline` for styles is what the UI primitives'
+	# inline style attributes need; there is no `unsafe-inline` for scripts.
+	header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: https:; font-src 'self' data:; connect-src 'self' https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+
+	log {
+		output stdout
+		format json
+		# Plan §9: logs carry paths, ids and error codes, never content. A
+		# request path here can contain a project or video id, which is the
+		# intended level of detail — nothing in this app puts transcript text
+		# in a URL.
+	}
+}

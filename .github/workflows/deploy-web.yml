@@ -1,0 +1,216 @@
+name: Deploy (web)
+
+# Builds the four images, pushes them to the GitHub Container Registry, and
+# rolls the droplet forward (plan §2's CI/CD table, M6).
+#
+# **ghcr.io rather than DigitalOcean's registry**, which is what M6 originally
+# assumed. Two reasons, and the second is the real one:
+#
+#   * It needs no account of its own. DO's registry wants an API token to push
+#     and a second one for the droplet to pull; ghcr.io is already reachable
+#     with the `GITHUB_TOKEN` this workflow is handed automatically.
+#   * That token is minted per run and expires with it. The droplet is handed
+#     the same short-lived token for its `docker pull` and logs out afterwards,
+#     so — exactly as before — **no long-lived registry credential is ever
+#     stored on the droplet**. The property M6 wanted is preserved; what
+#     changed is that nothing has to be created by hand to get it.
+#
+# The `paths:` filter is the point of having a separate workflow at all: a
+# desktop change must never trigger a web deploy, and the desktop release
+# pipeline (`release.yml`, tag-triggered) is untouched by anything here.
+#
+# What this workflow does **not** do is carry production secrets. The droplet's
+# `/opt/coursecut/.env` is created once by hand and never written from here
+# (plan §8), so the only credential Actions holds is the deploy SSH key — which
+# cannot read the OpenAI key or the database password.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/web/**'
+      - 'apps/api/**'
+      - 'apps/worker/**'
+      - 'infra/docker/**'
+      - '.github/workflows/deploy-web.yml'
+  # Rollback path: run with an older commit's SHA as `image_tag` and the
+  # droplet goes back to those exact images without a rebuild.
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Existing image tag to deploy (default: build this commit)'
+        required: false
+        type: string
+
+# A deploy is not safe to run twice at once — two `docker compose up` runs
+# against one droplet interleave badly, and the loser wins. Queue instead of
+# cancelling: an interrupted deploy is worse than a delayed one.
+concurrency:
+  group: deploy-web
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Skipped entirely when rolling back to an existing tag — the whole point
+    # of a rollback is to deploy bytes that were already built and tested.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.image_tag == '' }}
+    # `packages: write` is what lets the automatic GITHUB_TOKEN push to
+    # ghcr.io; `contents: read` is the checkout. Nothing else is granted.
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tag
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Four images, all `linux/amd64` — the droplet's architecture, and worth
+      # stating rather than inheriting, because a runner that is ever anything
+      # else would produce images that fail with "exec format error" at
+      # startup and nowhere earlier.
+      #
+      # Context is `apps/` for the three app images (see the Dockerfiles: the
+      # desktop tree is not reachable from a build) and `infra/docker/` for the
+      # backup image, which is one shell script.
+      - name: Build and push api
+        uses: docker/build-push-action@v6
+        with:
+          context: apps
+          file: infra/docker/api.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/coursecut-api:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/coursecut-api:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Build and push worker
+        uses: docker/build-push-action@v6
+        with:
+          context: apps
+          file: infra/docker/worker.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/coursecut-worker:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/coursecut-worker:latest
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,scope=worker,mode=max
+
+      - name: Build and push web
+        uses: docker/build-push-action@v6
+        with:
+          context: apps
+          file: infra/docker/web.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/coursecut-web:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/coursecut-web:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+
+      - name: Build and push backup
+        uses: docker/build-push-action@v6
+        with:
+          context: infra/docker
+          file: infra/docker/backup.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/coursecut-backup:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/coursecut-backup:latest
+          cache-from: type=gha,scope=backup
+          cache-to: type=gha,scope=backup,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build]
+    # `always()` so the rollback path — which skips `build` — still runs, while
+    # a genuine build failure still stops the deploy.
+    if: ${{ always() && needs.build.result != 'failure' && needs.build.result != 'cancelled' }}
+    environment: production
+    # `packages: read` is not for this runner — it is for the token this job
+    # hands the droplet to pull with. Read, not write: a deploy publishes
+    # nothing, and a rollback least of all.
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tag
+        run: |
+          tag='${{ inputs.image_tag }}'
+          [ -n "$tag" ] || tag='${{ needs.build.outputs.tag }}'
+          if [ -z "$tag" ]; then
+            echo "no image tag to deploy" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Authorize this runner's SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # A pinned host key, not `StrictHostKeyChecking=no`. The alternative
+          # is a deploy that would happily hand its registry credentials to
+          # whatever answers on port 22 — see the runbook for how to capture
+          # this value.
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # Only the three files the droplet runs from. Not `.env`, ever: it is
+      # the droplet's, and rsync would overwrite it with nothing.
+      - name: Copy stack files
+        run: |
+          rsync -av -e "ssh -i ~/.ssh/id_deploy" \
+            infra/docker/compose.prod.yml \
+            infra/docker/Caddyfile \
+            infra/docker/deploy.sh \
+            infra/docker/.env.example \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/coursecut/"
+
+      # The token is minted for this run and expires with it, so the droplet
+      # never stores a long-lived credential for pulling. It is piped over the
+      # SSH channel rather than written to a file, and logged out immediately
+      # after the pull.
+      - name: Deploy
+        run: |
+          ssh -i ~/.ssh/id_deploy "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "set -euo pipefail; \
+             echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin; \
+             chmod +x /opt/coursecut/deploy.sh; \
+             /opt/coursecut/deploy.sh '${{ steps.tag.outputs.tag }}'; \
+             docker logout ghcr.io"
+
+      # `deploy.sh` already waits for every healthcheck, so this is the
+      # end-to-end version of the same question: does the public domain, over
+      # TLS, through Caddy, reach a healthy API? It is the last thing that runs
+      # because a green deploy with a broken edge is the failure this catches.
+      - name: Verify the public endpoint
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "https://${{ secrets.APP_DOMAIN }}/api/health" | grep -q '"ok":true'; then
+              echo "healthy"
+              exit 0
+            fi
+            echo "attempt $attempt failed; retrying"
+            sleep 10
+          done
+          echo "the deployed API did not answer /api/health over TLS" >&2
+          exit 1

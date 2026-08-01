@@ -1,0 +1,28 @@
+# Build context for every image in `infra/docker/` is `apps/`, not the repo
+# root — which is the point. The desktop tree (`src/`, `src-tauri/`) is not
+# reachable from here at all, so no image can accidentally COPY it and no
+# `npm ci` inside a build can resolve against the desktop app's node_modules
+# (plan §0, §7.1).
+#
+# Everything below is excluded because it is either reproduced by the build
+# (node_modules, dist) or a secret that must never be baked into a layer.
+
+**/node_modules
+**/dist
+**/.vite
+**/*.tsbuildinfo
+
+# Real credentials. `.env.example` is deliberately not excluded — it is the
+# template, and having it in the image is harmless and occasionally useful.
+**/.env
+**/.env.*
+!**/.env.example
+
+# Tests and lint config are not needed at runtime. They stay out of the
+# context so a change to them does not invalidate the install layer.
+api/test
+**/eslint.config.js
+**/vitest.config.ts
+**/tsconfig.test.json
+
+**/.DS_Store

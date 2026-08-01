@@ -1,0 +1,207 @@
+/*
+ * PORTED FROM: src/styles.css @ dad013b
+ * DEVIATIONS: none
+ * One-way port — desktop is upstream. Don't edit this for web-only reasons;
+ * port the change to the desktop file first. See docs/web-app-plan.md §7.1,
+ * and re-run scripts/ui-drift.sh (which reads the SHA above) after syncing.
+ */
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+/* The app is dark-only — there is no light palette and no theme toggle, so
+   there's nothing for `dark:` to switch *between*. It stays defined as an
+   always-matching variant rather than being stripped from the ~20 shadcn
+   components and views that carry `dark:` utilities, which keeps those files
+   diffable against upstream shadcn output. */
+@custom-variant dark (&);
+
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, sans-serif;
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  padding: 2rem;
+}
+
+.error {
+  color: var(--destructive);
+}
+
+/* Lessons stage tile grid (M4, replaces the old flat `.lesson-list`) —
+ * `LessonCard` renders each lesson as a gallery tile. Selecting a tile no
+ * longer expands it in place (segment editing moved to its own page, see
+ * `LessonSegmentsView`), so every tile stays a fixed grid cell. */
+.lesson-tile-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+  align-items: start;
+}
+
+/* Source video preview (PRD §8.2 successor, Milestone "lesson segments") —
+ * the compact, always-visible player against the raw source file. See
+ * `docs/lesson-segments-plan.md`.
+ *
+ * `SourceVideoPreview.tsx` is now styled with Tailwind utilities directly
+ * (Phase 5 of the shadcn migration) — the `.source-preview`/
+ * `.source-preview-video` classNames are kept on it only as CSS hooks for
+ * `LessonSegmentsView`'s side-by-side layout rules further down, which still
+ * target them by name; see those rules for the actual declarations. */
+
+/* Lesson cards (M4: tiles in `.lesson-tile-grid` above; expansion doubles as
+ * selection, per `docs/lesson-segments-plan.md`). The card chrome itself
+ * (`LessonCard.tsx`) is now shadcn `Card` — this rule only positions the
+ * still-reused preview slot (also consumed by `LessonSegmentsView`). */
+
+.lesson-card-preview {
+  margin-top: 0.5rem;
+}
+
+/* `LessonSegmentsView` reuses `.lesson-card-preview`'s video/controls
+ * styling for its own (larger, full-page) preview. */
+.lesson-segments-preview {
+  max-width: 40rem;
+}
+
+/* Side-by-side lesson preview + raw source preview on `LessonSegmentsView`
+ * — the lesson's own stitched clip next to the full original recording, so
+ * the user can scrub the source for a boundary without leaving the page.
+ * Flex layout, gap, max-widths, and the ">>" arrow/label styling are all
+ * Tailwind utilities directly on the elements now (Phase 6 of the shadcn
+ * migration) — `.lesson-segments-preview-row` and
+ * `.lesson-segments-source-preview` are kept as classNames only as the CSS
+ * hooks the two rules below (and `.lesson-card-preview`/`.lesson-segments-
+ * preview` above) still target by name. */
+
+.lesson-segments-source-preview .source-preview {
+  max-width: none;
+}
+
+/* Force both players to the same frame height regardless of each video's
+ * own intrinsic aspect ratio — without this, `width: 100%` + `max-height`
+ * (set via Tailwind utilities directly on each `<video>` now, Phase 5 of the
+ * shadcn migration) only caps height, so two differently-shaped recordings
+ * render at different heights side by side. `object-fit: contain`
+ * letterboxes into that fixed height instead of distorting either video. */
+.lesson-segments-preview-row .lesson-card-video,
+.lesson-segments-preview-row .source-preview-video {
+  height: 25vh;
+  max-height: 25vh;
+  object-fit: contain;
+}
+
+/* Fullscreen escape hatch for the rule above — equal specificity to it, so
+ * source order (this rule comes after) makes it win once either player's
+ * fullscreen wrapper hook className is present. Without this, the 25vh cap
+ * above always wins over the fullscreen `<video>`'s own Tailwind
+ * `max-h-[82vh]` utility, since it's unlayered CSS and Tailwind utilities
+ * are declared inside `@layer utilities` (unlayered always beats layered,
+ * regardless of specificity) — found during Phase 5 shadcn-migration
+ * review. */
+.source-preview-fullscreen .source-preview-video,
+.lesson-card-player-fullscreen .lesson-card-video {
+  height: auto;
+  max-height: 82vh;
+}
+
+/* `LessonPreviewPlayer.tsx` is now styled with Tailwind utilities directly
+ * (Phase 5 of the shadcn migration) — `.lesson-card-video` is kept on its
+ * `<video>` only as a CSS hook for the shared-height override rule just
+ * above (`.lesson-segments-preview-row .lesson-card-video`). */
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: 'Geist Variable', sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}

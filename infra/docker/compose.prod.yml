@@ -1,0 +1,184 @@
+# The droplet's stack (plan §7, M6). Lives at `/opt/coursecut/` in production,
+# beside the `.env` it reads and the `Caddyfile` Caddy mounts — `deploy.sh`
+# puts all three there.
+#
+#   docker compose -f compose.prod.yml up -d --wait
+#
+# Five long-lived services and one that exits:
+#
+#   postgres  the database and the job queue. **No published ports** — plan §8
+#             makes that a hard rule, and the absence of a `ports:` key here is
+#             the whole enforcement. Reachable only on the compose network.
+#   migrate   bootstrap + migrate, then exits. Everything else waits for it.
+#   api       Hono, reachable only through Caddy
+#   worker    ffmpeg, Whisper, GPT — the only service with a scratch disk
+#   caddy     TLS, the SPA, and the one reverse proxy
+#   backup    nightly pg_dump to a separate bucket
+#
+# Images come from the registry, tagged by commit. `IMAGE_TAG` is what makes a
+# rollback a re-deploy of an older tag rather than a rebuild — see `deploy.sh`.
+
+name: coursecut
+
+# Without this a droplet's disk fills with container logs, and the first
+# symptom is Postgres refusing writes. 30 MB per service is plenty to debug
+# yesterday with.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: postgres
+      # `:?` so a missing password fails the deploy loudly instead of starting
+      # a database with a blank one.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: coursecut
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d coursecut"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Runs to completion on every deploy and then exits. Idempotent by
+  # construction: `db:bootstrap` re-asserts the app role's attributes and
+  # grants, and `db:migrate` applies only what is pending.
+  #
+  # It is a separate service rather than a step in the API's entrypoint
+  # because it needs `DATABASE_ADMIN_URL`, and the API must never have a
+  # reason to hold that — a request served by the admin role is a request with
+  # no RLS (plan §6). **No seed.** `db:seed` writes example orgs and known
+  # passwords; it belongs to development and nowhere near this file.
+  migrate:
+    image: ${REGISTRY:?set REGISTRY in .env}/coursecut-api:${IMAGE_TAG:-latest}
+    restart: "no"
+    logging: *logging
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["sh", "-c", "npm run db:bootstrap && npm run db:migrate"]
+
+  api:
+    image: ${REGISTRY:?set REGISTRY in .env}/coursecut-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # No `ports:`. Caddy reaches it over the compose network; the droplet's
+    # firewall is then not the only thing standing between :3000 and the
+    # internet.
+    expose:
+      - "3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    image: ${REGISTRY:?set REGISTRY in .env}/coursecut-worker:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      # A transcode writes its source, its audio and every segment cut here.
+      # A named volume rather than the container's writable layer so a
+      # multi-gigabyte job is not growing the overlay, and so `docker system
+      # prune` cannot take it out from under a running job.
+      #
+      # Mounted at the **parent** of `WORKER_SCRATCH_DIR`
+      # (`/var/lib/coursecut/scratch`) on purpose — see `worker.Dockerfile`:
+      # the worker removes and recreates the scratch root at startup, which
+      # needs a writable parent, and a volume mounted directly at that path
+      # makes the parent root-owned and the worker crash-loop on EACCES.
+      - worker-scratch:/var/lib/coursecut
+    deploy:
+      resources:
+        limits:
+          # Plan §3.3 is explicit that ffmpeg on one core starves the API.
+          # Until the worker moves to its own droplet this is the mitigation:
+          # leave the API a slice of CPU during an encode. Raise it (or delete
+          # it) when the worker is alone on a box.
+          cpus: "${WORKER_CPUS:-0.8}"
+
+  caddy:
+    image: ${REGISTRY:?set REGISTRY in .env}/coursecut-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN in .env}
+      # Required, not optional. An empty value is a Caddyfile syntax error
+      # rather than a missing contact address, and Caddy refuses the whole
+      # config — so a blank one takes the site down. Failing the deploy here is
+      # the better half of that trade.
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      # HTTP/3. Harmless if the firewall blocks it; a real improvement on the
+      # kind of connection that uploads a two-hour lecture.
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account keys. Losing this volume means
+      # re-issuing on next boot, which Let's Encrypt rate-limits — so it is a
+      # named volume, and the runbook says not to prune it.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_started
+
+  # The one service that does not take `env_file: .env`. It is given exactly
+  # the six variables it needs, because the point of the backup bucket having
+  # its own token is that fewer things hold it — handing this container the
+  # whole environment (the OpenAI key, the media bucket's credentials) would
+  # give that away for the sake of two fewer lines.
+  backup:
+    image: ${REGISTRY:?set REGISTRY in .env}/coursecut-backup:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      BACKUP_DATABASE_URL: ${BACKUP_DATABASE_URL:?set BACKUP_DATABASE_URL in .env}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:?set BACKUP_S3_ENDPOINT in .env}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:?set BACKUP_S3_BUCKET in .env}
+      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:?set BACKUP_S3_ACCESS_KEY_ID in .env}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:?set BACKUP_S3_SECRET_ACCESS_KEY in .env}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      BACKUP_HOUR_UTC: ${BACKUP_HOUR_UTC:-03}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  worker-scratch:
+  caddy-data:
+  caddy-config:
