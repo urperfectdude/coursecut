@@ -89,10 +89,19 @@ pub fn content_hash(video_path: &str) -> Result<String, String> {
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// Extracts mono 16kHz WAV audio from `video_path` into `output_path` — the
-/// format Whisper expects (PRD §7.3/§9). Reads the source video and writes
-/// only the new audio file; the source is never modified, copied, or
-/// uploaded.
+/// Extracts mono 16kHz audio from `video_path` into `output_path`, Opus-encoded
+/// in an Ogg container — a format Whisper accepts (PRD §7.3/§9). Reads the
+/// source video and writes only the new audio file; the source is never
+/// modified, copied, or uploaded.
+///
+/// **Why Opus rather than the raw PCM WAV this used to emit.** Whisper's API
+/// caps an upload at 25MB regardless of model, and mono/16kHz/16-bit PCM runs
+/// at 32 KB/s — so the cap landed at ~13 minutes of audio and any real lecture
+/// had to be split into a dozen separate requests (see `transcribe_audio`).
+/// Opus at 24 kbps is ~3 KB/s, which puts over two hours in a single request.
+/// Whisper resamples everything to 16kHz mono internally, and Opus at this
+/// bitrate is built for exactly this kind of wideband speech, so the bytes
+/// dropped are ones the model discards anyway.
 pub async fn extract_audio(
     app: &AppHandle,
     video_path: &str,
@@ -110,6 +119,10 @@ pub async fn extract_audio(
             "1",
             "-ar",
             "16000",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
             "-y",
             output_path,
         ])
@@ -218,7 +231,11 @@ async fn run_extraction(
         _ => {
             let duration = probe_duration(app, file_path).await?;
             let dir = audio_cache_dir(app)?;
-            let output_path = dir.join(format!("{hash}.wav"));
+            // `.ogg` since `extract_audio` now emits Opus. Audio cached by an
+            // older build is still `.wav` on disk and is still reused by the
+            // lookup above — the transcribe path keys off the file's own bytes,
+            // not this extension, so both coexist without a migration.
+            let output_path = dir.join(format!("{hash}.ogg"));
             let output_path_str = output_path
                 .to_str()
                 .ok_or_else(|| "audio cache path is not valid UTF-8".to_string())?

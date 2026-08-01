@@ -51,12 +51,12 @@ struct WhisperSegment {
 /// "just under the limit" file over the real cap.
 const SAFE_UPLOAD_BYTES: u64 = 24_000_000;
 
-/// Target size for each chunk when splitting oversized audio. At
-/// `extract_audio`'s fixed mono/16kHz/16-bit output (32 KB/s), this is
-/// exactly 10 minutes of audio (~18.3MB) — comfortably under
-/// `SAFE_UPLOAD_BYTES` even after the silence-seeking boundary picker
-/// nudges a cut a few tens of seconds away from this target in either
-/// direction.
+/// Target size for each chunk when splitting a legacy oversized WAV (see
+/// `transcribe_audio`). At the mono/16kHz/16-bit PCM `extract_audio` used
+/// to emit (32 KB/s), this is exactly 10 minutes of audio (~18.3MB) —
+/// comfortably under `SAFE_UPLOAD_BYTES` even after the silence-seeking
+/// boundary picker nudges a cut a few tens of seconds away from this
+/// target in either direction.
 const CHUNK_TARGET_BYTES: usize = 19_200_000;
 
 /// Uploads the local file at `audio_path` to OpenAI's Whisper API
@@ -65,15 +65,22 @@ const CHUNK_TARGET_BYTES: usize = 19_200_000;
 /// the response into `TranscriptSegment`s.
 ///
 /// Whisper caps uploads at 25MB (`SAFE_UPLOAD_BYTES` is a safe margin
-/// under that). Audio extracted by `ffmpeg.rs` is mono 16kHz WAV; most
-/// recordings are short enough to stay under the cap and go up in a
-/// single request (unchanged from before chunking existed). Anything
-/// longer is split via `wav.rs` into sub-cap WAV chunks, each uploaded in
-/// its own sequential request, with every returned segment's timestamps
-/// offset back onto the full recording's timeline before merging — see
-/// `merge_chunk_segments`. Either way, only the already-extracted local
-/// audio bytes ever leave the process, now possibly in several pieces
-/// instead of one. Never touches the source video.
+/// under that) for every model it offers — no model choice or parameter
+/// lifts it. `ffmpeg.rs` therefore extracts 24 kbps Opus (~3 KB/s), which
+/// puts over two hours of lecture inside one request, so in practice this
+/// is a single upload and the chunking below never runs.
+///
+/// It still runs for audio cached as raw PCM WAV by a build from before
+/// that change (32 KB/s — the cap at ~13 minutes), which is what the
+/// `RIFF` check selects on: such a file is split via `wav.rs` into sub-cap
+/// WAV chunks, each uploaded in its own sequential request, with every
+/// returned segment's timestamps offset back onto the full recording's
+/// timeline before merging — see `merge_chunk_segments`. An oversized
+/// *Opus* file means a recording past ~2 hours, which `wav.rs` cannot
+/// split; that gets a clear error rather than a confusing parse failure.
+///
+/// Either way, only the already-extracted local audio bytes ever leave the
+/// process. Never touches the source video.
 pub async fn transcribe_audio(
     app: &AppHandle,
     video_id: &str,
@@ -88,12 +95,20 @@ pub async fn transcribe_audio(
     let file_name = Path::new(audio_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("audio.wav")
+        .unwrap_or("audio.ogg")
         .to_string();
+    let mime = mime_for(&file_name);
 
     if audio_bytes.len() as u64 <= SAFE_UPLOAD_BYTES {
         progress::emit(app, video_id, Stage::Transcribing, None, None, attempt);
-        return upload_chunk(audio_bytes, file_name, api_key).await;
+        return upload_chunk(audio_bytes, file_name, mime, api_key).await;
+    }
+
+    if !audio_bytes.starts_with(b"RIFF") {
+        return Err(
+            "this recording is too long to transcribe in one upload (over ~2 hours of audio)"
+                .to_string(),
+        );
     }
 
     let chunks = wav::split_into_chunks(&audio_bytes, CHUNK_TARGET_BYTES)?;
@@ -115,26 +130,39 @@ pub async fn transcribe_audio(
         // `mark_error` path, so no partial/ambiguous transcript is ever
         // written.
         let chunk_name = format!("chunk-{index:03}-{file_name}");
-        let segments = upload_chunk(chunk_bytes, chunk_name, api_key).await?;
+        let segments = upload_chunk(chunk_bytes, chunk_name, "audio/wav", api_key).await?;
         chunk_results.push((segments, start_offset_secs));
     }
 
     Ok(merge_chunk_segments(chunk_results))
 }
 
-/// Uploads a single already-in-memory WAV file (a whole recording, or one
-/// chunk of one) to Whisper and parses the response into
-/// `TranscriptSegment`s, with timestamps relative to the start of
+/// Content type for `file_name`'s extension. Whisper keys off the filename
+/// extension more than the part's MIME type, but a matching one keeps the
+/// two from disagreeing. Only the formats `ffmpeg.rs` has ever written need
+/// to appear here; anything else falls back to Opus/Ogg, today's output.
+fn mime_for(file_name: &str) -> &'static str {
+    if file_name.rsplit('.').next().is_some_and(|ext| ext.eq_ignore_ascii_case("wav")) {
+        "audio/wav"
+    } else {
+        "audio/ogg"
+    }
+}
+
+/// Uploads a single already-in-memory audio file (a whole recording, or one
+/// WAV chunk of a legacy oversized one) to Whisper and parses the response
+/// into `TranscriptSegment`s, with timestamps relative to the start of
 /// `audio_bytes` (i.e. not yet offset for its position in a longer
 /// recording — see `merge_chunk_segments` for that).
 async fn upload_chunk(
     audio_bytes: Vec<u8>,
     file_name: String,
+    mime: &str,
     api_key: &str,
 ) -> Result<Vec<TranscriptSegment>, String> {
     let file_part = reqwest::multipart::Part::bytes(audio_bytes)
         .file_name(file_name)
-        .mime_str("audio/wav")
+        .mime_str(mime)
         .map_err(|err| format!("could not set audio part mime type: {err}"))?;
 
     let form = reqwest::multipart::Form::new()
