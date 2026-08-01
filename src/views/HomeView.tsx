@@ -116,14 +116,14 @@ export default function HomeView({ onOpenProject, onOpenSettings }: HomeViewProp
       </form>
 
       {keyCheckError ? (
-        <Alert className="my-4 border-amber-600/40 bg-amber-50 text-amber-900 dark:border-amber-400/40 dark:bg-amber-950/40 dark:text-amber-200">
+        <Alert className="my-4 border-amber-400/40 bg-amber-950/40 text-amber-200">
           <AlertDescription className="text-inherit">
             Could not check your OpenAI API key status: {keyCheckError}
           </AlertDescription>
         </Alert>
       ) : (
         keyPresent === false && (
-          <Alert className="my-4 flex items-center justify-between gap-4 border-amber-600/40 bg-amber-50 text-amber-900 dark:border-amber-400/40 dark:bg-amber-950/40 dark:text-amber-200">
+          <Alert className="my-4 flex items-center justify-between gap-4 border-amber-400/40 bg-amber-950/40 text-amber-200">
             <AlertDescription className="text-inherit">
               CourseCut is bring-your-own-key: transcription and analysis need an OpenAI API key.
               Nothing will process until one is saved.

@@ -73,7 +73,7 @@ export default function SegmentedScrubber({
           {segments.map((segment) => (
             <span
               key={segment.id}
-              className="absolute inset-y-0 rounded-full bg-amber-400/60 ring-1 ring-inset ring-black/20 dark:ring-white/20"
+              className="absolute inset-y-0 rounded-full bg-amber-400/60 ring-1 ring-inset ring-white/20"
               style={{
                 left: `${(segment.start / duration) * 100}%`,
                 width: `${((segment.end - segment.start) / duration) * 100}%`,

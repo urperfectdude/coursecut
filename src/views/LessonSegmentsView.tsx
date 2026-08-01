@@ -25,6 +25,10 @@ import {
   type Video,
 } from "../db";
 import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "../lib/timestamp";
+import {
+  segmentOffsets as computeSegmentOffsets,
+  rewriteFinalTimestampsToSource,
+} from "../lib/timeline";
 import { getSegmentDiffBadgeClassName } from "../lib/badge-variants";
 import { ChevronDown, ChevronUp, Pencil, Trash2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -278,6 +282,14 @@ export default function LessonSegmentsView({
   // call shape), `aiApplyBusy` is separate so the popup's own buttons can
   // disable independently of the outer prompt box.
   const [aiInstruction, setAiInstruction] = useState("");
+  // Which timeline the timestamps typed into the floating prompt refer to.
+  // "original" is the source recording (the backend's only timeline, so
+  // instructions pass through untouched); "final" is the stitched lesson the
+  // right-hand player shows, and gets converted before being sent — see
+  // `rewriteFinalTimestampsToSource`. Deliberately not persisted: it resets
+  // to the safe default on every visit rather than silently reinterpreting a
+  // later instruction from a choice made minutes ago.
+  const [promptTimeline, setPromptTimeline] = useState<"original" | "final">("original");
   const [aiPreviewBusy, setAiPreviewBusy] = useState(false);
   const [aiApplyBusy, setAiApplyBusy] = useState(false);
   const [proposedSegments, setProposedSegments] = useState<LessonSegmentRange[] | null>(null);
@@ -381,11 +393,26 @@ export default function LessonSegmentsView({
   // current DB segments (no `baseline`), never anything left over from a
   // cancelled popup. Doesn't touch `segments` state either way — only opens
   // the popup on success.
+  // In "final" mode the timestamps the user typed are positions in the
+  // stitched lesson, so they're mapped back onto the source timeline before
+  // being sent — the backend only ever speaks source time. Always maps
+  // against the lesson's real current `segments` (what the Final video
+  // player is actually showing), including from the popup's refine box,
+  // where the *baseline* is the not-yet-applied proposal but the video the
+  // user timed against is still this one.
+  const resolveInstruction = useCallback(
+    (instruction: string) =>
+      promptTimeline === "final"
+        ? rewriteFinalTimestampsToSource(instruction, segments)
+        : instruction,
+    [promptTimeline, segments],
+  );
+
   const handlePreviewEdit = useCallback(async () => {
     if (aiPreviewBusy || aiInstruction.trim() === "") return;
     setAiPreviewBusy(true);
     try {
-      const proposal = await previewLessonSegmentEdit(lessonId, aiInstruction);
+      const proposal = await previewLessonSegmentEdit(lessonId, resolveInstruction(aiInstruction));
       setProposedSegments(proposal);
       setSegmentsError(null);
     } catch (err) {
@@ -393,7 +420,7 @@ export default function LessonSegmentsView({
     } finally {
       setAiPreviewBusy(false);
     }
-  }, [aiPreviewBusy, aiInstruction, lessonId]);
+  }, [aiPreviewBusy, aiInstruction, lessonId, resolveInstruction]);
 
   useEffect(() => {
     if (aiInstruction !== "") return;
@@ -409,7 +436,11 @@ export default function LessonSegmentsView({
     if (aiPreviewBusy || proposedSegments === null || refineInstruction.trim() === "") return;
     setAiPreviewBusy(true);
     try {
-      const proposal = await previewLessonSegmentEdit(lessonId, refineInstruction, proposedSegments);
+      const proposal = await previewLessonSegmentEdit(
+        lessonId,
+        resolveInstruction(refineInstruction),
+        proposedSegments,
+      );
       setProposedSegments(proposal);
       setRefineInstruction("");
       setSegmentsError(null);
@@ -418,7 +449,7 @@ export default function LessonSegmentsView({
     } finally {
       setAiPreviewBusy(false);
     }
-  }, [aiPreviewBusy, proposedSegments, refineInstruction, lessonId]);
+  }, [aiPreviewBusy, proposedSegments, refineInstruction, lessonId, resolveInstruction]);
 
   const handleApplyProposal = useCallback(async () => {
     if (aiApplyBusy || proposedSegments === null || proposedSegments.length === 0) return;
@@ -817,20 +848,13 @@ export default function LessonSegmentsView({
     [lessonId, withSegmentUndo],
   );
 
-  // Cumulative virtual-timeline duration *before* each segment, same
-  // stitched-together-timeline math as `LessonPreviewPlayer`'s own
-  // `segmentOffsets` (kept separate rather than shared since that one also
-  // tracks the active-playback index, which isn't relevant here) — this is
-  // what lets the read-only "final video" columns below show each
-  // segment's position in the exported lesson rather than the source file.
-  const segmentOffsets = useMemo(() => {
-    let acc = 0;
-    return segments.map((segment) => {
-      const offset = acc;
-      acc += segment.end - segment.start;
-      return offset;
-    });
-  }, [segments]);
+  // Cumulative virtual-timeline duration *before* each segment — what lets
+  // the read-only "final video" columns below show each segment's position
+  // in the exported lesson rather than the source file. Shares its math with
+  // the prompt's Original/Final timestamp conversion via `../lib/timeline`,
+  // so the numbers shown here and the ones a "final" instruction is read
+  // against can't drift apart.
+  const segmentOffsets = useMemo(() => computeSegmentOffsets(segments), [segments]);
 
   return (
     <div className="pb-32">
@@ -973,7 +997,26 @@ export default function LessonSegmentsView({
             )}
           </div>
 
-          <div className="lesson-segments-preview-row mt-4 flex flex-wrap items-start gap-6">
+          {/* Pinned to the top of the viewport so the segment list below
+             scrolls *under* it — with a dozen-plus segments, editing a bound
+             near the bottom otherwise means scrolling back up to see what it
+             did. `-mx-8`/`px-8` bleed the band across `.app-shell`'s own 2rem
+             padding, so nothing shows through the gap beside it.
+
+             Two deliberate choices in the classes below:
+             * Solid `bg-background`, *not* `backdrop-blur` like the floating
+               AI input — `backdrop-filter` makes an element a containing
+               block for `position: fixed` descendants, which would trap both
+               players' fullscreen overlays (rendered in place as `fixed
+               inset-0`, not portaled) inside this row instead of covering the
+               viewport.
+             * `z-30` puts the band above the segment rows (whose `relative`
+               spinner wrappers would otherwise paint over it), while staying
+               below the body-portaled dialogs at `z-50`. It also caps this
+               subtree's paint level, which is why the floating AI input sits
+               at `z-20` — so a fullscreened player covers it rather than
+               having the prompt box float over the video. */}
+          <div className="lesson-segments-preview-row sticky top-0 z-30 -mx-8 mt-4 flex flex-wrap items-start gap-6 border-b border-border bg-background px-8 pt-4 pb-4">
             {/* The raw source video, alongside the lesson's own stitched
                preview — lets the user scrub the full original recording to
                find a boundary without leaving this page, rather than only
@@ -1247,26 +1290,71 @@ export default function LessonSegmentsView({
             </AlertDialogContent>
           </AlertDialog>
 
-          <div className="fixed inset-x-0 bottom-6 z-50 flex justify-center px-4">
+          {/* `z-20`, below the sticky preview band's `z-30` — see the comment
+             there. The two never overlap on screen (band pins to the top,
+             this floats at the bottom), so the only thing this ordering
+             decides is that a fullscreened player covers the prompt box. */}
+          <div className="fixed inset-x-0 bottom-6 z-20 flex justify-center px-4">
             <div className="relative w-full max-w-xl rounded-3xl border border-border bg-background/95 shadow-lg backdrop-blur supports-[backdrop-filter]:bg-background/80">
               <Textarea
                 value={aiInstruction}
                 disabled={aiPreviewBusy}
                 onChange={(event) => setAiInstruction(event.target.value)}
                 placeholder={AI_INSTRUCTION_PLACEHOLDERS[aiPlaceholderIndex]}
-                className="min-h-9 resize-none rounded-none border-none bg-transparent py-3 pl-4 pr-32 shadow-none focus-visible:border-none focus-visible:ring-0 dark:bg-transparent dark:disabled:bg-transparent"
+                className="min-h-9 resize-none rounded-none border-none bg-transparent py-3 pl-4 pr-64 shadow-none focus-visible:border-none focus-visible:ring-0 dark:bg-transparent dark:disabled:bg-transparent"
                 rows={1}
                 aria-label="Describe a change to this lesson's segments"
               />
-              <Button
-                type="button"
-                size="sm"
-                className="absolute bottom-2 right-2 shrink-0 rounded-full"
-                disabled={aiPreviewBusy || aiInstruction.trim() === ""}
-                onClick={() => void handlePreviewEdit()}
-              >
-                {aiPreviewBusy && proposedSegments === null ? "Previewing…" : "Preview Changes"}
-              </Button>
+              {/* Toggle and CTA share one absolutely-positioned row pinned to
+                 the bar's bottom-right, so they stay put (and stay aligned to
+                 each other) as the textarea grows with a longer instruction.
+                 The group's `h-7` matches the CTA's own `size="sm"` height. */}
+              <div className="absolute bottom-2 right-2 flex items-center gap-2">
+                <div
+                  role="group"
+                  aria-label="Timeline the timestamps you type refer to"
+                  className="flex h-7 items-center gap-0.5 rounded-full border border-border p-0.5"
+                >
+                  {(
+                    [
+                      ["original", "Original", "Timestamps refer to the original source video"],
+                      ["final", "Final", "Timestamps refer to the final, stitched lesson video"],
+                    ] as const
+                  ).map(([value, label, hint]) => {
+                    const isActive = promptTimeline === value;
+                    // With no segments there is no final timeline to time
+                    // anything against, so that half of the toggle is inert.
+                    const isDisabled = value === "final" && segments.length === 0;
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        aria-pressed={isActive}
+                        disabled={isDisabled}
+                        title={isDisabled ? "This lesson has no segments yet" : hint}
+                        onClick={() => setPromptTimeline(value)}
+                        className={cn(
+                          "h-6 rounded-full px-2.5 text-xs transition-colors disabled:pointer-events-none disabled:opacity-50",
+                          isActive
+                            ? "bg-secondary text-secondary-foreground"
+                            : "text-muted-foreground hover:text-foreground",
+                        )}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  className="shrink-0 rounded-full"
+                  disabled={aiPreviewBusy || aiInstruction.trim() === ""}
+                  onClick={() => void handlePreviewEdit()}
+                >
+                  {aiPreviewBusy && proposedSegments === null ? "Previewing…" : "Preview Changes"}
+                </Button>
+              </div>
             </div>
           </div>
         </>
@@ -1294,10 +1382,9 @@ interface LessonAiEditReviewModalProps {
  * same color intent at row scope instead of shrinking it down to the badge. */
 const SEGMENT_DIFF_ROW_CLASS_NAMES: Record<"unchanged" | "trimmed" | "new" | "removed", string> = {
   unchanged: "opacity-70",
-  trimmed: "border-l-2 border-amber-500/70 bg-amber-500/10 dark:border-amber-400/70 dark:bg-amber-400/10",
-  new: "border-l-2 border-emerald-500/70 bg-emerald-500/10 dark:border-emerald-400/70 dark:bg-emerald-400/10",
-  removed:
-    "border-l-2 border-red-500/70 bg-red-500/10 text-muted-foreground line-through dark:border-red-400/70 dark:bg-red-400/10",
+  trimmed: "border-l-2 border-amber-400/70 bg-amber-400/10",
+  new: "border-l-2 border-emerald-400/70 bg-emerald-400/10",
+  removed: "border-l-2 border-red-400/70 bg-red-400/10 text-muted-foreground line-through",
 };
 
 /** Old-vs-new review popup for the AI segment edit prompt
@@ -1331,86 +1418,98 @@ function LessonAiEditReviewModal({
         if (!open) onCancel();
       }}
     >
-      <DialogContent className="sm:max-w-xl" aria-label="Review proposed segment changes">
+      {/* Capped at 80% of the viewport: the two segment lists, the refine
+         box, its note and button, and the footer together overflow a short
+         window, and `DialogContent` has no height limit of its own — the
+         dialog would run off the top and bottom of the screen, taking Apply
+         and Cancel with it. `flex` (over the base `grid`) plus `min-h-0` on
+         the body is what lets the header and footer stay put while only the
+         middle scrolls. */}
+      <DialogContent
+        className="flex max-h-[80vh] flex-col sm:max-w-xl"
+        aria-label="Review proposed segment changes"
+      >
         <DialogHeader>
           <DialogTitle>Review proposed changes</DialogTitle>
         </DialogHeader>
 
-        {isEmptyProposal ? (
-          <p className="text-sm text-muted-foreground">This would remove every segment in this lesson.</p>
-        ) : (
-          <>
-            <p className="text-sm font-semibold">Current segments</p>
-            <ul className="m-0 flex max-h-[30vh] list-none flex-col gap-1 overflow-y-auto p-0">
-              {currentSegments.map((segment, index) => (
-                <li
-                  key={`current-${index}`}
-                  className="flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums"
-                >
-                  {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
-                </li>
-              ))}
-              {currentSegments.length === 0 && <li className="text-sm text-muted-foreground">(no segments)</li>}
-            </ul>
+        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+          {isEmptyProposal ? (
+            <p className="text-sm text-muted-foreground">This would remove every segment in this lesson.</p>
+          ) : (
+            <>
+              <p className="text-sm font-semibold">Current segments</p>
+              <ul className="m-0 flex max-h-[30vh] list-none flex-col gap-1 overflow-y-auto p-0">
+                {currentSegments.map((segment, index) => (
+                  <li
+                    key={`current-${index}`}
+                    className="flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums"
+                  >
+                    {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
+                  </li>
+                ))}
+                {currentSegments.length === 0 && <li className="text-sm text-muted-foreground">(no segments)</li>}
+              </ul>
 
-            <p className="text-sm font-semibold">Proposed segments</p>
-            <ul className="m-0 flex max-h-[30vh] list-none flex-col gap-1 overflow-y-auto p-0">
-              {proposedRows.map((row, index) => (
-                <li
-                  key={`proposed-${index}`}
-                  className={cn(
-                    "flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums",
-                    SEGMENT_DIFF_ROW_CLASS_NAMES[row.kind],
-                  )}
-                >
-                  {formatTimestamp(row.start)}–{formatTimestamp(row.end)}
-                  <Badge variant="outline" className={getSegmentDiffBadgeClassName(row.kind)}>
-                    {row.kind}
-                  </Badge>
-                </li>
-              ))}
-              {removed.map((segment, index) => (
-                <li
-                  key={`removed-${index}`}
-                  className={cn(
-                    "flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums",
-                    SEGMENT_DIFF_ROW_CLASS_NAMES.removed,
-                  )}
-                >
-                  {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
-                  <Badge variant="outline" className={getSegmentDiffBadgeClassName("removed")}>
-                    removed
-                  </Badge>
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
+              <p className="text-sm font-semibold">Proposed segments</p>
+              <ul className="m-0 flex max-h-[30vh] list-none flex-col gap-1 overflow-y-auto p-0">
+                {proposedRows.map((row, index) => (
+                  <li
+                    key={`proposed-${index}`}
+                    className={cn(
+                      "flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums",
+                      SEGMENT_DIFF_ROW_CLASS_NAMES[row.kind],
+                    )}
+                  >
+                    {formatTimestamp(row.start)}–{formatTimestamp(row.end)}
+                    <Badge variant="outline" className={getSegmentDiffBadgeClassName(row.kind)}>
+                      {row.kind}
+                    </Badge>
+                  </li>
+                ))}
+                {removed.map((segment, index) => (
+                  <li
+                    key={`removed-${index}`}
+                    className={cn(
+                      "flex items-center justify-between gap-2 rounded-md px-2 py-1 text-sm tabular-nums",
+                      SEGMENT_DIFF_ROW_CLASS_NAMES.removed,
+                    )}
+                  >
+                    {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
+                    <Badge variant="outline" className={getSegmentDiffBadgeClassName("removed")}>
+                      removed
+                    </Badge>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
 
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="lesson-segments-ai-refine">Refine this proposal</Label>
-          <Textarea
-            id="lesson-segments-ai-refine"
-            value={refineInstruction}
-            disabled={busy}
-            onChange={(event) => onRefineInstructionChange(event.target.value)}
-            placeholder="e.g. &quot;keep more of the ending&quot;"
-            rows={2}
-            aria-label="Refine the proposed segment changes"
-          />
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="lesson-segments-ai-refine">Refine this proposal</Label>
+            <Textarea
+              id="lesson-segments-ai-refine"
+              value={refineInstruction}
+              disabled={busy}
+              onChange={(event) => onRefineInstructionChange(event.target.value)}
+              placeholder="e.g. &quot;keep more of the ending&quot;"
+              rows={2}
+              aria-label="Refine the proposed segment changes"
+            />
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Exact timestamps (<code>m:ss</code>, <code>h:mm:ss</code>) in your instruction are
+            honored precisely.
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={busy || refineInstruction.trim() === ""}
+            onClick={onRefine}
+          >
+            {previewBusy ? "Updating…" : "Update proposal"}
+          </Button>
         </div>
-        <p className="text-sm text-muted-foreground">
-          Exact timestamps (<code>m:ss</code>, <code>h:mm:ss</code>) in your instruction are
-          honored precisely.
-        </p>
-        <Button
-          type="button"
-          variant="outline"
-          disabled={busy || refineInstruction.trim() === ""}
-          onClick={onRefine}
-        >
-          {previewBusy ? "Updating…" : "Update proposal"}
-        </Button>
 
         <DialogFooter>
           <Button type="button" variant="outline" onClick={onCancel} disabled={applyBusy}>

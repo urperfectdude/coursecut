@@ -138,7 +138,7 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
             variant={testResult.valid ? "default" : "destructive"}
             className={
               testResult.valid
-                ? "mt-4 border-emerald-600/40 bg-emerald-50 text-emerald-900 dark:border-emerald-400/40 dark:bg-emerald-950/40 dark:text-emerald-200"
+                ? "mt-4 border-emerald-400/40 bg-emerald-950/40 text-emerald-200"
                 : "mt-4"
             }
           >
@@ -189,7 +189,7 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
         </form>
 
         {instructionsSaved && (
-          <Alert className="mt-4 border-emerald-600/40 bg-emerald-50 text-emerald-900 dark:border-emerald-400/40 dark:bg-emerald-950/40 dark:text-emerald-200">
+          <Alert className="mt-4 border-emerald-400/40 bg-emerald-950/40 text-emerald-200">
             <AlertDescription className="text-inherit">Saved.</AlertDescription>
           </Alert>
         )}
