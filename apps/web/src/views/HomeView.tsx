@@ -1,4 +1,4 @@
-// PORTED FROM: src/views/HomeView.tsx @ dad013b
+// PORTED FROM: src/views/HomeView.tsx @ 7c985f8
 // DEVIATIONS: D7 (no missing-API-key banner — the key is platform-owned)
 //
 // Desktop is bring-your-own-key, so it warns here when no key is saved and
