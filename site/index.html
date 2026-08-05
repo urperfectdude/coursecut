@@ -276,7 +276,6 @@
       <img src="assets/icon-192.png" alt="" width="192" height="192" decoding="async">
       <span>Course<span class="slash">/</span>Cut</span>
     </a>
-    <p class="eyebrow">Desktop app · macOS &amp; Windows</p>
     <h1>Turn a three-hour lecture into the lessons it was always made of.</h1>
     <p class="lede">
       CourseCut transcribes your recording, finds where each topic begins and
@@ -292,10 +291,10 @@
       </a>
       <a class="btn" href="https://github.com/urperfectdude/coursecut/releases/latest" id="btn-win">
         <strong>Download for Windows</strong>
-        <span>64-bit · Windows 10 &amp; 11</span>
+        <span>64-bit · Win 10+</span>
       </a>
     </div>
-    <p class="fineprint" id="fineprint">Version 1.0 · Free while in early access</p>
+    <p class="fineprint"><a href="https://coursecut.duckdns.org/">Try it on the web</a></p>
     <p class="fineprint">
       Unsigned build during early access: on macOS, right-click the app
       and choose <strong>Open</strong>; on Windows, click
@@ -402,13 +401,7 @@
           const btn = document.getElementById("btn-win");
           btn.href = win.browser_download_url;
           btn.querySelector("span").textContent =
-            "64-bit · Windows 10 & 11 · " + bytes(win.size);
-        }
-
-        const version = (release.tag_name || "").replace(/^v/, "");
-        if (version) {
-          document.getElementById("fineprint").textContent =
-            "Version " + version + " · Free while in early access";
+            "64-bit · Win 10+ · " + bytes(win.size);
         }
       })
       .catch(() => {
