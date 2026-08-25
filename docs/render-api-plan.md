@@ -4,7 +4,7 @@
 
 A new public, programmatic API — separate from the org-member web UI — that lets a registered developer submit a set of video clips (or one whole video), each identified by a URL, and get back a single merged MP4: their clips assembled in order, wrapped in their org's intro/outro, carrying their brand colors, with an optional voiceover track. The response is a hosted URL to the finished file, with progress reported in between.
 
-**The driving use case is product walkthrough videos.** The caller isn't handing over already-edited footage — they're handing over one short screen-recording GIF per step of a workflow ("click Settings", "toggle Dark Mode", "click Save"), in the order the steps happen, and expecting back one polished walkthrough video: each step's click found and highlighted, a caption for what happened, a brief zoom into where it happened, all stitched together with their intro/outro and brand. Generic multi-clip merging (§2.3) is the mechanism; turning a folder of raw click GIFs into a guided demo is the product. See "Click detection & step annotation" for how a "click" gets found and what happens to it.
+**The driving use case is product walkthrough videos, recorded by a Chrome extension.** The extension records one continuous screen capture of a workflow, uploads the whole video to the caller's own storage, and — because it can also read the DOM — logs every click as it happens: coordinates, timestamp, and the clicked element's text/selector/tag ("clicked the button labeled 'Save'"). The caller's request to this API is that one video URL plus that ordered click log. Nothing is pre-cut, nothing is pre-captioned by hand — the API segments the recording at the clicks, and because the extension already knows *what* was clicked, most captions are exact rather than guessed. A secondary mode still accepts pre-cut clips for callers without that kind of recorder (§2.3). See "Click detection & step annotation" for the full detail on both modes.
 
 This is **not** the lesson-extraction product (upload → transcribe → AI-split into lessons → export). It shares no domain concept with `videos`/`lessons`/`transcript_segments`. What it shares is infrastructure: the same Postgres, the same `graphile-worker` queue, the same object store, the same `ffmpeg` wrapper module — because `apps/api` and `apps/worker` already are a general-purpose "queue a job, encode with ffmpeg, land the output in object storage" system, and this is a second job kind for it, not a second system.
 
@@ -16,11 +16,13 @@ Unnumbered deliberately, so it never has to shift if a numbered section above it
 
 ```mermaid
 flowchart TB
+    Ext["Chrome extension<br/>records session, logs clicks<br/>(coords + timestamp + DOM text/selector)"]
     Dev["Caller's backend<br/>(registered developer)"]
     Hook["Caller's callback_url<br/>(optional webhook receiver)"]
-    Clips["Step GIFs / clip URLs<br/>(caller's own hosting — DO Spaces or anywhere https)"]
+    SrcVid["Whole recording<br/>(caller's own hosting — DO Spaces or anywhere https)"]
+    Clips["Pre-cut step clips<br/>(secondary mode, no extension)"]
     VO["Voiceover URL<br/>(optional)"]
-    OpenAI(["OpenAI — vision model<br/>(fallback path only)"])
+    OpenAI(["OpenAI — vision model<br/>(rare fallback: no DOM text for a click)"])
 
     subgraph API["apps/api (Hono)"]
         Auth["requireApiKey<br/>hash lookup → org_id"]
@@ -33,14 +35,16 @@ flowchart TB
         Tk[("api_keys")]
         Tpl[("render_templates")]
         RJ[("render_jobs")]
-        RI[("render_inputs")]
+        RCE[("render_click_events<br/>(whole-video mode only)")]
+        RI[("render_inputs<br/>(one row per step, either mode)")]
         GW[("graphile_worker<br/>queue tables")]
     end
 
     subgraph Worker["apps/worker — tasks/render.ts"]
         Claim["Claim: queued → running"]
         Fetch["SSRF-safe fetcher<br/>block private/link-local IPs,<br/>re-validate every redirect,<br/>cap size + timeout"]
-        Detect["Detect clicks per step<br/>primary: caller-supplied clicks JSON<br/>fallback: extract change-frames →<br/>vision model → coords + action"]
+        Seg["Segment (whole-video mode only)<br/>cut at click-midpoint boundaries,<br/>reuses cutSegment"]
+        Detect["Detect clicks per step<br/>tier 1: extension DOM text/selector<br/>tier 2: caller coords only<br/>tier 3: change-frames → vision model"]
         Norm["Normalize each input to<br/>template's width/height/fps<br/>(click coords rescaled in lockstep)"]
         Annot["Annotate: highlight ring,<br/>zoom/crop punch-in, step caption<br/>— per click, per step"]
         Brand["Brand overlay<br/>drawbox + logo"]
@@ -56,22 +60,28 @@ flowchart TB
         Output[("output.mp4")]
     end
 
+    Ext -- "video URL + ordered click log" --> Dev
     Dev -- "Bearer API key" --> Auth --> RRoutes
     Auth --> TRoutes
     Dev -- "session cookie, org admin" --> KRoutes
 
-    RRoutes -- "insert + enqueue" --> RJ --> RI
+    RRoutes -- "whole-video mode:<br/>insert + enqueue" --> RJ --> RCE
+    RRoutes -- "clips mode:<br/>insert + enqueue" --> RI
     RRoutes --> GW
     TRoutes --> Tpl
     KRoutes --> Tk
 
     GW -- "picks up render task" --> Claim --> Fetch
+    Fetch -. "validated GET" .-> SrcVid
     Fetch -. "validated GET" .-> Clips
     Fetch -. "validated GET" .-> VO
     Fetch --> Resolved
     Tpl -. "read" .-> Claim
-    Resolved --> Detect
-    Detect -. "only if clicks JSON absent:<br/>extracted still frames" .-> OpenAI
+    RCE -. "ordered click log" .-> Seg
+    Resolved --> Seg
+    Seg -- "one cut per step" --> RI
+    RI --> Detect
+    Detect -. "only when a click has<br/>no usable DOM text" .-> OpenAI
     Detect --> Norm
     Assets --> Norm
     Norm --> Annot --> Brand --> Concat --> VMix --> Fin
@@ -122,7 +132,12 @@ An org sets this up once, not on every call:
 
 ### 2.3 Render jobs — the actual unit of work
 
-A render job takes: an ordered list of inputs (each a URL, or a previously-uploaded object key), a `template_id`, an optional voiceover input, and an optional `callback_url`. It produces one output file and reports status the same way an export does (`queued → running → done|failed`), plus a progress fraction.
+A render job runs in one of two modes:
+
+* **Whole-video mode (primary/recommended)** — one recording (URL or object key) plus an ordered click-event log (`t_ms`, `x`, `y`, and, from a DOM-aware recorder, `selector`/`element_text`/`tag_name`). The API segments the recording into steps itself (§6, "Segment") — the caller does no cutting.
+* **Clips mode (secondary)** — an ordered list of pre-cut inputs (each a URL or a previously-uploaded object key), for a caller whose recorder can't produce a click log.
+
+Either way the job also takes a `template_id`, an optional voiceover input, and an optional `callback_url`, produces one output file, and reports status the same way an export does (`queued → running → done|failed`), plus a progress fraction.
 
 ## 3. Data model (additive — nothing existing changes)
 
@@ -140,6 +155,9 @@ render_templates
 
 render_jobs
   id, org_id, template_id,
+  mode ('whole_video'|'clips'),
+  source_kind ('url'|'storage_key', whole_video mode only), source (the URL or key as given),
+  resolved_source_key (nullable — the fetched recording, once downloaded; whole_video mode only),
   status ('queued'|'running'|'done'|'failed'|'cancelled'), progress (0..1),
   output_key, error,
   voiceover_key (nullable, resolved object key once fetched),
@@ -147,17 +165,29 @@ render_jobs
   size_bytes, download_expires_at,
   created_at
 
+render_click_events
+  id, org_id, render_job_id, sort_order,
+  t_ms (position in the whole recording's own timeline, before Segment rebases it),
+  x, y,
+  selector (nullable), element_text (nullable), tag_name (nullable)
+  -- whole_video mode only; empty for a clips-mode job. Ordered by sort_order (== t_ms order).
+  -- What Segment reads to decide step boundaries, and what Detect's tier 1 reads for a caption.
+
 render_inputs
   id, org_id, render_job_id, sort_order,
-  source_kind ('url'|'storage_key'), source (the URL or key as given),
-  resolved_key (nullable — filled in once the fetcher has downloaded a URL input and put it in our own storage; makes a retry not re-fetch a caller's URL a second time),
-  clicks_json (nullable jsonb — array of { x, y, t_ms, label? } in source-clip pixel/time space; see
-    "Click detection & step annotation"),
-  clicks_source ('caller'|'vision_llm', nullable until Detect resolves it),
-  caption (nullable text — caller-supplied, or filled in by the vision-model fallback)
+  source_kind ('url'|'storage_key'), source (the URL or key as given, clips mode only —
+    whole_video mode rows are created by Segment, not by the request),
+  resolved_key (nullable — the step's own clip, once fetched (clips mode) or cut (whole_video
+    mode); makes a retry not re-fetch or re-cut),
+  clicks_json (nullable jsonb — array of { x, y, t_ms, selector?, element_text?, tag_name? } in
+    this step's own pixel/time space, i.e. already rebased off the source recording's timeline
+    for whole_video mode; see "Click detection & step annotation"),
+  clicks_source ('extension_dom'|'caller'|'vision_llm', nullable until Detect resolves it),
+  caption (nullable text — derived from clicks_json's element_text, caller-supplied, or filled in
+    by the vision-model fallback)
 ```
 
-`render_jobs`/`render_inputs`/`render_templates`/`api_keys` join `TENANT_TABLES` (`db/schema.ts`) and get the same RLS policy every other tenant table gets — no exception carved out for "it's an API, not the UI."
+`render_jobs`/`render_click_events`/`render_inputs`/`render_templates`/`api_keys` join `TENANT_TABLES` (`db/schema.ts`) and get the same RLS policy every other tenant table gets — no exception carved out for "it's an API, not the UI." `render_click_events` as its own table, rather than a jsonb blob on `render_jobs`, matches this codebase's existing convention (`transcript_segments`/`lesson_segments` are dedicated tables, not blobs) and lets Segment order and query them with normal SQL.
 
 `jobs.kind` gains a `"render"` value alongside `extract`/`transcribe`/`analyze`/`export`, with `jobs.renderId` added the same way `jobs.exportId` exists today (nullable FK, one column per job kind that uses it).
 
@@ -169,14 +199,22 @@ GET    /v1/templates/:id                fetch one
 PATCH  /v1/templates/:id                update
 GET    /v1/templates                    list
 
-POST   /v1/renders                      { template_id,
-                                           inputs: [{ url|storage_key,
-                                                       clicks?: [{x, y, t_ms, label?}],
-                                                       caption?: string }, ...],
-                                           voiceover_url?, voiceover_mode?, callback_url? }
-                                         → 202, { id, status: "queued" }
-                                         (omitting `clicks` on a step triggers the vision-model
-                                          fallback — see "Click detection & step annotation")
+POST   /v1/renders    Whole-video mode (recommended):
+                       { template_id,
+                         source: { url | storage_key },
+                         clicks: [{ t_ms, x, y, selector?, element_text?, tag_name? }, ...],
+                         voiceover_url?, voiceover_mode?, callback_url? }
+
+                       Clips mode (secondary — no recorder click log available):
+                       { template_id,
+                         inputs: [{ url|storage_key, clicks?: [{x, y, t_ms, label?}],
+                                     caption?: string }, ...],
+                         voiceover_url?, voiceover_mode?, callback_url? }
+
+                       Exactly one of `source`+`clicks` or `inputs` — a request naming both,
+                       or neither, is a 400. → 202, { id, status: "queued" }
+                       (a click missing usable element_text falls to the vision-model tier —
+                        see "Click detection & step annotation")
 GET    /v1/renders/:id                  → { id, status, progress, output_url?, error? }
                                          (output_url present only once status = "done";
                                           re-minted fresh on every call, §9)
@@ -205,15 +243,24 @@ Every fetched input is downloaded to the worker's scratch dir, **then immediatel
 
 Also unnumbered, for the same reason the architecture diagram is — this elaborates on pipeline steps referenced by name from §6, not the other way around.
 
-### Two paths to the same output shape
+### Segment first, in whole-video mode: turning one recording into steps
 
-Whichever path resolves a step's clicks, it produces the same thing: `render_inputs.clicks_json`, an array of `{ x, y, t_ms, label? }` in the *source clip's own pixel coordinates and timeline* — never normalized-resolution coordinates, and never guessed twice (§3's `resolved_key` rule for fetches applies here too: once resolved, a retry reuses it rather than re-detecting).
+Whole-video mode has no `render_inputs` rows at request time — only `render_click_events`, ordered by `t_ms` against the one source recording. Segment creates the step rows before Detect ever runs, using the same trim primitive `tasks/export.ts` already uses (`cutSegment`), just choosing different cut points:
 
-1. **Primary — caller-supplied.** The `POST /v1/renders` body carries `clicks` inline per input (§4) — zero fetches, zero model calls, zero latency, and it's simply correct, because it came from whatever recorded the click in the first place (most screen-capture tooling already knows exactly where the cursor was). This is the expected path for an integrated caller and costs nothing beyond the request itself.
-2. **Fallback — vision model on change-frames.** When `clicks` is omitted for a step, the worker can't afford to send every frame of even a short GIF to a vision model — cost and latency both scale with frame count, and most frames of a click recording are visually identical to the one before it. So it first finds the *few* frames worth looking at:
-   * Decode the GIF/clip to frames and score consecutive-frame difference (ffmpeg's `select='gt(scene,…)'` or an equivalent pixel-diff pass) to find the handful of moments where the screen actually changed — a click recording is mostly stillness punctuated by a few real transitions.
-   * Send just those candidate frames (capped — see §8) to a vision-capable model, one call per step, asking for click coordinates and a short action description, structured the same way `domain/lessons.ts` already asks GPT-5.5 for structured JSON rather than free text.
-   * The response becomes `clicks_json` (`clicks_source = 'vision_llm'` recorded alongside it, distinct from `'caller'`, so a later audit or re-run policy can tell which steps were guessed).
+* **Boundaries are the midpoints between consecutive clicks**, not a fixed window around each click. Step *i* spans from `midpoint(click[i-1], click[i])` to `midpoint(click[i], click[i+1])`, with the first step starting at `t=0` and the last ending at the recording's probed duration. This guarantees non-overlapping, gapless steps by construction — no lead/trail constant to tune, and no special-casing two clicks that happen close together.
+* **Timestamps get rebased.** `render_click_events.t_ms` is a position in the *whole recording's* timeline; the moment Segment cuts a step out, that click's effective time becomes `t_ms − step_start_ms`. `render_inputs.clicks_json` always stores the rebased, step-relative time — the same discipline §6's "Normalize" note applies to coordinates (transform once, at the boundary, never carry the untransformed value forward). A step with no click inside it at all can't occur by construction, since every step is built *around* exactly one click event.
+* Each cut step is uploaded to storage as `render_inputs.resolved_key`, same as a fetched clips-mode input — from here on, Detect/Normalize/Annotate/Brand/Concat treat a whole-video step and a clips-mode input identically. This is why the pipeline downstream of Segment is mode-agnostic: it only ever sees `render_inputs` rows.
+
+### Three tiers to resolve a step's caption and click data
+
+Whichever tier resolves a step's click, it lands in the same place: `render_inputs.clicks_json`, in that step's own pixel/time space (never guessed twice — §3's `resolved_key` rule for fetches applies here too).
+
+1. **Tier 1 — extension DOM metadata (whole-video mode's normal case).** A click event with `element_text`/`selector` populated needs no model call at all: the caption is built directly from what was actually clicked ("Click **Save**"), and it's exactly correct because it came from the DOM, not a guess about pixels. This is the expected path once the extension change lands, and it costs nothing beyond the request itself.
+2. **Tier 2 — coordinates only, no label.** A click event (extension or caller-supplied, clips mode) that has `x`/`y`/`t_ms` but no usable `element_text` (a canvas, an icon button with no accessible name, a cross-origin iframe the content script can't read into) has *where*, just not *what*. Good enough to drive the highlight and zoom; the caption falls through to tier 3 for wording.
+3. **Tier 3 — vision model on change-frames.** Only reached when a step has no usable label (tier 2) or no click data at all (a clips-mode input with no `clicks` supplied). The worker can't afford to send every frame of even a short clip to a vision model — cost and latency both scale with frame count, and most frames of a click recording are visually identical to the one before it — so it first finds the *few* frames worth looking at:
+   * Decode the clip to frames and score consecutive-frame difference (ffmpeg's `select='gt(scene,…)'` or an equivalent pixel-diff pass) to find the handful of moments where the screen actually changed.
+   * Send just those candidate frames (capped — see §8) to a vision-capable model, one call per step, asking for click coordinates (when tier 2 didn't already have them) and a short action description, structured the same way `domain/lessons.ts` already asks GPT-5.5 for structured JSON rather than free text.
+   * The response fills in `clicks_json`/`caption` (`clicks_source = 'vision_llm'`, distinct from `'extension_dom'`/`'caller'`, so a later audit or re-run policy can tell which steps were guessed).
 
 ### Why coordinates have to travel through Normalize, not around it
 
@@ -223,7 +270,7 @@ A click at `(840, 512)` means nothing once the clip has been scaled and padded t
 
 * **Highlight** — an animated ring/pulse centered on the (transformed) click point, timed to the click's `t_ms`: fade in, hold, fade out over roughly half a second. Color comes from the render's own `render_templates.brand_primary_hex` — the highlight is brand-colored by construction, not a hardcoded accent, which is also why no new template column is needed for it.
 * **Zoom** — a brief punch-in (`zoompan` or a scale+crop pair) centered on the click point for roughly a second either side of `t_ms`, then back to the full frame. Skipped for a step with no detected click at all (a plain establishing clip with no interaction) rather than zooming into nothing.
-* **Caption** — on-screen `drawtext`, positioned bottom-center by default, showing either the caller-supplied `render_inputs.caption` or the vision model's action description when the fallback path produced one. This is a **burned-in text overlay for R5**, not narrated audio — an auto-narrated version is a natural extension once TTS is wired in (it would reuse the exact `adelay`/`volume`/`amix` mixing shape §6's voiceover step already salvaged from `ffmpeg-server`), but that's left open (§11) rather than assumed.
+* **Caption** — on-screen `drawtext`, positioned bottom-center by default, showing `render_inputs.caption` however it was resolved: built from the extension's `element_text` (tier 1), the vision model's action description (tier 3), or the caller's own `caption` field in clips mode. This is a **burned-in text overlay**, not narrated audio — an auto-narrated version is a natural extension once TTS is wired in (it would reuse the exact `adelay`/`volume`/`amix` mixing shape §6's voiceover step already salvaged from `ffmpeg-server`), but that's left open (§11) rather than assumed.
 
 All three run against the *normalized* per-step clip, before Brand overlay and before Concat — so the intro and outro, which aren't steps and carry no click data, are never touched by this stage.
 
@@ -232,14 +279,15 @@ All three run against the *normalized* per-step clip, before Brand overlay and b
 Mirrors `tasks/export.ts`'s claim → encode → finalize shape:
 
 1. **Claim**: `queued → running`, guarded by `status = 'queued'` (same race the export job guards against).
-2. **Fetch**: each `render_inputs` row with `source_kind = 'url'` and no `resolved_key` goes through the SSRF-safe fetcher (§5) and lands in storage; `storage_key` inputs (already-uploaded assets) are used as-is.
-3. **Detect**: resolve each step's `clicks_json` — caller-supplied inline data if present, otherwise the change-frame-extraction-then-vision-model fallback ("Click detection & step annotation" above). Skipped entirely, at zero cost, for any input that already came with `clicks`.
-4. **Normalize**: unlike `cutSegment`'s outputs, these files can arrive in any resolution, fps, or codec. Each input (and the intro/outro) is scaled+padded to the template's `target_width`/`target_height`/`target_fps` and re-encoded to a fixed `libx264`/`aac` profile — this step is why concat can't just reuse `concatVideos` on the raw inputs. `concatVideos`'s stream-copy concat *is* still the right tool once every part shares one profile, so this step feeds it, doesn't replace it. The same scale/pad transform computed here is what turns `Detect`'s source-space click coordinates into target-space ones (see above).
-5. **Annotate**: per detected click, burn in the highlight ring, the zoom punch-in, and the step caption (all detailed above) onto the normalized step clip. The intro and outro pass through untouched — they aren't steps and carry no click data.
-6. **Brand overlay**: `drawbox`/`overlay` filters burn in the color bar and logo from the template onto the annotated clips (not the intro/outro, which are the org's own pre-made assets).
-7. **Concat**: intro + normalized clips (in `sort_order`) + outro, via the existing `concatVideos`.
-8. **Voiceover** (if present): a second `ffmpeg` pass, `-map` to either replace the concatenated file's audio track entirely (`replace`) or mix it under the original at a fixed ducked level (`duck`) — one filter graph, chosen by `voiceover_mode`. `duck` reuses a filter-graph shape salvaged from an earlier Node/Express prototype (`ffmpeg-server`, previously deployed on Render — see §11): per-track `adelay=<ms>|<ms>,volume=<n>dB`, then `amix=inputs=N:duration=longest`. That prototype otherwise contributes nothing else here (§11) — no auth, no SSRF defense on its own URL fetcher, Cloudinary instead of our own storage — and is being retired rather than deployed anywhere, DO included.
-9. **Upload + finalize**: same as `tasks/export.ts` — upload, record `size_bytes`, set `download_expires_at`, write `done`/`failed`, and on `callback_url` presence, enqueue a webhook delivery (§7). Cancellation checked between every ffmpeg invocation exactly as the export job does.
+2. **Fetch**: in whole-video mode, the one source recording goes through the SSRF-safe fetcher (§5); in clips mode, each `render_inputs` row with `source_kind = 'url'` and no `resolved_key` does. `storage_key` sources (already-uploaded assets) are used as-is either way.
+3. **Segment** (whole-video mode only): cut the fetched recording into one `render_inputs` row per click event, at click-midpoint boundaries, via `cutSegment` — see "Segment first, in whole-video mode" above. Skipped entirely in clips mode, where `render_inputs` rows already exist from the request.
+4. **Detect**: resolve each step's `clicks_json`/`caption` via the three-tier order — extension DOM text, then coordinates-only, then the vision-model fallback ("Click detection & step annotation" above). Tier 1 is free; only tier 3 costs a model call.
+6. **Normalize**: unlike `cutSegment`'s outputs, these files can arrive in any resolution, fps, or codec. Each input (and the intro/outro) is scaled+padded to the template's `target_width`/`target_height`/`target_fps` and re-encoded to a fixed `libx264`/`aac` profile — this step is why concat can't just reuse `concatVideos` on the raw inputs. `concatVideos`'s stream-copy concat *is* still the right tool once every part shares one profile, so this step feeds it, doesn't replace it. The same scale/pad transform computed here is what turns `Detect`'s source-space click coordinates into target-space ones (see above).
+7. **Annotate**: per detected click, burn in the highlight ring, the zoom punch-in, and the step caption (all detailed above) onto the normalized step clip. The intro and outro pass through untouched — they aren't steps and carry no click data.
+8. **Brand overlay**: `drawbox`/`overlay` filters burn in the color bar and logo from the template onto the annotated clips (not the intro/outro, which are the org's own pre-made assets).
+9. **Concat**: intro + normalized clips (in `sort_order`) + outro, via the existing `concatVideos`.
+10. **Voiceover** (if present): a second `ffmpeg` pass, `-map` to either replace the concatenated file's audio track entirely (`replace`) or mix it under the original at a fixed ducked level (`duck`) — one filter graph, chosen by `voiceover_mode`. `duck` reuses a filter-graph shape salvaged from an earlier Node/Express prototype (`ffmpeg-server`, previously deployed on Render — see §11): per-track `adelay=<ms>|<ms>,volume=<n>dB`, then `amix=inputs=N:duration=longest`. That prototype otherwise contributes nothing else here (§11) — no auth, no SSRF defense on its own URL fetcher, Cloudinary instead of our own storage — and is being retired rather than deployed anywhere, DO included.
+11. **Upload + finalize**: same as `tasks/export.ts` — upload, record `size_bytes`, set `download_expires_at`, write `done`/`failed`, and on `callback_url` presence, enqueue a webhook delivery (§7). Cancellation checked between every ffmpeg invocation exactly as the export job does.
 
 ## 7. Progress & completion delivery
 
@@ -252,6 +300,7 @@ Mirrors `tasks/export.ts`'s claim → encode → finalize shape:
 * New metered kind in `usage_events`: `render_output_seconds` — the finished output's duration, recorded once on success (mirrors `TRANSCRIPTION_SECONDS`'s "record what actually happened, after the fact" rule in `quota.ts`).
 * A second new metered kind: `vision_frames_analyzed` — one unit per still frame actually sent to the vision model in the Detect fallback (§6). Only the fallback path writes it; a render where every step arrived with `clicks` already resolved records zero. This is the one place in this feature where per-render cost is caller-input-dependent rather than a flat function of output duration, so it needs its own ceiling, not a share of `render_output_seconds`.
 * A hard per-render frame cap (a fixed number, not an org setting) on how many change-frames Detect will send per step and in total — the backstop against a single noisy or long GIF blowing past any monthly minutes ceiling in one call, independent of what the org's usage looks like that month.
+* A hard cap on `render_click_events` per job, too, in whole-video mode — since each click event becomes one Segment cut and one `render_inputs` row, an unbounded click log is an unbounded step count, not just an unbounded frame count.
 * New `org_settings` columns, same nullable-override shape as the existing ones: `render_minutes_limit`, `vision_frames_limit`, and reuse `storage_bytes_limit` / `max_active_jobs` as-is — a render job is one more thing counted by `activeJobCount` and one more thing whose output counts against storage.
 * `assertCanRender()` alongside `assertCanExport()`: suspended check, active-job cap, storage headroom, plus the new monthly minutes and vision-frame ceilings.
 * Rate limiting (`http/rate-limit.ts`) needs a second key function: today's `consume(...)` buckets are keyed by `userId`, which doesn't exist on an API-key request. Same buckets, keyed by `keyId` instead — `POST /v1/renders` and `POST /v1/templates` join the `EXPENSIVE` bucket's path list.
@@ -264,9 +313,10 @@ Same answer as `exports.ts`'s download URL: a presigned GET, not a permanently p
 
 * **R1** — `api_keys` table + `requireApiKey`, key management routes behind session auth. No render logic yet; provable with a `GET /v1/whoami`-style smoke route.
 * **R2** — `render_templates` CRUD, reusing the existing presigned-upload flow for intro/outro/logo assets.
-* **R3** — `render_jobs`/`render_inputs`, the SSRF-safe fetcher as its own tested module, `tasks/render.ts` without voiceover, brand overlay, or click annotation — prove clip-concat-with-intro-outro end to end first.
+* **R3** — `render_jobs`/`render_inputs` (clips mode only), the SSRF-safe fetcher as its own tested module, `tasks/render.ts` without voiceover, brand overlay, or click annotation — prove clip-concat-with-intro-outro end to end first.
 * **R4** — voiceover mixing, brand color/logo overlay, webhook delivery, quotas wired in.
-* **R5** — click detection and annotation: caller-supplied `clicks_json` (primary path) driving highlight + zoom + caption first, since it's zero-cost and validates the Annotate filter graphs against real coordinates; the change-frame-extraction + vision-model fallback layered in after, since it's the harder and more expensive half.
+* **R5** — whole-video mode: `render_click_events`, the Segment stage (reusing `cutSegment`), and Detect's tier 1 (extension DOM text) driving highlight + zoom + caption. This is the actual target use case — a caller with an instrumented recorder gets a complete walkthrough with no vision-model call anywhere in the path.
+* **R6** — Detect's tiers 2–3: coordinates-only handling and the change-frame-extraction + vision-model fallback, for clips-mode callers and for whole-video clicks the extension couldn't label. Sequenced after R5 deliberately — it's the harder, more expensive half, and R5 alone already serves the primary caller.
 
 ## 11. Decisions
 
@@ -287,6 +337,10 @@ Same answer as `exports.ts`'s download URL: a presigned GET, not a permanently p
 | Caption is a burned-in on-screen `drawtext`, not TTS narration, for R5 | Auto-narrating the caption via TTS immediately | Keeps R5 to one new capability (visual annotation) instead of two; narration is a near-term extension that reuses the voiceover step's existing mixing math once wanted (§11, Open) |
 | v1 assumes the caller supplies steps pre-ordered | Inferring step order from clip content | Matching UI state across unordered clips to reconstruct a workflow is a materially harder and more speculative problem than anything else in this plan — worth scoping on its own once ordered input is working, not bundled into the first version |
 | Highlight ring color comes from `render_templates.brand_primary_hex`, no new template column | A dedicated `highlight_color` field | One brand color already exists per template; a walkthrough's highlight *is* the brand accent, and a second color field would just be a way for the two to drift apart |
+| Whole-video mode (one recording + a click-event log) as the primary/recommended request shape, clips mode kept as secondary | Requiring every caller to pre-cut into per-step clips | The actual recorder is a Chrome extension producing one continuous capture; requiring it to pre-cut would push ffmpeg work onto the caller that `cutSegment` already does for free server-side. Clips mode stays for callers without that kind of recorder |
+| Segment cuts at the midpoint between consecutive click timestamps | A fixed lead/trail window around each click | Midpoint boundaries are non-overlapping and gapless by construction — pure arithmetic, no tunable constant, and no special-casing two clicks that land close together |
+| Extension-captured DOM `element_text`/`selector` promoted to tier 1 of click detection, ahead of both plain coordinates and the vision-model fallback | Treating every caller-supplied click the same regardless of whether it carries a semantic label | "Click **Save**" read straight from the DOM is strictly more accurate than anything inferred from pixels, and — now that the extension can capture it — costs nothing extra to include |
+| `render_click_events` as its own dedicated table, not a `jsonb` column on `render_jobs` | `render_jobs.raw_clicks_json` | Matches this codebase's existing convention (`transcript_segments`/`lesson_segments` are dedicated tables, not blobs) and lets Segment order and query click events with plain SQL |
 
 ### Open
 
@@ -298,5 +352,7 @@ Same answer as `exports.ts`'s download URL: a presigned GET, not a permanently p
 | Max clip count / max total input duration per render | Needs a number before R3 ships, not before this plan is agreed on |
 | Whether non-MP4 output formats are ever needed | Out of scope until asked for; one format keeps the normalize step (§6) simple |
 | Auto-narrating captions via TTS, once wanted | Reuse the voiceover step's `adelay`/`volume`/`amix` mixing (§6) with the generated speech clip as just another voiceover input — no new mixing code, only a TTS call ahead of it |
-| Exact frame cap for the vision-model fallback, and the per-frame/per-render cost this implies | Needs a real number (and a look at actual GPT vision pricing against typical GIF lengths) before R5's fallback half ships — the caller-supplied path (R5's first half) doesn't depend on this |
+| Exact frame cap for the vision-model fallback, and the per-frame/per-render cost this implies | Needs a real number (and a look at actual GPT vision pricing against typical GIF lengths) before R6 ships — R5's extension-DOM path doesn't depend on this |
 | Whether `clicks_source = 'vision_llm'` steps should ever be shown back to the caller for confirmation before rendering | Open — a guessed click could be visibly wrong in a way a caller would want to catch before spending render minutes on it; adds a review round-trip this plan doesn't currently have |
+| The Chrome extension change itself (emitting `t_ms`/`x`/`y`/`selector`/`element_text`/`tag_name` per click, alongside the existing recording-upload flow) | Confirmed feasible ("minor changes") but not yet scoped as its own piece of work — this plan assumes the log format above; the extension-side implementation is a separate task this doc doesn't cover |
+| What happens to a step whose click landed on a generic/unlabeled element (tier 2: coordinates but no `element_text`) when the caller hasn't enabled the vision fallback at all | Leaning: render it with highlight + zoom but a generic caption ("Step 3") rather than blocking the whole render on a missing label |
