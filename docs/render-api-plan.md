@@ -1,14 +1,19 @@
-# CourseCut Render API — R&D Plan
+# CourseCut Walkthrough API — R&D Plan
 
 ## 0. Scope
 
-A new public, programmatic API — separate from the org-member web UI — that lets a registered developer submit a set of video clips (or one whole video), each identified by a URL, and get back a single merged MP4: their clips assembled in order, wrapped in their org's intro/outro, carrying their brand colors, with an optional voiceover track. The response is a hosted URL to the finished file, with progress reported in between.
+A new public, programmatic API — separate from the org-member web UI — that turns one uploaded screen recording, narrated in the caller's own voice, into a polished step-by-step product walkthrough video: intro, one clip per step (cut precisely at the moment each step's action happens, not just wherever the narration lands), an optional title card per step, the org's brand, and an outro. The response is a hosted URL to the finished file, with progress reported in between.
 
-**The driving use case is product walkthrough videos, recorded by a Chrome extension.** The extension records one continuous screen capture of a workflow, uploads the whole video to the caller's own storage, and — because it can also read the DOM — logs every click as it happens: coordinates, timestamp, and the clicked element's text/selector/tag ("clicked the button labeled 'Save'"). The caller's request to this API is that one video URL plus that ordered click log. Nothing is pre-cut, nothing is pre-captioned by hand — the API segments the recording at the clicks, and because the extension already knows *what* was clicked, most captions are exact rather than guessed. A secondary mode still accepts pre-cut clips for callers without that kind of recorder (§2.3). See "Click detection & step annotation" for the full detail on both modes.
+**This is deliberately "coursecut style."** The caller doesn't hand over pre-cut clips, click coordinates, or a DOM event log — they upload one video, the same way a video reaches this codebase everywhere else, and the *existing* transcription-and-analysis pipeline does the actual work of finding the steps:
 
-This is **not** the lesson-extraction product (upload → transcribe → AI-split into lessons → export). It shares no domain concept with `videos`/`lessons`/`transcript_segments`. What it shares is infrastructure: the same Postgres, the same `graphile-worker` queue, the same object store, the same `ffmpeg` wrapper module — because `apps/api` and `apps/worker` already are a general-purpose "queue a job, encode with ffmpeg, land the output in object storage" system, and this is a second job kind for it, not a second system.
+* **Extract + transcribe** (unmodified `extract`/`transcribe` jobs) turn the narration into text, exactly as for a lecture.
+* **Analyze** (unmodified `analyze` job, same GPT-5.5 call `domain/lessons.ts` already makes) finds the step boundaries from that transcript. A "step" *is* a `lessons` row — same table, same AI call, same per-org `analysisInstructions` knob already used to steer the prompt — just read as "steps in a task" instead of "topics in a lecture." No new prompt-writing, no new table.
+* A new **Refine** stage exists because narration timing and action timing don't coincide — someone says "now I'll click Save" a beat before or after actually clicking it. Refine snaps each transcript-derived boundary to the nearest real visual transition in a *narrow* local window of video around it (a few seconds, not the whole recording), so the cut lands on the actual action.
+* A new **Assemble** stage cuts each step at its refined boundary (reusing the exact `cutSegment`/`concatVideos` primitives `tasks/export.ts` already uses), stitches them with the org's intro/outro and brand, and uploads the result.
 
-Video for this feature reaches OpenAI **only conditionally, and only as still frames.** When a caller supplies click coordinates directly (the primary path — see below), nothing leaves for OpenAI at all. When they don't, a handful of extracted still frames per clip go to a vision model to locate the click — never the GIF itself, never audio. That's a narrower version of the same rule `coursecut-privacy-invariants` states for the lesson product (least data that leaves, and only ever to the one vendor), not an exception to it. What this feature *does* introduce, that nothing else in the codebase does, is **the server fetching a URL the caller supplied.** §5 is why that's the section to read most carefully before building anything here.
+This supersedes an earlier design in this same doc that used a Chrome extension to log click coordinates and DOM element text, with a vision-model fallback for anything unlabeled. That approach is preserved in §11 ("Superseded") for the record, not because it was wrong, but because this one gets a *better* signal (a human explaining intent, not a click's raw coordinates) out of a pipeline that already exists and is already paid for, at the cost of one narrow new job kind instead of a whole detection subsystem and an unscoped extension dependency.
+
+Privacy is now the same rule as the rest of the product, not a narrower version of it: only extracted audio and transcript text ever reach OpenAI (`coursecut-privacy-invariants`, unchanged). The one narrow exception is a rare vision-model tiebreaker inside Refine, covered in its own section below, and it is the exception, not the routine path.
 
 ## Architecture diagram
 
@@ -16,17 +21,15 @@ Unnumbered deliberately, so it never has to shift if a numbered section above it
 
 ```mermaid
 flowchart TB
-    Ext["Chrome extension<br/>records session, logs clicks<br/>(coords + timestamp + DOM text/selector)"]
     Dev["Caller's backend<br/>(registered developer)"]
     Hook["Caller's callback_url<br/>(optional webhook receiver)"]
-    SrcVid["Whole recording<br/>(caller's own hosting — DO Spaces or anywhere https)"]
-    Clips["Pre-cut step clips<br/>(secondary mode, no extension)"]
-    VO["Voiceover URL<br/>(optional)"]
-    OpenAI(["OpenAI — vision model<br/>(rare fallback: no DOM text for a click)"])
+    OpenAIT["OpenAI — Whisper + GPT-5.5<br/>(existing transcript/analysis calls)"]
+    OpenAIV(["OpenAI — vision model<br/>(rare: Refine tiebreaker only)"])
 
     subgraph API["apps/api (Hono)"]
         Auth["requireApiKey<br/>hash lookup → org_id"]
-        RRoutes["POST /v1/renders<br/>GET /v1/renders/:id<br/>POST /v1/renders/:id/cancel"]
+        UpRoutes["POST /v1/videos/uploads<br/>(existing upload logic,<br/>API-key-authed)"]
+        WRoutes["POST /v1/walkthroughs<br/>GET /v1/walkthroughs/:id<br/>GET /v1/walkthroughs/:id/steps"]
         TRoutes["/v1/templates CRUD"]
         KRoutes["/v1/api-keys<br/>(session-authed, not API-key-authed)"]
     end
@@ -34,79 +37,73 @@ flowchart TB
     subgraph PG["Postgres — RLS, org_id-scoped"]
         Tk[("api_keys")]
         Tpl[("render_templates")]
-        RJ[("render_jobs")]
-        RCE[("render_click_events<br/>(whole-video mode only)")]
-        RI[("render_inputs<br/>(one row per step, either mode)")]
+        Vid[("videos / transcript_segments<br/>(existing, unmodified)")]
+        Les[("lessons / lesson_segments<br/>= steps (existing, unmodified)")]
+        WJ[("walkthrough_jobs")]
+        WJS[("walkthrough_job_steps<br/>(lesson_id, refined start/end)")]
         GW[("graphile_worker<br/>queue tables")]
     end
 
-    subgraph Worker["apps/worker — tasks/render.ts"]
+    subgraph VideoPipeline["apps/worker — existing video pipeline, unmodified"]
+        Ex["extract"]
+        Tr["transcribe"]
+        An["analyze"]
+    end
+
+    subgraph WTask["apps/worker — tasks/walkthrough.ts (new)"]
         Claim["Claim: queued → running"]
-        Fetch["SSRF-safe fetcher<br/>block private/link-local IPs,<br/>re-validate every redirect,<br/>cap size + timeout"]
-        Seg["Segment (whole-video mode only)<br/>cut at click-midpoint boundaries,<br/>reuses cutSegment"]
-        Detect["Detect clicks per step<br/>tier 1: extension DOM text/selector<br/>tier 2: caller coords only<br/>tier 3: change-frames → vision model"]
-        Norm["Normalize each input to<br/>template's width/height/fps<br/>(click coords rescaled in lockstep)"]
-        Annot["Annotate: highlight ring,<br/>zoom/crop punch-in, step caption<br/>— per click, per step"]
-        Brand["Brand overlay<br/>drawbox + logo"]
-        Concat["Concat: intro + clips + outro<br/>(stream-copy, uniform profile)"]
-        VMix["Voiceover mix: replace or duck<br/>(adelay / volume / amix —<br/>salvaged from the retired<br/>ffmpeg-server prototype)"]
+        Refine["Refine: snap each step boundary<br/>to the nearest real visual transition<br/>in a narrow local window"]
+        Cut["Cut each step at its refined range<br/>(cutSegment, same primitive export uses)"]
+        Assemble["Assemble: intro + steps + outro<br/>(concatVideos) + brand + title cards"]
         Fin["Finalize: upload, size_bytes,<br/>download_expires_at, done/failed"]
         Web["Webhook sender<br/>HMAC-signed, few retries"]
     end
 
     subgraph Store["Object storage — R2 / DO Spaces (storage.ts)"]
-        Assets[("Template assets:<br/>intro / outro / logo")]
-        Resolved[("Resolved inputs<br/>(fetched once, reused on retry)")]
+        Assets[("Template assets: intro / outro / logo")]
         Output[("output.mp4")]
     end
 
-    Ext -- "video URL + ordered click log" --> Dev
-    Dev -- "Bearer API key" --> Auth --> RRoutes
+    Dev -- "Bearer API key" --> Auth
+    Auth --> UpRoutes --> Vid
+    Auth --> WRoutes
     Auth --> TRoutes
     Dev -- "session cookie, org admin" --> KRoutes
 
-    RRoutes -- "whole-video mode:<br/>insert + enqueue" --> RJ --> RCE
-    RRoutes -- "clips mode:<br/>insert + enqueue" --> RI
-    RRoutes --> GW
-    TRoutes --> Tpl
-    KRoutes --> Tk
+    WRoutes -- "insert walkthrough_jobs;<br/>queue extract if not already done" --> WJ
+    WRoutes --> Ex
+    Ex --> Tr --> An
+    An -- "writes lessons/lesson_segments" --> Les
+    An -. "one new link: if a walkthrough_jobs<br/>row is pending for this video,<br/>queue the walkthrough task" .-> Claim
+    An <-. "audio / transcript text only" .-> OpenAIT
 
-    GW -- "picks up render task" --> Claim --> Fetch
-    Fetch -. "validated GET" .-> SrcVid
-    Fetch -. "validated GET" .-> Clips
-    Fetch -. "validated GET" .-> VO
-    Fetch --> Resolved
-    Tpl -. "read" .-> Claim
-    RCE -. "ordered click log" .-> Seg
-    Resolved --> Seg
-    Seg -- "one cut per step" --> RI
-    RI --> Detect
-    Detect -. "only when a click has<br/>no usable DOM text" .-> OpenAI
-    Detect --> Norm
-    Assets --> Norm
-    Norm --> Annot --> Brand --> Concat --> VMix --> Fin
-    Fin --> Output
-    Fin -- "status + progress" --> RJ
-    Fin --> Web
-    Web -- "POST result" --> Hook
+    GW -. "queues" .-> Ex
+    GW -. "queues" .-> Claim
 
-    Dev -- "poll GET /v1/renders/:id" --> RRoutes
-    Output -. "fresh presigned URL, minted per call" .-> RRoutes
-    RRoutes -.-> Dev
+    Les --> Refine
+    Refine -. "only if a local window<br/>is genuinely ambiguous" .-> OpenAIV
+    Refine --> WJS
+    WJS --> Cut --> Assemble
+    Assets --> Assemble
+    Assemble --> Fin --> Output
+    Fin -- "status + progress" --> WJ
+    Fin --> Web --> Hook
+
+    Dev -- "poll GET /v1/walkthroughs/:id" --> WRoutes
+    Output -. "fresh presigned URL, minted per call" .-> WRoutes
+    WRoutes -.-> Dev
 ```
 
 ## 1. Why this is cheap
 
-Reuse, concretely:
+Reuse, concretely — and this design reuses more of the existing product than the superseded one did:
 
-* **Auth/tenancy** — an org is still the tenant; RLS, `withOrg()`, and the `org_id`-on-every-row + composite-FK convention (`db/schema.ts`) carry over unchanged. The only new piece is *how* a request identifies its org when there's no browser session (§2.1).
-* **Queue** — `graphile-worker`, `jobs` as the tenant-visible projection, `job_key` idempotency, `apps/worker`'s claim → run → finalize shape (`tasks/export.ts`) — copied, not reinvented, for the new `render` job kind.
-* **Storage** — `storage.ts` stays the only file that talks S3. Output keys follow the existing convention: `{org}/renders/{render_id}/output.mp4`.
-* **ffmpeg** — `probeDuration`, `concatVideos` already exist. What's new is normalizing heterogeneous *caller-supplied* inputs to a common codec/resolution before concat (§6) — `cutSegment`'s outputs never needed this because they all came from the same tool with the same settings.
-* **Quotas** — same `org_settings` + `usage_events` shape (`quota.ts`), one more metered kind.
-* **OpenAI access** — `openai.ts` already holds the one platform key and the one client this codebase talks to GPT through; the vision-model fallback (see "Click detection & step annotation") is a new *call shape* (images in, structured JSON out, same discipline `domain/lessons.ts` already follows) against infrastructure that exists, not a new integration.
+* **The entire video pipeline** — `extract`, `transcribe`, `analyze`, the `videos`/`transcript_segments`/`lessons`/`lesson_segments` tables, the per-org `analysisInstructions` prompt knob, the content-hash transcript cache — all unmodified. A "step" is a `lessons` row; nothing about that table, its AI call, or its RLS policy changes.
+* **ffmpeg primitives** — `probeDuration`, `cutSegment`, `concatVideos` (`ffmpeg.ts`) reused directly by the new `walkthrough` task, the same way `tasks/export.ts` already uses them for a multi-segment lesson export.
+* **Upload** — the exact presigned-PUT flow `routes/videos.ts` already implements (`POST /projects/:id/uploads` → PUT to storage → `POST /videos/:id/complete`) is exposed under API-key auth instead of session auth; the underlying ticket-minting/completion logic isn't duplicated (§4).
+* **Auth/tenancy, queue, storage, quotas** — same as the superseded design: RLS + `withOrg()`, `graphile-worker` + `jobs` projection, `storage.ts` as the only S3-talking file, `org_settings` + `usage_events`.
 
-What's genuinely new: API keys, brand templates, the render job's own tables, an outbound URL fetcher that has to defend itself, a webhook sender, and the click-detection/annotation stage.
+What's genuinely new: API keys, brand templates, the `walkthrough_jobs`/`walkthrough_job_steps` tables, the Refine stage's local scene-detection + rare vision tiebreaker, the Assemble stage, a webhook sender, and **one small piece of orchestration glue**: `analyze`'s success handler gains one more responsibility — if the video has a pending `walkthrough_jobs` row, queue the `walkthrough` task next. That's the one new link in an otherwise unmodified chain, and it's worth naming rather than glossing over as free reuse.
 
 ## 2. New surfaces
 
@@ -124,20 +121,16 @@ Checked before assuming otherwise: **`better-auth` (installed `1.6.25`, and curr
 
 An org sets this up once, not on every call:
 
-* Intro clip, outro clip (object keys, uploaded the same presigned-PUT way `videos` are today — no new upload mechanism).
-* Brand colors (primary/secondary, hex) — burned in as a lower-third bar / title-card accent via `ffmpeg`'s `drawbox`, not as a vague "theme."
-* Optional logo image (PNG, object key) — overlaid at a fixed corner.
-* Optional default voiceover mix behavior: `replace` (voiceover becomes the whole track) or `duck` (original audio ducked under it). Per-render can override.
-* Target output spec: resolution + fps + container, since every input clip has to be normalized to *something* before concat (§6) — this is where that "something" is declared once per org instead of guessed per render.
+* Intro clip, outro clip (object keys, uploaded the same presigned-PUT way as everything else — no new upload mechanism).
+* Brand colors (primary/secondary, hex) and an optional logo (PNG, object key), used for a per-step title card and a corner watermark.
+* `voiceover_mode` default `'none'` — the caller's own narration, already in the source recording, *is* the walkthrough's voiceover. This exists as an override for a caller who later wants to replace or duck their narration under a different track, not as something the primary flow needs.
+* Target output spec: resolution + fps + container, used only to normalize the intro/outro (separate pre-made assets) to match the source recording — the step clips themselves need no normalizing (§6).
 
-### 2.3 Render jobs — the actual unit of work
+### 2.3 Walkthrough jobs — the actual unit of work
 
-A render job runs in one of two modes:
+A walkthrough job takes a `video_id` (from an upload made via §2.1's auth, or an already-uploaded video), a `template_id`, and an optional `callback_url`. It drives the *existing* video pipeline to completion if it hasn't run yet (extract → transcribe → analyze), then runs the new `walkthrough` task (Refine → cut → assemble → upload), and reports status the same way an export does (`queued → running → done|failed`), plus a progress fraction.
 
-* **Whole-video mode (primary/recommended)** — one recording (URL or object key) plus an ordered click-event log (`t_ms`, `x`, `y`, and, from a DOM-aware recorder, `selector`/`element_text`/`tag_name`). The API segments the recording into steps itself (§6, "Segment") — the caller does no cutting.
-* **Clips mode (secondary)** — an ordered list of pre-cut inputs (each a URL or a previously-uploaded object key), for a caller whose recorder can't produce a click log.
-
-Either way the job also takes a `template_id`, an optional voiceover input, and an optional `callback_url`, produces one output file, and reports status the same way an export does (`queued → running → done|failed`), plus a progress fraction.
+Videos created through this API attach to a **singleton `_api` project**, auto-created per org on first use. An API caller has no notion of "projects" — that's a web-UI organizing concept — so this exists purely to satisfy `videos.project_id`'s existing composite FK without a schema change, and the caller never sees or names it.
 
 ## 3. Data model (additive — nothing existing changes)
 
@@ -150,173 +143,131 @@ render_templates
   intro_key, outro_key, logo_key (nullable),
   brand_primary_hex, brand_secondary_hex (nullable),
   target_width, target_height, target_fps,
-  voiceover_mode default ('replace' | 'duck'),
+  voiceover_mode default 'none' ('none' | 'replace' | 'duck'),
   created_at, updated_at
 
-render_jobs
-  id, org_id, template_id,
-  mode ('whole_video'|'clips'),
-  source_kind ('url'|'storage_key', whole_video mode only), source (the URL or key as given),
-  resolved_source_key (nullable — the fetched recording, once downloaded; whole_video mode only),
+walkthrough_jobs
+  id, org_id, video_id, template_id,
   status ('queued'|'running'|'done'|'failed'|'cancelled'), progress (0..1),
   output_key, error,
-  voiceover_key (nullable, resolved object key once fetched),
   callback_url (nullable),
   size_bytes, download_expires_at,
   created_at
 
-render_click_events
-  id, org_id, render_job_id, sort_order,
-  t_ms (position in the whole recording's own timeline, before Segment rebases it),
-  x, y,
-  selector (nullable), element_text (nullable), tag_name (nullable)
-  -- whole_video mode only; empty for a clips-mode job. Ordered by sort_order (== t_ms order).
-  -- What Segment reads to decide step boundaries, and what Detect's tier 1 reads for a caption.
-
-render_inputs
-  id, org_id, render_job_id, sort_order,
-  source_kind ('url'|'storage_key'), source (the URL or key as given, clips mode only —
-    whole_video mode rows are created by Segment, not by the request),
-  resolved_key (nullable — the step's own clip, once fetched (clips mode) or cut (whole_video
-    mode); makes a retry not re-fetch or re-cut),
-  clicks_json (nullable jsonb — array of { x, y, t_ms, selector?, element_text?, tag_name? } in
-    this step's own pixel/time space, i.e. already rebased off the source recording's timeline
-    for whole_video mode; see "Click detection & step annotation"),
-  clicks_source ('extension_dom'|'caller'|'vision_llm', nullable until Detect resolves it),
-  caption (nullable text — derived from clicks_json's element_text, caller-supplied, or filled in
-    by the vision-model fallback)
+walkthrough_job_steps
+  id, org_id, walkthrough_job_id, lesson_id, sort_order,
+  refined_start, refined_end (doublePrecision — Refine's output; the trim range Assemble
+    actually cuts, distinct from lessons.start/end, see "Why refined bounds live here, not
+    on lessons")
 ```
 
-`render_jobs`/`render_click_events`/`render_inputs`/`render_templates`/`api_keys` join `TENANT_TABLES` (`db/schema.ts`) and get the same RLS policy every other tenant table gets — no exception carved out for "it's an API, not the UI." `render_click_events` as its own table, rather than a jsonb blob on `render_jobs`, matches this codebase's existing convention (`transcript_segments`/`lesson_segments` are dedicated tables, not blobs) and lets Segment order and query them with normal SQL.
+`api_keys`/`render_templates`/`walkthrough_jobs`/`walkthrough_job_steps` join `TENANT_TABLES` (`db/schema.ts`) and get the same RLS policy every other tenant table gets — no exception carved out for "it's an API, not the UI." `videos`/`transcript_segments`/`lessons`/`lesson_segments` need no changes at all; `walkthrough_job_steps.lesson_id` is a plain reference into the existing `lessons` table.
 
-`jobs.kind` gains a `"render"` value alongside `extract`/`transcribe`/`analyze`/`export`, with `jobs.renderId` added the same way `jobs.exportId` exists today (nullable FK, one column per job kind that uses it).
+`jobs.kind` gains a `"walkthrough"` value alongside `extract`/`transcribe`/`analyze`/`export`, with `jobs.walkthroughId` added the same way `jobs.exportId` exists today.
+
+### Why refined bounds live here, not on `lessons`
+
+Refine's output is specific to *this* walkthrough attempt's need for a click-accurate cut. `lessons.start`/`.end` are a cached bound recomputed from `lesson_segments` (`db/schema.ts`'s own comment: "a cached derived bound... recomputed after every segment write") and are read by the ordinary lesson editor UI for a completely different purpose. Writing Refine's snapped boundary into that shared column would be a surprising side effect for anything else reading that video's lessons — so `walkthrough_job_steps` keeps its own copy, and the shared table's semantics stay exactly what the rest of the product already expects.
 
 ## 4. API surface
 
 ```
+POST   /v1/videos/uploads               { filename, size, content_type }
+                                         → { video_id, storage_key, upload: {...} }
+                                         (same ticket-minting logic as
+                                          POST /projects/:id/uploads, minus the
+                                          project param — resolves the singleton
+                                          _api project itself)
+POST   /v1/videos/:id/upload/part-urls  (unchanged from the existing route)
+POST   /v1/videos/:id/complete          (unchanged from the existing route)
+
 POST   /v1/templates                    create a brand template
 GET    /v1/templates/:id                fetch one
 PATCH  /v1/templates/:id                update
 GET    /v1/templates                    list
 
-POST   /v1/renders    Whole-video mode (recommended):
-                       { template_id,
-                         source: { url | storage_key },
-                         clicks: [{ t_ms, x, y, selector?, element_text?, tag_name? }, ...],
-                         voiceover_url?, voiceover_mode?, callback_url? }
-
-                       Clips mode (secondary — no recorder click log available):
-                       { template_id,
-                         inputs: [{ url|storage_key, clicks?: [{x, y, t_ms, label?}],
-                                     caption?: string }, ...],
-                         voiceover_url?, voiceover_mode?, callback_url? }
-
-                       Exactly one of `source`+`clicks` or `inputs` — a request naming both,
-                       or neither, is a 400. → 202, { id, status: "queued" }
-                       (a click missing usable element_text falls to the vision-model tier —
-                        see "Click detection & step annotation")
-GET    /v1/renders/:id                  → { id, status, progress, output_url?, error? }
+POST   /v1/walkthroughs                 { video_id, template_id, callback_url? }
+                                         → 202, { id, status: "queued" }
+GET    /v1/walkthroughs/:id             → { id, status, progress, output_url?, error? }
                                          (output_url present only once status = "done";
                                           re-minted fresh on every call, §9)
-POST   /v1/renders/:id/cancel
+GET    /v1/walkthroughs/:id/steps       → [{ lesson_id, title, summary, start, end }, ...]
+                                         (reads lessons for this job's video — lets a
+                                          caller see what steps were actually found)
+POST   /v1/walkthroughs/:id/cancel
 
 POST   /v1/api-keys   GET /v1/api-keys   DELETE /v1/api-keys/:id      (session-authed, §2.1)
 ```
 
-All under `requireApiKey` except the key-management routes. No SSE endpoint for this API — an external HTTP client polling `GET /v1/renders/:id` or receiving one webhook is a simpler contract than asking every integrator to hold an SSE connection open server-to-server.
+All under `requireApiKey` except the key-management routes. No SSE endpoint for this API — an external HTTP client polling `GET /v1/walkthroughs/:id` or receiving one webhook is a simpler contract than asking every integrator to hold an SSE connection open server-to-server.
 
-## 5. Ingestion & the SSRF problem
+## 5. Ingestion
 
-Every other network call this codebase makes is *outbound to a service we chose* (OpenAI, our own S3-compatible bucket). This feature is the first thing that fetches a URL **a caller chose**, from our infrastructure, before any human looks at it. Treated as what it is — a request forger's dream unless stopped — the fetcher must, before making any request:
+Direct upload (above) is the only ingestion path this plan builds. It reuses existing, already-hardened code — the browser/caller PUTs bytes straight to storage, exactly as today's web app does — so there is no caller-supplied URL for the server to fetch, and no SSRF surface to defend at all for this feature. That's a deliberate simplification from the superseded design, which needed its own SSRF-safe fetcher because its primary path *was* a caller-hosted URL. If a URL-based secondary mode (matching the very first version of this ask — "the video is already hosted on DigitalOcean") is wanted later, the fetcher design from that earlier pass (reject non-https, resolve and reject private/link-local ranges, re-validate every redirect, cap size and timeout) is still the right approach and can be added without touching anything in this version — it just isn't built until something needs it.
 
-1. **Reject non-`https` schemes** outright (no `file://`, `ftp://`, etc.).
-2. **Resolve the hostname and reject private/link-local/loopback ranges** — `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16` (this is the one that reaches DigitalOcean's and every other cloud's metadata endpoint), and IPv6 equivalents. Re-check the resolved IP, not just the hostname string — DNS rebinding means "looked safe when we checked" isn't "is safe when we connect."
-3. **Follow redirects manually, re-validating at each hop** — a URL that resolves safely but 302s to `169.254.169.254` is the same attack one step later. Cap redirect count.
-4. **Cap response size while streaming** (a duration/size ceiling tied to the org's upload quota, `assertCanUpload`'s existing shape) and **cap connect+total timeout** — an org's quota already bounds cost; this bounds a single request from hanging a worker slot.
-5. **No credentials of ours on the outbound request** — no cookies, no auth headers forwarded, plain anonymous GET.
+## Step identification & boundary refinement
 
-This is exactly the shape of check a well-known SSRF-safe-fetch library exists for; writing it by hand invites missing a range. Whatever's used, it lives in one module (`worker/src/fetch-remote.ts`), the same way `storage.ts` is the only file that talks S3 — one place to audit, one place that changes if a new private range needs adding.
+Also unnumbered, for the same reason the architecture diagram is.
 
-Every fetched input is downloaded to the worker's scratch dir, **then immediately uploaded to our own storage** (`render_inputs.resolved_key`) before any ffmpeg step touches it — so a retry re-reads from our bucket, not the caller's URL again, and ffmpeg never runs against a path that came from an unvalidated fetch's redirect chain.
+### Step identification: reuse `analyze`, don't rebuild it
 
-## Click detection & step annotation
+`analyze` already turns a transcript into an ordered list of `{ start, end, title, summary }` rows via one structured GPT-5.5 call (`domain/lessons.ts`). Asked to find "topics in a lecture," it finds lesson boundaries; nothing about the call changes to make it instead find "steps in a narrated task" — the per-org `analysisInstructions` field (`org_settings`, already free-text and already appended to the prompt) is the existing extension point for steering that, and a walkthrough-oriented org can set it once ("segment by distinct user actions, not by topic") without a code change. The caption for each step comes from `lessons.title`/`.summary` — built from what the person actually said, which is a better source than a vision model's guess at pixels ever was in the superseded design.
 
-Also unnumbered, for the same reason the architecture diagram is — this elaborates on pipeline steps referenced by name from §6, not the other way around.
+### Refine: because narration timing isn't action timing
 
-### Segment first, in whole-video mode: turning one recording into steps
+A transcript boundary says roughly *when* a step starts, not exactly when the click happened. Someone narrating "now I'll click Save" might click a beat before or after saying it. Refine exists to close that gap, and it does so cheaply because the transcript boundary already narrows the search to a few seconds instead of the whole recording:
 
-Whole-video mode has no `render_inputs` rows at request time — only `render_click_events`, ordered by `t_ms` against the one source recording. Segment creates the step rows before Detect ever runs, using the same trim primitive `tasks/export.ts` already uses (`cutSegment`), just choosing different cut points:
+1. For each `lessons` row (in order), look at a small local window of the source video centered on its transcript-given start (a fixed number of seconds either side — tunable, see §11 Open).
+2. Run a scene-change/frame-difference pass over just that window (`ffmpeg`'s `select='gt(scene,…)'` or an equivalent pixel-diff scan) — cheap, because it decodes a few seconds, not the whole video.
+3. If one transition clearly dominates the window, snap the boundary to it. This is the expected case — a UI click produces a sharp, unambiguous visual change — and it costs no model call at all.
+4. If the window is genuinely ambiguous (no single dominant transition — a slow fade, or several similar-magnitude changes close together), send just the handful of candidate frames from that narrow window to a vision-capable model, asking which one shows the action actually complete. This is the **only** place this feature calls a vision model, it operates on a few frames from a few seconds of video, and it's expected to be rare, not routine, unlike the superseded design's fallback tier.
 
-* **Boundaries are the midpoints between consecutive clicks**, not a fixed window around each click. Step *i* spans from `midpoint(click[i-1], click[i])` to `midpoint(click[i], click[i+1])`, with the first step starting at `t=0` and the last ending at the recording's probed duration. This guarantees non-overlapping, gapless steps by construction — no lead/trail constant to tune, and no special-casing two clicks that happen close together.
-* **Timestamps get rebased.** `render_click_events.t_ms` is a position in the *whole recording's* timeline; the moment Segment cuts a step out, that click's effective time becomes `t_ms − step_start_ms`. `render_inputs.clicks_json` always stores the rebased, step-relative time — the same discipline §6's "Normalize" note applies to coordinates (transform once, at the boundary, never carry the untransformed value forward). A step with no click inside it at all can't occur by construction, since every step is built *around* exactly one click event.
-* Each cut step is uploaded to storage as `render_inputs.resolved_key`, same as a fetched clips-mode input — from here on, Detect/Normalize/Annotate/Brand/Concat treat a whole-video step and a clips-mode input identically. This is why the pipeline downstream of Segment is mode-agnostic: it only ever sees `render_inputs` rows.
+The result — `walkthrough_job_steps.refined_start`/`.refined_end` — is what Assemble actually cuts on.
 
-### Three tiers to resolve a step's caption and click data
+## 6. Pipeline
 
-Whichever tier resolves a step's click, it lands in the same place: `render_inputs.clicks_json`, in that step's own pixel/time space (never guessed twice — §3's `resolved_key` rule for fetches applies here too).
+Two phases: the existing video pipeline (unmodified), then the new `walkthrough` task, mirroring `tasks/export.ts`'s claim → encode → finalize shape.
 
-1. **Tier 1 — extension DOM metadata (whole-video mode's normal case).** A click event with `element_text`/`selector` populated needs no model call at all: the caption is built directly from what was actually clicked ("Click **Save**"), and it's exactly correct because it came from the DOM, not a guess about pixels. This is the expected path once the extension change lands, and it costs nothing beyond the request itself.
-2. **Tier 2 — coordinates only, no label.** A click event (extension or caller-supplied, clips mode) that has `x`/`y`/`t_ms` but no usable `element_text` (a canvas, an icon button with no accessible name, a cross-origin iframe the content script can't read into) has *where*, just not *what*. Good enough to drive the highlight and zoom; the caption falls through to tier 3 for wording.
-3. **Tier 3 — vision model on change-frames.** Only reached when a step has no usable label (tier 2) or no click data at all (a clips-mode input with no `clicks` supplied). The worker can't afford to send every frame of even a short clip to a vision model — cost and latency both scale with frame count, and most frames of a click recording are visually identical to the one before it — so it first finds the *few* frames worth looking at:
-   * Decode the clip to frames and score consecutive-frame difference (ffmpeg's `select='gt(scene,…)'` or an equivalent pixel-diff pass) to find the handful of moments where the screen actually changed.
-   * Send just those candidate frames (capped — see §8) to a vision-capable model, one call per step, asking for click coordinates (when tier 2 didn't already have them) and a short action description, structured the same way `domain/lessons.ts` already asks GPT-5.5 for structured JSON rather than free text.
-   * The response fills in `clicks_json`/`caption` (`clicks_source = 'vision_llm'`, distinct from `'extension_dom'`/`'caller'`, so a later audit or re-run policy can tell which steps were guessed).
+**Existing pipeline (reused verbatim):**
 
-### Why coordinates have to travel through Normalize, not around it
+1. `extract` — audio pulled from the uploaded video, exactly as for a lecture.
+2. `transcribe` — Whisper, exactly as for a lecture, including the per-org content-hash cache.
+3. `analyze` — GPT-5.5 finds step boundaries, writes `lessons`/`lesson_segments`. On success, one new check: if a `walkthrough_jobs` row is waiting on this video, queue the `walkthrough` task.
 
-A click at `(840, 512)` means nothing once the clip has been scaled and padded to the template's target resolution (§6 step "Normalize") — the two operations must share one affine transform. Both `Detect` and `Normalize` compute the same scale factor and padding offset from the same source-to-target dimensions; `Detect` stores the *source-space* point, and the transform is applied once, at the moment `Annotate` (§6) needs a target-space point to draw at. Storing pre-transformed coordinates would mean re-deriving the same math a second time and risking the two derivations drifting apart.
+**`apps/worker/src/tasks/walkthrough.ts` (new):**
 
-### What Annotate actually burns in, per detected click
-
-* **Highlight** — an animated ring/pulse centered on the (transformed) click point, timed to the click's `t_ms`: fade in, hold, fade out over roughly half a second. Color comes from the render's own `render_templates.brand_primary_hex` — the highlight is brand-colored by construction, not a hardcoded accent, which is also why no new template column is needed for it.
-* **Zoom** — a brief punch-in (`zoompan` or a scale+crop pair) centered on the click point for roughly a second either side of `t_ms`, then back to the full frame. Skipped for a step with no detected click at all (a plain establishing clip with no interaction) rather than zooming into nothing.
-* **Caption** — on-screen `drawtext`, positioned bottom-center by default, showing `render_inputs.caption` however it was resolved: built from the extension's `element_text` (tier 1), the vision model's action description (tier 3), or the caller's own `caption` field in clips mode. This is a **burned-in text overlay**, not narrated audio — an auto-narrated version is a natural extension once TTS is wired in (it would reuse the exact `adelay`/`volume`/`amix` mixing shape §6's voiceover step already salvaged from `ffmpeg-server`), but that's left open (§11) rather than assumed.
-
-All three run against the *normalized* per-step clip, before Brand overlay and before Concat — so the intro and outro, which aren't steps and carry no click data, are never touched by this stage.
-
-## 6. Pipeline (`apps/worker/src/tasks/render.ts`)
-
-Mirrors `tasks/export.ts`'s claim → encode → finalize shape:
-
-1. **Claim**: `queued → running`, guarded by `status = 'queued'` (same race the export job guards against).
-2. **Fetch**: in whole-video mode, the one source recording goes through the SSRF-safe fetcher (§5); in clips mode, each `render_inputs` row with `source_kind = 'url'` and no `resolved_key` does. `storage_key` sources (already-uploaded assets) are used as-is either way.
-3. **Segment** (whole-video mode only): cut the fetched recording into one `render_inputs` row per click event, at click-midpoint boundaries, via `cutSegment` — see "Segment first, in whole-video mode" above. Skipped entirely in clips mode, where `render_inputs` rows already exist from the request.
-4. **Detect**: resolve each step's `clicks_json`/`caption` via the three-tier order — extension DOM text, then coordinates-only, then the vision-model fallback ("Click detection & step annotation" above). Tier 1 is free; only tier 3 costs a model call.
-6. **Normalize**: unlike `cutSegment`'s outputs, these files can arrive in any resolution, fps, or codec. Each input (and the intro/outro) is scaled+padded to the template's `target_width`/`target_height`/`target_fps` and re-encoded to a fixed `libx264`/`aac` profile — this step is why concat can't just reuse `concatVideos` on the raw inputs. `concatVideos`'s stream-copy concat *is* still the right tool once every part shares one profile, so this step feeds it, doesn't replace it. The same scale/pad transform computed here is what turns `Detect`'s source-space click coordinates into target-space ones (see above).
-7. **Annotate**: per detected click, burn in the highlight ring, the zoom punch-in, and the step caption (all detailed above) onto the normalized step clip. The intro and outro pass through untouched — they aren't steps and carry no click data.
-8. **Brand overlay**: `drawbox`/`overlay` filters burn in the color bar and logo from the template onto the annotated clips (not the intro/outro, which are the org's own pre-made assets).
-9. **Concat**: intro + normalized clips (in `sort_order`) + outro, via the existing `concatVideos`.
-10. **Voiceover** (if present): a second `ffmpeg` pass, `-map` to either replace the concatenated file's audio track entirely (`replace`) or mix it under the original at a fixed ducked level (`duck`) — one filter graph, chosen by `voiceover_mode`. `duck` reuses a filter-graph shape salvaged from an earlier Node/Express prototype (`ffmpeg-server`, previously deployed on Render — see §11): per-track `adelay=<ms>|<ms>,volume=<n>dB`, then `amix=inputs=N:duration=longest`. That prototype otherwise contributes nothing else here (§11) — no auth, no SSRF defense on its own URL fetcher, Cloudinary instead of our own storage — and is being retired rather than deployed anywhere, DO included.
-11. **Upload + finalize**: same as `tasks/export.ts` — upload, record `size_bytes`, set `download_expires_at`, write `done`/`failed`, and on `callback_url` presence, enqueue a webhook delivery (§7). Cancellation checked between every ffmpeg invocation exactly as the export job does.
+4. **Claim**: `queued → running`, guarded by `status = 'queued'` (same race the export job guards against).
+5. **Refine**: for each `lessons` row belonging to this video, resolve `refined_start`/`refined_end` as described above; write one `walkthrough_job_steps` row per lesson.
+6. **Cut**: for each step, `cutSegment` the source video at its refined range — the same primitive `tasks/export.ts` uses per `lesson_segments` entry, applied here to Refine's tighter range instead.
+7. **Assemble**: intro + cut steps (in order) + outro, via `concatVideos` — plus, per step, an optional title-card overlay (`drawtext`, from that step's `lessons.title`) and the template's brand color/logo, burned in before the concat. No per-step resolution normalizing is needed here: every step clip was just cut from the *same* uploaded recording by the *same* tool, so there's no heterogeneous-input problem to solve — only the intro/outro (separate pre-made assets) may need scaling to match the recording's resolution.
+8. **Upload + finalize**: same as `tasks/export.ts` — upload, record `size_bytes`, set `download_expires_at`, write `done`/`failed`, and on `callback_url` presence, enqueue a webhook delivery (§7). Cancellation checked between every ffmpeg invocation exactly as the export job does.
 
 ## 7. Progress & completion delivery
 
-* `GET /v1/renders/:id` is authoritative — poll it any time; `progress` is duration-weighted across remaining pipeline steps the same way `encodeAndUpload` weights segments today.
-* `callback_url`, if given, gets **one** POST on terminal state (`done` or `failed`), body `{ id, status, output_url?, error? }`, signed with an HMAC header (`X-CourseCut-Signature`, key = a per-org webhook secret set alongside the API key) so a receiver can verify it didn't come from someone else. Delivery is fire-and-forget with a short retry (2–3 attempts, backoff) recorded on the `render_jobs` row — not a durable webhook queue with a dashboard; that's real scope this plan doesn't take on yet (§11, Open).
+* `GET /v1/walkthroughs/:id` is authoritative — poll it any time; `progress` spans the whole chain (extract/transcribe/analyze, when they still need to run, then Refine/Cut/Assemble), duration-weighted the same way `encodeAndUpload` weights multi-segment exports today.
+* `callback_url`, if given, gets **one** POST on terminal state (`done` or `failed`), body `{ id, status, output_url?, error? }`, signed with an HMAC header (`X-CourseCut-Signature`, key = a per-org webhook secret set alongside the API key) so a receiver can verify it didn't come from someone else. Delivery is fire-and-forget with a short retry (2–3 attempts, backoff) recorded on the `walkthrough_jobs` row — not a durable webhook queue with a dashboard; that's real scope this plan doesn't take on yet (§11, Open).
 * No delivery guarantee beyond that retry — the polling endpoint is the source of truth precisely so a lost webhook isn't a lost result.
 
 ## 8. Quotas & rate limiting
 
-* New metered kind in `usage_events`: `render_output_seconds` — the finished output's duration, recorded once on success (mirrors `TRANSCRIPTION_SECONDS`'s "record what actually happened, after the fact" rule in `quota.ts`).
-* A second new metered kind: `vision_frames_analyzed` — one unit per still frame actually sent to the vision model in the Detect fallback (§6). Only the fallback path writes it; a render where every step arrived with `clicks` already resolved records zero. This is the one place in this feature where per-render cost is caller-input-dependent rather than a flat function of output duration, so it needs its own ceiling, not a share of `render_output_seconds`.
-* A hard per-render frame cap (a fixed number, not an org setting) on how many change-frames Detect will send per step and in total — the backstop against a single noisy or long GIF blowing past any monthly minutes ceiling in one call, independent of what the org's usage looks like that month.
-* A hard cap on `render_click_events` per job, too, in whole-video mode — since each click event becomes one Segment cut and one `render_inputs` row, an unbounded click log is an unbounded step count, not just an unbounded frame count.
-* New `org_settings` columns, same nullable-override shape as the existing ones: `render_minutes_limit`, `vision_frames_limit`, and reuse `storage_bytes_limit` / `max_active_jobs` as-is — a render job is one more thing counted by `activeJobCount` and one more thing whose output counts against storage.
-* `assertCanRender()` alongside `assertCanExport()`: suspended check, active-job cap, storage headroom, plus the new monthly minutes and vision-frame ceilings.
-* Rate limiting (`http/rate-limit.ts`) needs a second key function: today's `consume(...)` buckets are keyed by `userId`, which doesn't exist on an API-key request. Same buckets, keyed by `keyId` instead — `POST /v1/renders` and `POST /v1/templates` join the `EXPENSIVE` bucket's path list.
+* Transcription is already metered (`TRANSCRIPTION_SECONDS`, `quota.ts`) and needs no change — a walkthrough's audio costs exactly what a lecture's would, same meter, same monthly ceiling.
+* New metered kind: `walkthrough_output_seconds` — the finished output's duration, recorded once on success, same "record what actually happened, after the fact" rule as the existing kinds.
+* A second, deliberately small metered kind: `vision_tiebreak_calls` — one unit per ambiguous-window vision call Refine actually makes. Expected to be zero or near-zero for most videos, unlike the superseded design's `vision_frames_analyzed`, which was a routine cost.
+* `assertCanWalkthrough()` alongside `assertCanExport()`: suspended check, active-job cap, storage headroom, plus the new monthly output-seconds ceiling.
+* A hard per-video cap on step count (a fixed number, not an org setting) — bounds worst-case Refine/Cut work per job independent of what a single (mis-)analyzed video's transcript produced.
+* New `org_settings` columns, same nullable-override shape as the existing ones: `walkthrough_minutes_limit`, and reuse `storage_bytes_limit` / `max_active_jobs` as-is.
+* Rate limiting (`http/rate-limit.ts`) needs a second key function: today's `consume(...)` buckets are keyed by `userId`, which doesn't exist on an API-key request. Same buckets, keyed by `keyId` instead — `POST /v1/walkthroughs`, `POST /v1/videos/uploads`, and `POST /v1/templates` join the `EXPENSIVE` bucket's path list.
 
 ## 9. Output delivery
 
-Same answer as `exports.ts`'s download URL: a presigned GET, not a permanently public object — R2/DO Spaces bucket hostnames never reach a caller any more than they reach the SPA (`storage.ts`'s rule 3). `GET /v1/renders/:id` mints a fresh presigned URL on every call rather than storing one, so `output_url`'s TTL is "however long ago you last asked," not a fixed expiry the caller has to race. `download_expires_at` (same column shape as `exports`) is when the *object itself* is deleted by a retention sweep, not when the URL expires — those are different clocks, same as today.
+Same answer as `exports.ts`'s download URL: a presigned GET, not a permanently public object — R2/DO Spaces bucket hostnames never reach a caller any more than they reach the SPA (`storage.ts`'s rule 3). `GET /v1/walkthroughs/:id` mints a fresh presigned URL on every call rather than storing one, so `output_url`'s TTL is "however long ago you last asked," not a fixed expiry the caller has to race. `download_expires_at` (same column shape as `exports`) is when the *object itself* is deleted by a retention sweep, not when the URL expires — those are different clocks, same as today.
 
 ## 10. Milestones (rough)
 
-* **R1** — `api_keys` table + `requireApiKey`, key management routes behind session auth. No render logic yet; provable with a `GET /v1/whoami`-style smoke route.
-* **R2** — `render_templates` CRUD, reusing the existing presigned-upload flow for intro/outro/logo assets.
-* **R3** — `render_jobs`/`render_inputs` (clips mode only), the SSRF-safe fetcher as its own tested module, `tasks/render.ts` without voiceover, brand overlay, or click annotation — prove clip-concat-with-intro-outro end to end first.
-* **R4** — voiceover mixing, brand color/logo overlay, webhook delivery, quotas wired in.
-* **R5** — whole-video mode: `render_click_events`, the Segment stage (reusing `cutSegment`), and Detect's tier 1 (extension DOM text) driving highlight + zoom + caption. This is the actual target use case — a caller with an instrumented recorder gets a complete walkthrough with no vision-model call anywhere in the path.
-* **R6** — Detect's tiers 2–3: coordinates-only handling and the change-frame-extraction + vision-model fallback, for clips-mode callers and for whole-video clicks the extension couldn't label. Sequenced after R5 deliberately — it's the harder, more expensive half, and R5 alone already serves the primary caller.
+* **W1** — `api_keys` table + `requireApiKey`, key management routes behind session auth. No walkthrough logic yet; provable with a `GET /v1/whoami`-style smoke route.
+* **W2** — `render_templates` CRUD, reusing the existing presigned-upload flow for intro/outro/logo assets.
+* **W3** — `walkthrough_jobs`/`walkthrough_job_steps`, the API-key-authed upload routes and singleton `_api` project, the orchestration link from `analyze` into the new `walkthrough` task, and a first version of `tasks/walkthrough.ts` that trusts `lessons.start`/`.end` as-is (no Refine yet) for the cut+assemble. Proves the whole "reuse the video pipeline for step-finding" idea end to end before adding precision.
+* **W4** — Refine (local scene-detection snap + rare vision tiebreaker), per-step title cards, brand overlay, webhook delivery, quotas wired in.
 
 ## 11. Decisions
 
@@ -326,33 +277,35 @@ Same answer as `exports.ts`'s download URL: a presigned GET, not a permanently p
 |---|---|---|
 | Hand-rolled API keys, hashed, in a new `api_keys` table | `better-auth`'s `api-key` plugin | Verified against the installed and current versions: no such plugin ships. Rolling this by hand is the one exception to "the library's crypto beats ours" (`auth.ts`), forced by the library simply not offering it |
 | Plain `sha256` for key storage, not bcrypt/scrypt | Slow password-style hashing | Keys are generated with enough entropy that a slow hash defends against nothing a fast one doesn't, and adds latency to every authenticated request |
-| Templates as a stored, reusable resource | Full brand config inline on every render call | An org has one brand, many renders; a `template_id` keeps the payload small and gives something to version |
+| Templates as a stored, reusable resource | Full brand config inline on every call | An org has one brand, many walkthroughs; a `template_id` keeps the payload small and gives something to version |
 | Polling as the source of truth, webhook as a convenience notification | Webhook-only | A lost webhook must not mean a lost result for a server-to-server integration |
-| New `render_jobs`/`render_inputs` tables, not reusing `videos`/`lessons`/`exports` | Bending the existing lesson/export tables to fit | This product has no lesson concept at all — a `videos` row implies a transcript pipeline that never runs here |
-| A dedicated, isolated URL-fetching module with private-IP/redirect/size/timeout checks | Fetching input URLs inline wherever needed | This is the one place the server acts on a caller's arbitrary input against its own network — it gets the same "one file owns this" treatment `storage.ts` gets for S3 |
-| Retire the `ffmpeg-server` Render prototype outright; port only its `adelay`/`volume`/`amix` audio-mix filter graph into `ffmpeg.ts` | (a) Redeploy it to the DO droplet as its own service; (b) redeploy it after patching auth + SSRF | Reviewed the full repo: no auth on any route, `downloadFile.js` fetches caller URLs with no private-IP/redirect checks (the exact hole §5 defends against), and it uploads to Cloudinary — a second storage vendor whose credentials are checked into that repo's `.env.example` and should be rotated regardless. Its video-overlay compositing is also a different operation (picture-in-picture layering) from this plan's sequential intro+clips+outro concat, so there was nothing to salvage there either. The one thing worth keeping is the audio filter-graph shape, for when a voiceover input is a synthesized AI voice track rather than a human recording — same mixing math either way |
-| Click detection: caller-supplied metadata as the primary path, vision-model-on-change-frames as fallback | (a) Pure computer-vision cursor/ripple detection everywhere; (b) always calling a vision model, even when the caller already knows the click point | Caller-supplied coordinates are free, instant, and exactly correct when available — most screen-capture tooling already has them. Pure CV (cursor template matching) is brittle across OS/browser cursor themes and answers "where" but not "what happened," which the caption needs. Always calling a vision model would pay API cost and latency on every step even when the answer was already known for free |
-| Detect only samples change-frames (scene-diff), not every frame, before calling the vision model | Sending the whole GIF's frames to the model | Most of a click recording is visual stillness; cost and latency scale with frames sent, and only the handful of real transitions carry information a click-locating model needs |
-| Highlight, zoom, and caption all enabled as the default Annotate behavior | Detect-and-order only, no visual embellishment | The stated goal is a polished guided walkthrough, not merely correctly-ordered raw clips — the whole value of automatic click detection is spending it on something the viewer sees |
-| Caption is a burned-in on-screen `drawtext`, not TTS narration, for R5 | Auto-narrating the caption via TTS immediately | Keeps R5 to one new capability (visual annotation) instead of two; narration is a near-term extension that reuses the voiceover step's existing mixing math once wanted (§11, Open) |
-| v1 assumes the caller supplies steps pre-ordered | Inferring step order from clip content | Matching UI state across unordered clips to reconstruct a workflow is a materially harder and more speculative problem than anything else in this plan — worth scoping on its own once ordered input is working, not bundled into the first version |
-| Highlight ring color comes from `render_templates.brand_primary_hex`, no new template column | A dedicated `highlight_color` field | One brand color already exists per template; a walkthrough's highlight *is* the brand accent, and a second color field would just be a way for the two to drift apart |
-| Whole-video mode (one recording + a click-event log) as the primary/recommended request shape, clips mode kept as secondary | Requiring every caller to pre-cut into per-step clips | The actual recorder is a Chrome extension producing one continuous capture; requiring it to pre-cut would push ffmpeg work onto the caller that `cutSegment` already does for free server-side. Clips mode stays for callers without that kind of recorder |
-| Segment cuts at the midpoint between consecutive click timestamps | A fixed lead/trail window around each click | Midpoint boundaries are non-overlapping and gapless by construction — pure arithmetic, no tunable constant, and no special-casing two clicks that land close together |
-| Extension-captured DOM `element_text`/`selector` promoted to tier 1 of click detection, ahead of both plain coordinates and the vision-model fallback | Treating every caller-supplied click the same regardless of whether it carries a semantic label | "Click **Save**" read straight from the DOM is strictly more accurate than anything inferred from pixels, and — now that the extension can capture it — costs nothing extra to include |
-| `render_click_events` as its own dedicated table, not a `jsonb` column on `render_jobs` | `render_jobs.raw_clicks_json` | Matches this codebase's existing convention (`transcript_segments`/`lesson_segments` are dedicated tables, not blobs) and lets Segment order and query click events with plain SQL |
+| A "step" is a `lessons` row, produced by the existing unmodified `analyze` job | A new AI prompt/pipeline for "steps" specifically | The problem — find meaningful time-ranges in a transcript — is identical; the existing per-org `analysisInstructions` field is already the extension point for steering it toward task-steps instead of lecture-topics |
+| Direct presigned-PUT upload as the only ingestion path in this plan | Requiring or defaulting to a caller-hosted URL the server fetches | Reuses already-hardened code with zero new SSRF surface; a URL-based secondary mode is still possible later (§5) but isn't built until something needs it |
+| Refine snaps each transcript boundary to the nearest real visual transition in a narrow local window | Trusting the transcript boundary as the cut point | Narration timing and action timing don't coincide; a narrow local scan is cheap specifically because the transcript already narrows the search to a few seconds |
+| Refined boundaries stored on a new `walkthrough_job_steps` row, not written back onto `lessons` | Updating `lessons.start`/`.end` in place | `lessons`'s cached bound is read by the ordinary lesson editor for a different purpose; writing a walkthrough-specific refinement into a shared column would be a surprising side effect elsewhere in the product |
+| Assemble calls `cutSegment`/`concatVideos` directly inside the new `walkthrough` task, rather than queuing one `exports` row per step | Reusing the `exports` table/job machinery per step | `exports` carries UI-facing state (pause/resume/retry, a standalone downloadable-clip concept) that doesn't map onto an internal step of one larger automated assembly, and would require writing a step's boundary into shared `lesson_segments` rows just to get it in |
+| Per-step visual treatment limited to an optional title card (from `lessons.title`) | Highlight ring + zoom-to-click (from the superseded click-detection design) | There's no click coordinate in this design at all — only *when* a transition happens, never *where* on screen — so there's nothing for a highlight or zoom to target |
+| `vision_tiebreak_calls` metered separately from `walkthrough_output_seconds`, and expected near zero | Treating it as a routine cost like the superseded design's `vision_frames_analyzed` | It only fires for a genuinely ambiguous local window, not once per step, so bundling it into a flat per-render cost would misprice the common case |
+
+### Superseded (kept for the record, not currently built)
+
+The previous version of this plan used a Chrome extension to capture click coordinates and DOM element text/selector per step, with a three-tier fallback (extension DOM text → coordinates only → vision-model-on-change-frames) and a `Segment` stage that cut the source video at the midpoint between consecutive clicks. Superseded in this pass because the transcript-driven approach above gets a richer signal (spoken intent, not a click's raw coordinates) out of infrastructure that already exists and is already paid for, and removes an entire unscoped dependency (the extension-side change was never built). If a future need re-introduces click-level precision — e.g., a walkthrough with no narration at all — that design is still a reasonable starting point, not a discarded mistake.
+
+| Superseded decision | Why it made sense at the time |
+|---|---|
+| `render_click_events` + a three-tier click/caption resolution (extension DOM text → coordinates → vision model) | Reasonable when the assumed recorder was a Chrome extension with no narration to lean on at all |
+| `Segment` cutting at the midpoint between consecutive click timestamps | The right boundary rule *for click-based input* — non-overlapping by construction — but moot once boundaries come from a transcript instead |
+| Highlight ring (from `brand_primary_hex`) + zoom punch-in per click | Made sense when a click's exact screen coordinate was known; nothing in the current design produces one |
+| Retiring the `ffmpeg-server` Render prototype outright; salvaging only its `adelay`/`volume`/`amix` audio-mix filter graph | Still true and still relevant — see "Open" below, since a caller invoking `voiceover_mode: 'replace'`/`'duck'` (§2.2) would use exactly that mixing shape |
 
 ### Open
 
 | Question | Leaning |
 |---|---|
-| Webhook delivery durability (retry count, dead-letter visibility) | A few fire-and-forget retries for R4; a real delivery queue with a retry/replay UI is more than an R&D pass needs — revisit if a customer actually depends on webhooks arriving |
-| Per-render vs. per-org rate limits for API-key traffic | Leaning per-key, same shape as today's per-user buckets — needs real traffic to size the numbers |
-| Whether `render_output_seconds` is billed differently from transcription minutes, or shares one "compute" ceiling | Genuinely open — no pricing model exists yet for this API, same as the web app's own pricing (§10 of `web-app-plan.md`) |
-| Max clip count / max total input duration per render | Needs a number before R3 ships, not before this plan is agreed on |
-| Whether non-MP4 output formats are ever needed | Out of scope until asked for; one format keeps the normalize step (§6) simple |
-| Auto-narrating captions via TTS, once wanted | Reuse the voiceover step's `adelay`/`volume`/`amix` mixing (§6) with the generated speech clip as just another voiceover input — no new mixing code, only a TTS call ahead of it |
-| Exact frame cap for the vision-model fallback, and the per-frame/per-render cost this implies | Needs a real number (and a look at actual GPT vision pricing against typical GIF lengths) before R6 ships — R5's extension-DOM path doesn't depend on this |
-| Whether `clicks_source = 'vision_llm'` steps should ever be shown back to the caller for confirmation before rendering | Open — a guessed click could be visibly wrong in a way a caller would want to catch before spending render minutes on it; adds a review round-trip this plan doesn't currently have |
-| The Chrome extension change itself (emitting `t_ms`/`x`/`y`/`selector`/`element_text`/`tag_name` per click, alongside the existing recording-upload flow) | Confirmed feasible ("minor changes") but not yet scoped as its own piece of work — this plan assumes the log format above; the extension-side implementation is a separate task this doc doesn't cover |
-| What happens to a step whose click landed on a generic/unlabeled element (tier 2: coordinates but no `element_text`) when the caller hasn't enabled the vision fallback at all | Leaning: render it with highlight + zoom but a generic caption ("Step 3") rather than blocking the whole render on a missing label |
+| Webhook delivery durability (retry count, dead-letter visibility) | A few fire-and-forget retries for W4; a real delivery queue with a retry/replay UI is more than an R&D pass needs — revisit if a customer actually depends on webhooks arriving |
+| Per-key vs. per-org rate limits for API-key traffic | Leaning per-key, same shape as today's per-user buckets — needs real traffic to size the numbers |
+| Pricing / plan tiers for `walkthrough_output_seconds` | Genuinely open — no pricing model exists yet for this API, same as the web app's own pricing (§10 of `web-app-plan.md`) |
+| Exact width of Refine's local search window, and the scene-change threshold | Needs real narrated recordings to tune against — too narrow risks missing the actual transition, too wide re-introduces the cost problem the narrow window exists to avoid |
+| Max step count per video | Needs a number before W3 ships, not before this plan is agreed on |
+| Whether the `voiceover_mode: 'replace'/'duck'` override (§2.2) is worth building now or waiting for demand | Leaning wait — the primary flow's narration already serves as the voiceover; the salvaged `ffmpeg-server` mixing shape is ready whenever this is prioritized |
+| What happens when `analyze` finds zero steps, or one step spanning the whole video (e.g. a narration style GPT doesn't segment well) | Open — likely surfaces as a `walkthrough_jobs` failure with a clear message rather than silently producing a one-clip "walkthrough" |
