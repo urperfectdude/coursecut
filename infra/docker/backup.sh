@@ -12,6 +12,13 @@
 #                         the RLS-scoped app role would silently contain no
 #                         tenant rows at all, which is the worst possible
 #                         backup: one that restores cleanly and is empty.
+#   BACKUP_STEPCUT_DATABASE_URL
+#                         StepCut's own database (docs/stepcut-plan.md), dumped
+#                         and pruned the same way, under its own S3 key prefix
+#                         so the two databases' dumps never collide or get
+#                         pruned against each other's dates. Optional — unset
+#                         until stepcut is actually deployed, so this script
+#                         does not start failing before that lands.
 #   BACKUP_S3_*           endpoint, bucket, credentials. A *different* bucket
 #                         and a *different* token from the media bucket, so
 #                         the credential the API and worker hold cannot read
@@ -60,14 +67,21 @@ s3() {
 # can reorder to satisfy dependencies, restore a single table, and skip
 # ownership — none of which a plain dump can do when the roles on the new
 # server are not the ones on the old.
+#
+# Takes a name and a connection string rather than reading the coursecut env
+# vars directly, so the same function dumps any number of databases — one
+# call per database in the list built below, each under its own S3 key prefix
+# (`${PREFIX}/<name>-*`) so pruning and naming never collide between them.
 dump_once() {
+  db_name="$1"
+  db_url="$2"
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  key="${PREFIX}/coursecut-${stamp}.dump"
-  file="/tmp/coursecut-${stamp}.dump"
+  key="${PREFIX}/${db_name}-${stamp}.dump"
+  file="/tmp/${db_name}-${stamp}.dump"
 
-  log "dumping to ${key}"
+  log "dumping ${db_name} to ${key}"
   pg_dump --format=custom --no-owner --no-privileges \
-    --file="$file" "$BACKUP_DATABASE_URL"
+    --file="$file" "$db_url"
 
   size="$(wc -c < "$file")"
   # A dump that is implausibly small is the shape a permissions or
@@ -76,7 +90,7 @@ dump_once() {
   # far above an empty one.
   if [ "$size" -lt 4096 ]; then
     rm -f "$file"
-    log "dump was only ${size} bytes — refusing to upload it"
+    log "${db_name} dump was only ${size} bytes — refusing to upload it"
     return 1
   fi
 
@@ -89,13 +103,15 @@ dump_once() {
 # lifecycle rule, so retention is one number in one file and does not depend on
 # a console setting nobody can see from here.
 prune() {
+  db_name="$1"
   cutoff="$(date -u -d "${RETENTION_DAYS} days ago" +%Y%m%d)"
-  log "pruning dumps older than ${cutoff}"
+  log "pruning ${db_name} dumps older than ${cutoff}"
 
   s3 ls "s3://${BACKUP_S3_BUCKET}/${PREFIX}/" | awk '{print $4}' | while read -r name; do
     [ -n "$name" ] || continue
-    # coursecut-20260731T030000Z.dump → 20260731
-    day="$(echo "$name" | sed -n 's/^coursecut-\([0-9]\{8\}\)T.*\.dump$/\1/p')"
+    # coursecut-20260731T030000Z.dump → 20260731 (and likewise for any other
+    # db_name prefix in the same listing — sed only matches this db's own).
+    day="$(echo "$name" | sed -n "s/^${db_name}-\([0-9]\{8\}\)T.*\.dump\$/\1/p")"
     [ -n "$day" ] || continue
     if [ "$day" -lt "$cutoff" ]; then
       s3 rm "s3://${BACKUP_S3_BUCKET}/${PREFIX}/${name}"
@@ -104,12 +120,28 @@ prune() {
   done
 }
 
+# The list of databases to back up. `coursecut` is always here; `stepcut` is
+# appended only once `BACKUP_STEPCUT_DATABASE_URL` is actually set, so this
+# script keeps working unmodified on a droplet that has not deployed stepcut
+# yet (docs/stepcut-plan.md, Phase 1).
+run_all() {
+  ok=0
+  dump_once coursecut "$BACKUP_DATABASE_URL" || ok=1
+  prune coursecut || { log "coursecut prune failed"; ok=1; }
+
+  if [ -n "${BACKUP_STEPCUT_DATABASE_URL:-}" ]; then
+    dump_once stepcut "$BACKUP_STEPCUT_DATABASE_URL" || ok=1
+    prune stepcut || { log "stepcut prune failed"; ok=1; }
+  fi
+
+  return "$ok"
+}
+
 # `once` exists so the runbook's "prove the backup works" step is a command
 # rather than a wait, and so an operator about to do something frightening can
 # take a dump first.
 if [ "${1:-}" = "once" ]; then
-  dump_once
-  prune
+  run_all
   exit 0
 fi
 
@@ -127,8 +159,7 @@ while true; do
   # A failed backup must not kill the loop — tomorrow's attempt may well
   # succeed, and a container in a crash loop is a backup system that stopped
   # trying. It is loud instead.
-  if ! dump_once; then
+  if ! run_all; then
     log "BACKUP FAILED"
   fi
-  prune || log "prune failed"
 done

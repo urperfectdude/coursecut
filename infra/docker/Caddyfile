@@ -105,6 +105,47 @@
 	}
 }
 
+# StepCut (docs/stepcut-plan.md, Phase 1), on its own hostname. Unlike the
+# `{$APP_DOMAIN}` block above, this one does not serve `/srv` directly —
+# `stepcut-web` is its own small internal container with the built SPA and a
+# baked-in SPA-fallback Caddyfile of its own (see `stepcut-web.Dockerfile`
+# and `apps/stepcut/Caddyfile`), so the static handler here is just a reverse
+# proxy to it. This is still the site that owns TLS and the public-facing
+# headers for stepcut.duckdns.org: `stepcut-web` has none of its own, on
+# purpose (plan decision 5) — it is reached only through this shared edge
+# Caddy, never bound to a host port.
+{$STEPCUT_DOMAIN} {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		-Server
+	}
+
+	handle /api/* {
+		reverse_proxy stepcut-api:3001 {
+			flush_interval -1
+		}
+
+		request_body {
+			max_size 32MB
+		}
+	}
+
+	handle {
+		reverse_proxy stepcut-web:80
+	}
+
+	header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: https:; font-src 'self' data:; connect-src 'self' https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+
+	log {
+		output stdout
+		format json
+	}
+}
+
 # The database UI (Adminer), on its own hostname.
 #
 # This is the only thing in the deployment that puts a database in front of a

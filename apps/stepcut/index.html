@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The app is dark-only (see `src/styles.css`). Declared here as well as
+         in CSS so the very first paint — before the stylesheet loads — is
+         already dark, rather than flashing white on load. -->
+    <meta name="color-scheme" content="dark" />
+    <title>StepCut</title>
+
+    <!-- No icon assets yet (no stepcut equivalent of apps/web's og/icon-* set
+         at the repo root) — added when there is real branding to link to,
+         rather than pointing at files that don't exist. -->
+
+    <!-- Matches `--background` in src/styles.css (oklch(0.145 0 0)), so the
+         mobile browser chrome continues the app rather than framing it. -->
+    <meta name="theme-color" content="#0a0a0a" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="StepCut" />
+    <meta
+      property="og:description"
+      content="Turn a narrated screen recording into the step-by-step tutorial it was always made of."
+    />
+    <meta name="twitter:card" content="summary" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

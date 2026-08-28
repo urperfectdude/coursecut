@@ -1,0 +1,31 @@
+{
+  // Same options as `apps/worker`'s, and for the same reasons — no `DOM`,
+  // strict, no emit (tsx runs the TypeScript directly). Copied rather than
+  // extended because each app under `apps/` installs its own dependencies,
+  // and a config that reaches across package boundaries for its *own*
+  // settings is the kind of coupling that makes one package's install break
+  // another's build.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true
+  },
+  // `../stepcut-api/src` is here because the worker imports that project's
+  // db client and env module directly — one definition of the connection
+  // mechanism, not two. Typechecking those files from here is what keeps
+  // that honest: a change to `apps/stepcut-api`'s client that breaks the
+  // worker fails the worker's own typecheck rather than at runtime.
+  "include": ["src", "../stepcut-api/src"]
+}
