@@ -4,7 +4,7 @@
 #
 #   docker compose -f compose.prod.yml up -d --wait
 #
-# Five long-lived services and one that exits:
+# The coursecut services (five long-lived, one that exits):
 #
 #   postgres  the database and the job queue. **No published ports** — plan §8
 #             makes that a hard rule, and the absence of a `ports:` key here is
@@ -12,8 +12,14 @@
 #   migrate   bootstrap + migrate, then exits. Everything else waits for it.
 #   api       Hono, reachable only through Caddy
 #   worker    ffmpeg, Whisper, GPT — the only service with a scratch disk
-#   caddy     TLS, the SPA, and the one reverse proxy
-#   backup    nightly pg_dump to a separate bucket
+#   caddy     TLS, the SPA, and the one reverse proxy (for both coursecut and
+#             stepcut — see the `{$STEPCUT_DOMAIN}` block in Caddyfile)
+#   backup    nightly pg_dump to a separate bucket, for both databases
+#
+# Plus StepCut's own services (docs/stepcut-plan.md, Phase 1) — same Postgres
+# server, a second database, isolated by database/queue rather than by
+# machine: `stepcut-migrate` (creates the `stepcut` database, then bootstrap +
+# migrate), `stepcut-api`, `stepcut-worker`, `stepcut-web`.
 #
 # Images come from the registry, tagged by commit. `IMAGE_TAG` is what makes a
 # rollback a re-deploy of an older tag rather than a rebuild — see `deploy.sh`.
@@ -128,6 +134,115 @@ services:
           # it) when the worker is alone on a box.
           cpus: "${WORKER_CPUS:-0.8}"
 
+  # StepCut (docs/stepcut-plan.md, Phase 1). Its own database, its own queue,
+  # isolated from the coursecut services above by database and by env vars —
+  # not by machine — so its step-detection algorithms can iterate without
+  # risking the shipped lesson product. Same registry, no `coursecut-` prefix
+  # on the images (plan decision 6): it is a distinct product sharing a
+  # droplet, not a coursecut feature.
+  #
+  # Runs to completion on every deploy, same shape as `migrate` above, except
+  # it also has to create the `stepcut` database itself first: `postgres`
+  # above only creates `coursecut` (its own `POSTGRES_DB`), and
+  # `db:create` (docs/stepcut-plan.md decision 7) is what puts a second
+  # database on that same server, idempotently, before bootstrap/migrate run
+  # against it.
+  stepcut-migrate:
+    image: ${REGISTRY:?set REGISTRY in .env}/stepcut-api:${IMAGE_TAG:-latest}
+    restart: "no"
+    logging: *logging
+    env_file:
+      - .env
+    # Maps the droplet `.env`'s `STEPCUT_`-prefixed vars to the unprefixed
+    # names `apps/stepcut-api/src/env.ts` reads. `env_file: .env` alone would
+    # hand this service coursecut's `DATABASE_URL` under the same unprefixed
+    # key, since both apps' vars live in one shared file on the droplet.
+    environment:
+      DATABASE_URL: ${STEPCUT_DATABASE_URL}
+      DATABASE_ADMIN_URL: ${STEPCUT_DATABASE_ADMIN_URL}
+      APP_DB_USER: ${STEPCUT_APP_DB_USER}
+      APP_DB_PASSWORD: ${STEPCUT_APP_DB_PASSWORD}
+      PORT: ${STEPCUT_PORT}
+      APP_URL: ${STEPCUT_APP_URL}
+      AUTH_SECRET: ${STEPCUT_AUTH_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["sh", "-c", "npm run db:create && npm run db:bootstrap && npm run db:migrate"]
+
+  stepcut-api:
+    image: ${REGISTRY:?set REGISTRY in .env}/stepcut-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${STEPCUT_DATABASE_URL}
+      DATABASE_ADMIN_URL: ${STEPCUT_DATABASE_ADMIN_URL}
+      APP_DB_USER: ${STEPCUT_APP_DB_USER}
+      APP_DB_PASSWORD: ${STEPCUT_APP_DB_PASSWORD}
+      PORT: ${STEPCUT_PORT}
+      APP_URL: ${STEPCUT_APP_URL}
+      AUTH_SECRET: ${STEPCUT_AUTH_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      stepcut-migrate:
+        condition: service_completed_successfully
+    # No `ports:` — same reasoning as `api` above: Caddy reaches it over the
+    # compose network only.
+    expose:
+      - "3001"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Phase 1's queue consumer is a single throwaway `ping` task (plan decision
+  # 3) — no scratch volume and no CPU limit here, unlike `worker` above,
+  # because nothing CPU- or disk-heavy runs yet. Both arrive in Phase 5
+  # alongside the render task.
+  stepcut-worker:
+    image: ${REGISTRY:?set REGISTRY in .env}/stepcut-worker:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${STEPCUT_DATABASE_URL}
+      DATABASE_ADMIN_URL: ${STEPCUT_DATABASE_ADMIN_URL}
+      APP_DB_USER: ${STEPCUT_APP_DB_USER}
+      APP_DB_PASSWORD: ${STEPCUT_APP_DB_PASSWORD}
+      PORT: ${STEPCUT_PORT}
+      APP_URL: ${STEPCUT_APP_URL}
+      AUTH_SECRET: ${STEPCUT_AUTH_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      stepcut-migrate:
+        condition: service_completed_successfully
+
+  # The SPA, on its own internal container rather than baked into `caddy`
+  # above (plan decision 5) — coupling stepcut's frontend deploys to a
+  # coursecut-web rebuild would contradict "own droplet services end to end."
+  # Internal-only, same pattern as `adminer` below: no published port, reached
+  # only through the edge Caddy's `{$STEPCUT_DOMAIN}` block.
+  stepcut-web:
+    image: ${REGISTRY:?set REGISTRY in .env}/stepcut-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    expose:
+      - "80"
+    depends_on:
+      stepcut-api:
+        condition: service_started
+
   caddy:
     image: ${REGISTRY:?set REGISTRY in .env}/coursecut-web:${IMAGE_TAG:-latest}
     restart: unless-stopped
@@ -142,6 +257,22 @@ services:
       # The database UI's own hostname. A DuckDNS name resolves every
       # subdomain to the same address, so this needs no DNS record of its own.
       DB_DOMAIN: ${DB_DOMAIN:?set DB_DOMAIN in .env}
+      # StepCut's own hostname (docs/stepcut-plan.md Phase 1) — the
+      # `{$STEPCUT_DOMAIN}` site block in Caddyfile that proxies to
+      # `stepcut-api`/`stepcut-web` below.
+      #
+      # Defaulted, not `:?`-required like the other domains above — on
+      # purpose. StepCut's plan calls for this var to land in the droplet's
+      # `.env` by hand, as its own deploy-confirmed step, deliberately after
+      # this file merges rather than bundled into the same commit. `:?` would
+      # interpolate-fail Compose for every service the moment that happens —
+      # not just `caddy` or `stepcut-*` — so the very next ordinary coursecut
+      # deploy (any push touching `infra/docker/**`/`apps/**`) would break
+      # until someone did that manual step. `stepcut.invalid` is a syntactically
+      # valid Caddy site address that resolves to nothing, so the config still
+      # loads and the coursecut site is unaffected either way; ACME simply
+      # never succeeds for it until the real domain is set.
+      STEPCUT_DOMAIN: ${STEPCUT_DOMAIN:-stepcut.invalid}
     env_file:
       # Only the two basic-auth values, in their own file rather than in
       # `.env` — so Caddy is not handed the OpenAI key and the bucket
@@ -171,6 +302,8 @@ services:
       - caddy-config:/config
     depends_on:
       api:
+        condition: service_started
+      stepcut-web:
         condition: service_started
 
   # A browser SQL client for the production database, at `DB_DOMAIN`.
@@ -206,6 +339,17 @@ services:
     logging: *logging
     environment:
       BACKUP_DATABASE_URL: ${BACKUP_DATABASE_URL:?set BACKUP_DATABASE_URL in .env}
+      # StepCut's own database, dumped and pruned separately from coursecut's
+      # (plan decision 9) — see `backup.sh`'s loop over both.
+      #
+      # Defaulted to blank, not `:?`-required, for the same reason as
+      # `STEPCUT_DOMAIN` above: this lands in the droplet's `.env` by hand in
+      # StepCut's own deploy step, deliberately after this file merges.
+      # `backup.sh` already treats an unset value as "skip the StepCut dump,
+      # still run coursecut's" — `:?` here would never let that graceful
+      # check run at all, since Compose fails interpolation for the *whole*
+      # file, for every service, before any container starts.
+      BACKUP_STEPCUT_DATABASE_URL: ${BACKUP_STEPCUT_DATABASE_URL:-}
       BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:?set BACKUP_S3_ENDPOINT in .env}
       BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:?set BACKUP_S3_BUCKET in .env}
       BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:?set BACKUP_S3_ACCESS_KEY_ID in .env}

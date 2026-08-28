@@ -31,6 +31,7 @@ on:
       - 'apps/web/**'
       - 'apps/api/**'
       - 'apps/worker/**'
+      - 'apps/stepcut*/**'
       - 'infra/docker/**'
       - '.github/workflows/deploy-web.yml'
   # Rollback path: run with an older commit's SHA as `image_tag` and the
@@ -136,6 +137,48 @@ jobs:
           cache-from: type=gha,scope=backup
           cache-to: type=gha,scope=backup,mode=max
 
+      # StepCut (docs/stepcut-plan.md, Phase 1). No `coursecut-` prefix on
+      # these three — it is a distinct product sharing the registry and the
+      # droplet, not a coursecut feature (plan decision 6).
+      - name: Build and push stepcut-api
+        uses: docker/build-push-action@v6
+        with:
+          context: apps
+          file: infra/docker/stepcut-api.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/stepcut-api:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/stepcut-api:latest
+          cache-from: type=gha,scope=stepcut-api
+          cache-to: type=gha,scope=stepcut-api,mode=max
+
+      - name: Build and push stepcut-worker
+        uses: docker/build-push-action@v6
+        with:
+          context: apps
+          file: infra/docker/stepcut-worker.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/stepcut-worker:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/stepcut-worker:latest
+          cache-from: type=gha,scope=stepcut-worker
+          cache-to: type=gha,scope=stepcut-worker,mode=max
+
+      - name: Build and push stepcut-web
+        uses: docker/build-push-action@v6
+        with:
+          context: apps
+          file: infra/docker/stepcut-web.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/stepcut-web:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/stepcut-web:latest
+          cache-from: type=gha,scope=stepcut-web
+          cache-to: type=gha,scope=stepcut-web,mode=max
+
   deploy:
     runs-on: ubuntu-latest
     needs: [build]
@@ -213,4 +256,21 @@ jobs:
             sleep 10
           done
           echo "the deployed API did not answer /api/health over TLS" >&2
+          exit 1
+
+      # Run after the coursecut check above completes (not in parallel), so a
+      # stepcut regression cannot mask a coursecut one or vice versa —
+      # whichever fails first is reported first, and this repeats the same
+      # deployed-and-reachable question for the new stepcut.duckdns.org site.
+      - name: Verify the stepcut public endpoint
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "https://${{ secrets.STEPCUT_DOMAIN }}/api/health" | grep -q '"ok":true'; then
+              echo "healthy"
+              exit 0
+            fi
+            echo "attempt $attempt failed; retrying"
+            sleep 10
+          done
+          echo "the deployed stepcut API did not answer /api/health over TLS" >&2
           exit 1

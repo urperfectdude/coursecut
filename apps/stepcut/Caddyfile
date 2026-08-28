@@ -1,0 +1,21 @@
+# Baked into the `stepcut-web` image at build time (see
+# `infra/docker/stepcut-web.Dockerfile`), not bind-mounted like the edge
+# Caddy's `infra/docker/Caddyfile` is — this container is internal-only and
+# reached solely through the edge Caddy's `{$STEPCUT_DOMAIN}` block, which
+# owns TLS, HSTS/CSP headers and logging for the public response. All this
+# one has to do is answer the internal proxy with the SPA: serve the built
+# bundle and fall back to `index.html` for client-side routes.
+#
+# Lives here, alongside the app it serves, rather than under `infra/docker/`
+# with the other Caddy config: `infra/docker/stepcut-web.Dockerfile`'s build
+# context is `apps/` (same rule as every other image in this stack — see that
+# Dockerfile's own header), so a file this Dockerfile `COPY`s has to be
+# reachable from inside `apps/`. `infra/` is `apps/`'s sibling at the repo
+# root and out of reach of that build entirely.
+
+:80 {
+	encode zstd gzip
+	root * /srv
+	try_files {path} /index.html
+	file_server
+}
