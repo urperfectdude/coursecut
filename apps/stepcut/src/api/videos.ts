@@ -126,6 +126,45 @@ export function deleteVideo(id: string): Promise<void> {
   return request<void>("DELETE", `/videos/${id}`);
 }
 
+/** A short-TTL presigned GET for a video's source object — what `useVideoSrc`
+ * feeds an HTML `<video>`. Never a permanently public URL (plan §6). */
+export function getPlaybackUrl(storageKey: string): Promise<string> {
+  return request<{ url: string }>("POST", "/videos/playback-url", { storage_key: storageKey }).then(
+    (res) => res.url,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Steps: editing (Phase 4 — docs/stepcut-plan.md §8: "Manual editing")
+// ---------------------------------------------------------------------------
+
+/** Patches a step's boundary/title/summary. Any call here flips `source` to
+ * `"manual"` server-side — see `apps/stepcut-api/src/domain/steps.ts`. */
+export function updateStep(
+  id: string,
+  patch: { start?: number; end?: number; title?: string; summary?: string },
+): Promise<Step> {
+  return request<Step>("PATCH", `/steps/${id}`, patch);
+}
+
+/** Splits a step at `at` (seconds, strictly inside its current range) into
+ * two manual steps. Returns both, original first. */
+export function splitStep(id: string, at: number): Promise<Step[]> {
+  return request<Step[]>("POST", `/steps/${id}/split`, { at });
+}
+
+export function deleteStep(id: string): Promise<void> {
+  return request<void>("DELETE", `/steps/${id}`);
+}
+
+/** Adds a manual step to a video. */
+export function addStep(
+  videoId: string,
+  input: { start: number; end: number; title: string; summary?: string },
+): Promise<Step> {
+  return request<Step>("POST", `/videos/${videoId}/steps`, input);
+}
+
 /**
  * Uploads `file`'s parts and returns the (part number, ETag) list the
  * completion call needs. Part URLs are signed a batch at a time rather than

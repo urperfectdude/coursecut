@@ -4,13 +4,17 @@
 // button, a list of the org's videos with a status pill, and an inline view
 // of a transcribed video's transcript. Phase 3 adds a "Find steps" action and
 // a **read-only** list of the steps GPT-5.5 proposes from that transcript —
-// no editing yet (dragging a boundary, retitling, split/merge/delete are all
-// Phase 4's `PATCH`/`split`/`delete` routes and editor UI). No coursecut
-// counterpart: apps/stepcut's views are original, not ported from desktop.
+// no editing yet — Phase 4 (docs/stepcut-plan.md §8: "Manual editing") adds
+// an "Edit steps" action once that list is non-empty, handing off to
+// `StepsEditorView` (via `onEditSteps`, owned by `App.tsx`): dragging a
+// boundary, retitling, split/delete/add all live there now, not in this
+// inline panel. No coursecut counterpart: apps/stepcut's views are
+// original, not ported from desktop.
 //
-// No video playback here — that's Phase 4+, once there is something to edit
-// against. This view's job is now "prove a transcript appears after upload,
-// and AI-proposed steps appear after analyzing it."
+// No video playback here — that's `StepsEditorView`'s job now. This panel's
+// own job stays "prove a transcript appears after upload, and AI-proposed
+// steps appear after analyzing it," plus (Phase 4) the hand-off once there's
+// something to edit.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -35,6 +39,8 @@ import {
 
 interface DashboardViewProps {
   org: OrgSummary | undefined;
+  /** Navigates to `StepsEditorView` for a video (Phase 4). */
+  onEditSteps: (videoId: string) => void;
 }
 
 /** A video is still moving through the pipeline until one of these holds —
@@ -88,7 +94,7 @@ function isAnalyzing(panel: StepsPanel | undefined): boolean {
   return panel?.job?.state === "queued" || panel?.job?.state === "running";
 }
 
-export default function DashboardView({ org }: DashboardViewProps) {
+export default function DashboardView({ org, onEditSteps }: DashboardViewProps) {
   const [videos, setVideos] = useState<Video[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -339,19 +345,29 @@ export default function DashboardView({ org }: DashboardViewProps) {
                         }
                         if (panel.steps.length > 0) {
                           return (
-                            <ol className="flex flex-col gap-2">
-                              {panel.steps.map((step, index) => (
-                                <li key={step.id} className="text-sm">
-                                  <span className="mr-2 font-mono text-xs text-muted-foreground">
-                                    {index + 1}. {formatTimestamp(step.start)}–{formatTimestamp(step.end)}
-                                  </span>
-                                  <span className="font-medium">{step.title}</span>
-                                  {step.summary && (
-                                    <p className="ml-5 text-sm text-muted-foreground">{step.summary}</p>
-                                  )}
-                                </li>
-                              ))}
-                            </ol>
+                            <>
+                              <ol className="flex flex-col gap-2">
+                                {panel.steps.map((step, index) => (
+                                  <li key={step.id} className="text-sm">
+                                    <span className="mr-2 font-mono text-xs text-muted-foreground">
+                                      {index + 1}. {formatTimestamp(step.start)}–{formatTimestamp(step.end)}
+                                    </span>
+                                    <span className="font-medium">{step.title}</span>
+                                    {step.summary && (
+                                      <p className="ml-5 text-sm text-muted-foreground">{step.summary}</p>
+                                    )}
+                                  </li>
+                                ))}
+                              </ol>
+                              <Button
+                                type="button"
+                                size="sm"
+                                className="self-start"
+                                onClick={() => onEditSteps(video.id)}
+                              >
+                                Edit steps
+                              </Button>
+                            </>
                           );
                         }
                         if (isAnalyzing(panel)) {

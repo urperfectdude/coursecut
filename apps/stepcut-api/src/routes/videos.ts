@@ -201,6 +201,26 @@ videoRoutes.get("/videos/:id", async (c) => {
   return c.json(serialize.video(row));
 });
 
+/**
+ * Mints a short-TTL presigned GET for a video's source object — Phase 4's
+ * step editor needs to actually play the recording it's editing steps
+ * against. Own copy of apps/api/src/routes/videos.ts's `/videos/playback-url`
+ * (that file's D2): resolved against the caller's own rows, never signed as
+ * given, so a guessed or leaked key is a 404 rather than a signed URL.
+ */
+videoRoutes.post("/videos/playback-url", async (c) => {
+  const body = await c.req.json<{ storage_key?: string }>();
+  const key = body.storage_key;
+  if (!key) throw badRequest("storage_key is required");
+
+  const [row] = await tx(c, (t) =>
+    t.select({ id: videos.id }).from(videos).where(eq(videos.storageKey, key)).limit(1),
+  );
+  if (!row) throw notFound("video");
+
+  return c.json({ url: await storage.presignGet(key) });
+});
+
 videoRoutes.get("/videos/:id/transcript", async (c) => {
   const id = param(c, "id");
   const rows = await tx(c, async (t) => {

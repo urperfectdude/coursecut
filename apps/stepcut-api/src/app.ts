@@ -20,6 +20,7 @@ import { getAuth } from "./auth.js";
 import { requireOrg, type AppEnv } from "./http/context.js";
 import { orgRoutes } from "./routes/orgs.js";
 import { videoRoutes } from "./routes/videos.js";
+import { stepRoutes } from "./routes/steps.js";
 
 export function createApp() {
   const app = new Hono<AppEnv>();
@@ -44,6 +45,7 @@ export function createApp() {
   api.use("*", requireOrg);
   api.route("/", orgRoutes);
   api.route("/", videoRoutes);
+  api.route("/", stepRoutes);
 
   app.route("/api", api);
 
