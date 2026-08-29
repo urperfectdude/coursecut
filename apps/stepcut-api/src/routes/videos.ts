@@ -17,10 +17,21 @@
 //     `assertCanQueueJob` don't exist in StepCut yet — Phase 6 territory. The
 //     only refusal Phase 2 has is the upload-completion `headObject`
 //     re-check that the object actually landed in storage.
-//   * **No `/videos/:id/analyze` or `/videos/:id/lessons`.** `analyze` and
-//     `steps` are Phase 3.
 //   * **A `GET /videos` list route**, not in the plan's §4 sketch but needed
 //     for a usable dashboard and cheap to add.
+//   * **A `GET /videos/:id/jobs` list route**, also not in the plan's §4
+//     sketch. Phase 3 adds it for the same reason as the point above: without
+//     an SSE stream (see `apps/stepcut-worker/src/progress.ts`'s header),
+//     something has to tell a polling dashboard whether `analyze` is still
+//     running or has failed — `steps` staying empty is ambiguous between
+//     "still analyzing," "analysis found nothing," and "analysis errored,"
+//     and only the job row can tell those apart.
+//
+// Phase 3 (docs/stepcut-plan.md §8: "AI step proposal") adds
+// `/videos/:id/analyze` and `GET /videos/:id/steps` — see the "Steps" section
+// below. Both are still session-authed only, same as everything else here;
+// the plan's `/v1/...` API-key surface (§4) is a decision nothing in this
+// file has made yet.
 //
 // The upload-row-exists-before-the-bytes-do rationale, the presigned-PUT vs.
 // multipart threshold, and the re-check-after-upload discipline are all
@@ -32,7 +43,7 @@ import { asc, desc, eq } from "drizzle-orm";
 import { param, tx, type AppEnv } from "../http/context.js";
 import { badRequest, notFound } from "../http/errors.js";
 import * as serialize from "../http/serialize.js";
-import { transcriptSegments, videos } from "../db/schema.js";
+import { jobs, steps, transcriptSegments, videos } from "../db/schema.js";
 import { cancelJobsForVideo, enqueueVideoJob } from "../jobs/queue.js";
 import * as storage from "../storage.js";
 import type { Tx } from "../db/client.js";
@@ -203,6 +214,39 @@ videoRoutes.get("/videos/:id/transcript", async (c) => {
   return c.json(rows.map(serialize.transcriptSegment));
 });
 
+/**
+ * A video's proposed steps, in playback order. AI-proposed until Phase 4's
+ * editor exists, at which point an edited row's `source` flips to `manual`
+ * and this same read keeps working unchanged.
+ */
+videoRoutes.get("/videos/:id/steps", async (c) => {
+  const id = param(c, "id");
+  const rows = await tx(c, async (t) => {
+    await requireVideoRow(t, id);
+    return t
+      .select()
+      .from(steps)
+      .where(eq(steps.videoId, id))
+      .orderBy(asc(steps.sortOrder), asc(steps.start));
+  });
+  return c.json(rows.map(serialize.step));
+});
+
+/**
+ * A video's pipeline jobs, most recent first — what a polling dashboard reads
+ * to tell "still analyzing" apart from "analysis failed" or "found nothing,"
+ * since `GET /videos/:id/steps` alone cannot distinguish those (see this
+ * file's header).
+ */
+videoRoutes.get("/videos/:id/jobs", async (c) => {
+  const id = param(c, "id");
+  const rows = await tx(c, async (t) => {
+    await requireVideoRow(t, id);
+    return t.select().from(jobs).where(eq(jobs.videoId, id)).orderBy(desc(jobs.createdAt));
+  });
+  return c.json(rows.map(serialize.job));
+});
+
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
@@ -251,6 +295,43 @@ videoRoutes.post("/videos/:id/transcribe", async (c) => {
   return c.json(serialize.video(row));
 });
 
+// ---------------------------------------------------------------------------
+// Steps (Phase 3 — docs/stepcut-plan.md §8: "AI step proposal")
+// ---------------------------------------------------------------------------
+
+/**
+ * Queues step-boundary analysis. Only the transcript **text** goes to
+ * GPT-5.5 — never audio, never video (see `coursecut-privacy-invariants`).
+ *
+ * Checked here rather than left for the worker to discover, the same
+ * "validate before enqueueing" choice `/extract` makes for an unstarted
+ * upload: a video that has never been transcribed can never produce a step,
+ * so there is nothing to gain from burning a job row and a poll cycle on a
+ * request that cannot succeed.
+ *
+ * Returns the video's steps as they stand now, which for a fresh analysis is
+ * the empty list — the UI's cue to start polling `GET /videos/:id/jobs`
+ * rather than assuming this call already did the work.
+ */
+videoRoutes.post("/videos/:id/analyze", async (c) => {
+  const id = param(c, "id");
+  const attempt = attemptOf(await c.req.json<{ attempt?: number }>().catch(() => ({})));
+
+  const rows = await tx(c, async (t) => {
+    const video = await requireVideoRow(t, id);
+    if (video.transcriptStatus !== "transcribed") {
+      throw badRequest("this video has not finished transcribing yet");
+    }
+    await enqueueVideoJob(t, c.get("orgId"), "analyze", id, attempt);
+    return t
+      .select()
+      .from(steps)
+      .where(eq(steps.videoId, id))
+      .orderBy(asc(steps.sortOrder), asc(steps.start));
+  });
+  return c.json(rows.map(serialize.step));
+});
+
 videoRoutes.delete("/videos/:id", async (c) => {
   const id = param(c, "id");
 
@@ -258,7 +339,7 @@ videoRoutes.delete("/videos/:id", async (c) => {
     const video = await requireVideoRow(t, id);
     // Nothing should be queued against a row that is about to stop existing.
     await cancelJobsForVideo(t, id);
-    // transcript_segments and jobs go via ON DELETE CASCADE.
+    // transcript_segments, jobs, and steps go via ON DELETE CASCADE.
     await t.delete(videos).where(eq(videos.id, id));
     return video;
   });

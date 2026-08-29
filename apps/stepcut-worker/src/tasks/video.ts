@@ -1,23 +1,30 @@
-// The two video-pipeline stages Phase 2 has: extract → transcribe.
+// The video-pipeline stages: extract → transcribe (Phase 2), analyze
+// (Phase 3).
 //
-// Own copy of apps/worker/src/tasks/video.ts's `runExtract`/`runTranscribe`
-// halves — `runAnalyze` doesn't exist here, because `analyze` (and the
-// `steps` table it writes) is Phase 3.
+// Own copy of apps/worker/src/tasks/video.ts's `runExtract`/`runTranscribe`/
+// `runAnalyze` — `runAnalyze` here calls `analyzeSteps` (its own prompt, see
+// `apps/stepcut-api/src/openai.ts`'s header) rather than that file's
+// `analyzeTranscript`, and writes `steps` rather than `lessons`.
 //
-// One graphile-worker task for both stages, because they share everything
-// except their middle: the same job-row bookkeeping, the same cancellation
-// check, the same "record the failure where a future Retry can see it"
-// ending. The `jobs` row says which stage this is.
+// One graphile-worker task for all three stages, because they share
+// everything except their middle: the same job-row bookkeeping, the same
+// cancellation check, the same "record the failure where a future Retry can
+// see it" ending. The `jobs` row says which stage this is.
 //
 // **The chain is the worker's, not the API's.** `POST /videos/:id/extract`
 // just enqueues extraction and returns; a successful extract queues
 // transcription itself, here, once its own job has committed.
 
-import { withOrg } from "../../../stepcut-api/src/db/client.js";
+import { withOrg, type Tx } from "../../../stepcut-api/src/db/client.js";
 import { and, eq, isNotNull, ne } from "../../../stepcut-api/src/db/ops.js";
-import { jobs, transcriptSegments, videos } from "../../../stepcut-api/src/db/schema.js";
+import { jobs, steps, transcriptSegments, videos } from "../../../stepcut-api/src/db/schema.js";
 import * as storage from "../../../stepcut-api/src/storage.js";
-import { transcribeAudio, type TranscriptSegment } from "../../../stepcut-api/src/openai.js";
+import {
+  analyzeSteps,
+  transcribeAudio,
+  type StepSuggestion,
+  type TranscriptSegment,
+} from "../../../stepcut-api/src/openai.js";
 import { enqueueVideoJob } from "../../../stepcut-api/src/jobs/queue.js";
 import { extractAudio, probeDuration } from "../ffmpeg.js";
 import { makeReporter } from "../progress.js";
@@ -67,6 +74,8 @@ export async function runVideoJob(payload: VideoJobPayload): Promise<void> {
       await runExtract(orgId, videoId, jobId, job.attempt, report);
     } else if (job.kind === "transcribe") {
       await runTranscribe(orgId, videoId, report);
+    } else if (job.kind === "analyze") {
+      await runAnalyze(orgId, videoId, report);
     } else {
       throw new Error(`unknown video job kind ${job.kind}`);
     }
@@ -85,10 +94,17 @@ export async function runVideoJob(payload: VideoJobPayload): Promise<void> {
         .update(jobs)
         .set({ state: "failed", error: message, updatedAt: new Date() })
         .where(eq(jobs.id, jobId));
-      await tx
-        .update(videos)
-        .set({ transcriptStatus: "error", updatedAt: new Date() })
-        .where(eq(videos.id, videoId));
+      // Only extract/transcribe own `transcriptStatus` — an `analyze`
+      // failure has no transcript-side effect and must not stomp a video
+      // that is genuinely `transcribed`, which is exactly what unconditionally
+      // setting `error` here would do. The `jobs` row above is where an
+      // `analyze` failure actually surfaces (`GET /videos/:id/jobs`).
+      if (job.kind !== "analyze") {
+        await tx
+          .update(videos)
+          .set({ transcriptStatus: "error", updatedAt: new Date() })
+          .where(eq(videos.id, videoId));
+      }
     });
   }
 }
@@ -271,4 +287,84 @@ function findCachedTranscript(
       .where(eq(transcriptSegments.videoId, source.id))
       .orderBy(transcriptSegments.start, transcriptSegments.id);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Analyze
+// ---------------------------------------------------------------------------
+
+const newStepId = () => crypto.randomUUID();
+
+/**
+ * Sends the transcript **text** to GPT-5.5 (`analyzeSteps` — its own prompt,
+ * see `apps/stepcut-api/src/openai.ts`'s header) and replaces the video's
+ * AI-sourced steps with what comes back.
+ *
+ * Only `source = 'ai'` rows are cleared — a step a human has built or edited
+ * by hand (Phase 4) survives a re-analysis, the same `lessons.source` rule
+ * `apps/worker`'s `runAnalyze` already relies on. Unlike that reference,
+ * there is no dead-air trimming here: `transcript_segments` has no `keep`
+ * column in this schema (see `schema.ts`'s header), so every stored segment
+ * is sent as-is.
+ */
+async function runAnalyze(
+  orgId: string,
+  videoId: string,
+  report: ReturnType<typeof makeReporter>,
+): Promise<void> {
+  report(null, "Finding steps");
+
+  const segments = await withOrg(orgId, (tx) =>
+    tx
+      .select({
+        start: transcriptSegments.start,
+        end: transcriptSegments.end,
+        text: transcriptSegments.text,
+      })
+      .from(transcriptSegments)
+      .where(eq(transcriptSegments.videoId, videoId))
+      .orderBy(transcriptSegments.start, transcriptSegments.id),
+  );
+
+  if (segments.length === 0) {
+    throw new Error("This video has no transcript yet — transcribe it before analyzing.");
+  }
+
+  const suggestions = await analyzeSteps(segments);
+  // Sorted by start, because `sort_order` is assigned by this order.
+  suggestions.sort((a, b) => a.start - b.start);
+
+  await withOrg(orgId, (tx) => replaceAiSteps(tx, orgId, videoId, suggestions));
+}
+
+/**
+ * Deletes the video's `source = 'ai'` steps and inserts the fresh ones.
+ *
+ * Own copy of apps/worker's `replaceAiLessons`, simplified for a step's
+ * single range: no bounds to compute across a segment list, since a step
+ * *is* its own `start`/`end`.
+ */
+async function replaceAiSteps(
+  tx: Tx,
+  orgId: string,
+  videoId: string,
+  suggestions: StepSuggestion[],
+): Promise<void> {
+  await tx.delete(steps).where(and(eq(steps.videoId, videoId), eq(steps.source, "ai")));
+
+  if (suggestions.length === 0) return;
+  await tx.insert(steps).values(
+    suggestions.map((suggestion, index) => ({
+      id: newStepId(),
+      orgId,
+      videoId,
+      sortOrder: index,
+      start: suggestion.start,
+      end: suggestion.end,
+      title: suggestion.title,
+      summary: suggestion.summary,
+      confidence: suggestion.confidence,
+      source: "ai",
+    })),
+  );
 }

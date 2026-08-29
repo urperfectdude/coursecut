@@ -1,20 +1,21 @@
-// Whisper transcription — the transcription-only slice of apps/api's
+// Whisper transcription (Phase 2) and GPT-5.5 step analysis (Phase 3).
+//
+// The Whisper half is the transcription-only slice of apps/api's
 // src/openai.ts (`src-tauri/src/openai.rs`'s Whisper half, by way of that
-// port).
+// port). The analysis half below is **not** a port or a fork of that file's
+// `analyzeTranscript` — plan §9 is explicit that this prompt has to be its
+// own from day one, tuned for "steps in a task" rather than "lessons in a
+// lecture," because the freedom to iterate on it without touching the
+// shipped lesson product is the entire reason this backend is separate. The
+// shape it shares with the coursecut original (a text-only chat completion
+// returning a constrained JSON object, parsed defensively) is a technique
+// worth reusing, not a prompt worth reusing.
 //
-// StepCut has no GPT-5.5 lesson-analysis call to reimplement here, and that
-// is deliberate rather than a Phase 2 gap: `analyze` arrives in Phase 3 with
-// its **own** prompt, tuned for "steps in a task" from day one — plan §9 is
-// explicit that it must never share or fork coursecut's lesson-boundary
-// prompt, because the freedom to iterate on that prompt without touching the
-// shipped lesson product is the entire reason this backend is separate. So
-// this file only ever grows the pieces `extract`/`transcribe` need; the
-// analysis half belongs in a file that does not exist yet.
-//
-// **Privacy**, unchanged from the coursecut original: only the **extracted
-// audio** goes to Whisper. This module has no filesystem and no S3 access at
-// all — it takes audio as bytes a caller already extracted. Nothing else
-// about a tenant (ids, names, keys) is ever sent.
+// **Privacy**, unchanged from the coursecut original: only extracted audio
+// reaches Whisper, and only transcript **text** reaches GPT-5.5 — never the
+// source video. This module has no filesystem and no S3 access at all — it
+// takes audio as bytes, and transcript rows as plain objects, a caller
+// already has. Nothing else about a tenant (ids, names, keys) is ever sent.
 //
 // **The key is the platform's.** One `OPENAI_API_KEY` in the server's
 // environment, used for every tenant, never in the database and never sent
@@ -49,7 +50,11 @@ const CHUNK_TARGET_BYTES = 19_200_000;
  * 10 minutes. */
 const TRANSCRIBE_TIMEOUT_MS = 600_000;
 
+/** Same ceiling apps/api's chat completion gives GPT-5.5 for lesson analysis. */
+const COMPLETION_TIMEOUT_MS = 180_000;
+
 const TRANSCRIPTION_MODEL = "whisper-1";
+const ANALYSIS_MODEL = "gpt-5.5";
 
 function authHeaders(): Record<string, string> {
   return { Authorization: `Bearer ${env.openAiApiKey()}` };
@@ -205,4 +210,172 @@ export function mergeChunkSegments(
       text: segment.text,
     })),
   );
+}
+
+// ---------------------------------------------------------------------------
+// GPT-5.5 step analysis (Phase 3 — docs/stepcut-plan.md §5.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * One step proposal. `start`/`end`/`title` are always populated and
+ * `start < end`; `confidence` is always within `[0, 1]` — both enforced
+ * before the object is built, so nothing downstream re-checks them.
+ *
+ * Unlike a coursecut `LessonSuggestion`, this is a single range, not an array
+ * of them — a step is one contiguous action, never assembled from
+ * non-contiguous parts of the transcript (see `schema.ts`'s `steps` header).
+ */
+export interface StepSuggestion {
+  start: number;
+  end: number;
+  title: string;
+  summary: string;
+  confidence: number;
+}
+
+const STEP_ANALYSIS_SYSTEM_PROMPT =
+  "You are an assistant that watches the transcript of a narrated screen recording — someone " +
+  "walking through a task on their computer while describing what they are doing — and proposes " +
+  "the discrete steps that make up that task, for a tool that turns the recording into a " +
+  "step-by-step tutorial video. You are given the transcript as a sequence of timestamped " +
+  'segments (in seconds). Respond with a single JSON object of the exact shape {"steps": ' +
+  '[{"start": number, "end": number, "title": string, "summary": string, "confidence": number}, ' +
+  '...]} and nothing else — no prose, no markdown fences. A step is one contiguous, ordered ' +
+  'action the narrator performs and describes — for example "open the settings page", "rename ' +
+  'the project", or "click Save" — not a topic, a lesson, or a question. Order steps by `start` ' +
+  "and do not let them overlap; it is fine, and expected, for there to be a gap between two steps " +
+  "for narration that is not itself a step (a preamble, a false start, dead air, an aside) rather " +
+  "than forcing that material into the nearest step. Give each step a short, imperative title " +
+  '(for example "Open the settings menu") and a one- or two-sentence summary of what the user ' +
+  "does and why, written for someone following along afterward. Every `start` and `end` must be a " +
+  "real timestamp in seconds, drawn from (or falling between) the given segment boundaries, with " +
+  "`start` < `end`. Every step must include a `confidence` between 0 and 1 reflecting how sure " +
+  "you are about that step's boundaries.";
+
+interface ChatCompletionResponse {
+  choices?: Array<{ message?: { content?: string | null } }>;
+}
+
+/**
+ * A finite number out of a JSON value that should be numeric. A numeric
+ * string is accepted too rather than discarding an otherwise-usable
+ * suggestion over a formatting slip.
+ */
+function valueAsNumber(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string") {
+    const parsed = Number.parseFloat(value.trim());
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+/** One text-only chat completion, returning the message content. */
+async function chatCompletion(systemPrompt: string, userPrompt: string): Promise<string> {
+  const response = await callOpenAi(
+    "/chat/completions",
+    {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: ANALYSIS_MODEL,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      }),
+    },
+    COMPLETION_TIMEOUT_MS,
+    "GPT-5.5",
+  );
+
+  const parsed = (await response.json()) as ChatCompletionResponse;
+  const content = parsed.choices?.[0]?.message?.content;
+  if (!content) throw new Error("GPT-5.5 response had no message content");
+  return content;
+}
+
+/** A transcript line, timestamped in seconds — the shape both `transcribeAudio`
+ * and `analyzeSteps` agree on for a stored `transcript_segments` row. */
+export interface TranscriptLine {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** The `[start-end] text` rendering the analysis prompt uses for transcript context. */
+function renderTranscript(segments: readonly TranscriptLine[]): string {
+  return segments
+    .map((segment) => `[${segment.start.toFixed(2)}-${segment.end.toFixed(2)}] ${segment.text}`)
+    .join("\n");
+}
+
+/**
+ * Sends transcript **text only** — timestamps and words, never audio, never
+ * video — to GPT-5.5 and parses the reply into validated step suggestions.
+ */
+export async function analyzeSteps(segments: readonly TranscriptLine[]): Promise<StepSuggestion[]> {
+  if (segments.length === 0) throw new Error("no transcript segments to analyze");
+
+  const transcriptStart = Math.min(...segments.map((segment) => segment.start));
+  const transcriptEnd = Math.max(...segments.map((segment) => segment.end));
+
+  const content = await chatCompletion(
+    STEP_ANALYSIS_SYSTEM_PROMPT,
+    `Transcript (timestamps in seconds):\n\n${renderTranscript(segments)}`,
+  );
+
+  return parseStepSuggestions(content, transcriptStart, transcriptEnd);
+}
+
+/**
+ * Parses `{"steps": [...]}` into validated suggestions, **dropping** rather
+ * than erroring on any individual entry that is malformed: non-numeric
+ * bounds, `start >= end`, or bounds outside `[rangeStart - 1, rangeEnd + 1]`
+ * (a small tolerance around the transcript context actually given, mirroring
+ * the prompt's instruction to draw ranges from within it). A missing `steps`
+ * array is an error, since that is a malformed response rather than an empty
+ * one.
+ */
+export function parseStepSuggestions(
+  content: string,
+  transcriptStart: number,
+  transcriptEnd: number,
+): StepSuggestion[] {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(content);
+  } catch (err) {
+    throw new Error(
+      `could not parse GPT-5.5 JSON payload: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const rawSteps = (payload as { steps?: unknown })?.steps;
+  if (!Array.isArray(rawSteps)) {
+    throw new Error('GPT-5.5 JSON payload is missing a "steps" array');
+  }
+
+  const suggestions: StepSuggestion[] = [];
+  for (const raw of rawSteps) {
+    const entry = raw as Record<string, unknown>;
+    const start = valueAsNumber(entry.start);
+    const end = valueAsNumber(entry.end);
+    if (start === undefined || end === undefined) continue;
+    if (end <= start || start < transcriptStart - 1 || end > transcriptEnd + 1) continue;
+
+    const trimmedTitle = typeof entry.title === "string" ? entry.title.trim() : "";
+    const title = trimmedTitle.length > 0 ? trimmedTitle : "Untitled step";
+
+    suggestions.push({
+      start,
+      end,
+      title,
+      summary: typeof entry.summary === "string" ? entry.summary : "",
+      confidence: Math.min(1, Math.max(0, valueAsNumber(entry.confidence) ?? 0.5)),
+    });
+  }
+
+  return suggestions;
 }

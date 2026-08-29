@@ -2,12 +2,12 @@
 //
 // Phase 1 (docs/stepcut-plan.md §8: "Scaffold") shipped only the seven
 // better-auth/org tables plus `api_keys`. Phase 2 ("Upload & transcript")
-// adds `videos`, `transcript_segments` and `jobs` together — trimmed to what
-// Phase 2 needs (no `keep` column on transcript segments, `jobs.kind` is only
-// `'extract' | 'transcribe'` for now; see docs/stepcut-plan.md's Phase 2
-// section for the full list of deltas from apps/api's copy of this same
-// shape). `steps` arrives in Phase 3, `templates`/`renders`/`render_steps` in
-// Phase 5.
+// added `videos`, `transcript_segments` and `jobs` together — trimmed to what
+// Phase 2 needed (no `keep` column on transcript segments; see
+// docs/stepcut-plan.md's Phase 2 section for the full list of deltas from
+// apps/api's copy of this same shape). Phase 3 ("AI step proposal") adds
+// `steps` and extends `jobs.kind` with `'analyze'`. `templates`/`renders`/
+// `render_steps` arrive in Phase 5.
 //
 // Conventions, copied from apps/api/src/db/schema.ts:
 //
@@ -317,15 +317,15 @@ export const transcriptSegments = pgTable(
  * scheduling/retries/locking; this row is kept separate from that so a job
  * stays tenant-scoped and RLS-covered while the queue's internals are not.
  *
- * `kind` is only `'extract' | 'transcribe'` for now — no `'analyze'` (Phase
- * 3) or `'render'` (Phase 5) yet.
+ * `kind` is `'extract' | 'transcribe' | 'analyze'` as of Phase 3 — no
+ * `'render'` (Phase 5) yet.
  */
 export const jobs = pgTable(
   "jobs",
   {
     id: id(),
     orgId: text("org_id").notNull(),
-    // 'extract' | 'transcribe'.
+    // 'extract' | 'transcribe' | 'analyze'.
     kind: text("kind").notNull(),
     // 'queued' | 'running' | 'done' | 'failed' | 'cancelled'.
     state: text("state").notNull().default("queued"),
@@ -349,6 +349,51 @@ export const jobs = pgTable(
     }).onDelete("cascade"),
     index("idx_jobs_video_id").on(t.videoId),
     index("idx_jobs_org_state").on(t.orgId, t.state),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Steps — Phase 3 (docs/stepcut-plan.md §8: "AI step proposal")
+// ---------------------------------------------------------------------------
+//
+// What coursecut calls a "lesson," named for what it actually is here: one
+// contiguous action in a narrated screen recording, not a topic. Unlike
+// `lessons`, a step has exactly one `start`/`end` range of its own — there is
+// no `lesson_segments`-style child table, because a step is not assembled
+// from possibly-discontiguous ranges the way a lesson can be. No `kind`
+// column either: lessons distinguish "lesson" from "qna"/"discussion"/etc.,
+// but every step is the same kind of thing.
+//
+// `source` mirrors `lessons.source` exactly: `analyze` only ever replaces the
+// `'ai'` rows (see `apps/stepcut-worker/src/tasks/video.ts`'s `replaceAiSteps`),
+// so a step a human has edited survives a re-analysis. Phase 3 never writes
+// `source = 'manual'` itself — that arrives with the editor in Phase 4 — but
+// the column exists now so `analyze`'s replace-only-'ai' rule has something to
+// respect from day one.
+export const steps = pgTable(
+  "steps",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    videoId: text("video_id").notNull(),
+    sortOrder: integer("sort_order").notNull().default(0),
+    start: doublePrecision("start").notNull(),
+    end: doublePrecision("end").notNull(),
+    title: text("title").notNull(),
+    summary: text("summary"),
+    // 'ai' | 'manual'.
+    source: text("source").notNull().default("ai"),
+    // Nullable — only ever set for an AI-proposed step.
+    confidence: doublePrecision("confidence"),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    foreignKey({
+      name: "fk_steps_video",
+      columns: [t.videoId, t.orgId],
+      foreignColumns: [videos.id, videos.orgId],
+    }).onDelete("cascade"),
+    index("idx_steps_video_id").on(t.videoId),
   ],
 );
 
@@ -377,6 +422,7 @@ export const membersRelations = relations(members, ({ one }) => ({
 export const videosRelations = relations(videos, ({ many }) => ({
   transcriptSegments: many(transcriptSegments),
   jobs: many(jobs),
+  steps: many(steps),
 }));
 
 export const transcriptSegmentsRelations = relations(transcriptSegments, ({ one }) => ({
@@ -385,6 +431,10 @@ export const transcriptSegmentsRelations = relations(transcriptSegments, ({ one 
 
 export const jobsRelations = relations(jobs, ({ one }) => ({
   video: one(videos, { fields: [jobs.videoId], references: [videos.id] }),
+}));
+
+export const stepsRelations = relations(steps, ({ one }) => ({
+  video: one(videos, { fields: [steps.videoId], references: [videos.id] }),
 }));
 
 /**
@@ -401,7 +451,7 @@ export const jobsRelations = relations(jobs, ({ one }) => ({
  *     `org_id` FK, no policy, looked up directly by the (future)
  *     `requireApiKey` middleware, which then calls `withOrg(row.orgId, ...)`
  *     for everything downstream of that lookup.
- *   * `steps`/`templates`/`renders`/`render_steps` will be added here
- *     alongside their own migrations in Phase 3/5.
+ *   * `templates`/`renders`/`render_steps` will be added here alongside their
+ *     own migrations in Phase 5.
  */
-export const TENANT_TABLES = ["videos", "transcript_segments", "jobs"] as const;
+export const TENANT_TABLES = ["videos", "transcript_segments", "jobs", "steps"] as const;

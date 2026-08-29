@@ -31,6 +31,33 @@ export interface TranscriptSegment {
   text: string;
 }
 
+/** A proposed (or, from Phase 4 on, edited) step. */
+export interface Step {
+  id: string;
+  video_id: string;
+  sort_order: number;
+  start: number;
+  end: number;
+  title: string;
+  summary: string | null;
+  source: string;
+  confidence: number | null;
+  updated_at: string;
+}
+
+export interface Job {
+  id: string;
+  kind: string;
+  state: string;
+  video_id: string | null;
+  attempt: number;
+  progress: number | null;
+  detail: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface UploadTicket {
   video_id: string;
   storage_key: string;
@@ -59,6 +86,24 @@ export function getVideo(id: string): Promise<Video> {
 
 export function getTranscript(id: string): Promise<TranscriptSegment[]> {
   return request<TranscriptSegment[]>("GET", `/videos/${id}/transcript`);
+}
+
+export function getSteps(id: string): Promise<Step[]> {
+  return request<Step[]>("GET", `/videos/${id}/steps`);
+}
+
+/** Most recent first — a polling caller reads `jobs[0]` for `kind === "analyze"`. */
+export function getJobs(id: string): Promise<Job[]> {
+  return request<Job[]>("GET", `/videos/${id}/jobs`);
+}
+
+/**
+ * Queues step analysis. Returns the video's steps as they stand now (empty,
+ * for a fresh analysis) — the caller should poll `getJobs`/`getSteps` rather
+ * than treat this response as the finished result.
+ */
+export function analyzeVideo(videoId: string): Promise<Step[]> {
+  return request<Step[]>("POST", `/videos/${videoId}/analyze`);
 }
 
 function createUploadTicket(filename: string, size: number, contentType: string): Promise<UploadTicket> {

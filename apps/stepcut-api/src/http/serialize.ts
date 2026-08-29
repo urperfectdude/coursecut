@@ -7,11 +7,17 @@
 // with, so there is no legacy field-name debt to honour.
 
 import type { InferSelectModel } from "drizzle-orm";
-import type { jobs as jobsTable, transcriptSegments as transcriptSegmentsTable, videos as videosTable } from "../db/schema.js";
+import type {
+  jobs as jobsTable,
+  steps as stepsTable,
+  transcriptSegments as transcriptSegmentsTable,
+  videos as videosTable,
+} from "../db/schema.js";
 
 type VideoRow = InferSelectModel<typeof videosTable>;
 type TranscriptSegmentRow = InferSelectModel<typeof transcriptSegmentsTable>;
 type JobRow = InferSelectModel<typeof jobsTable>;
+type StepRow = InferSelectModel<typeof stepsTable>;
 
 const iso = (value: Date) => value.toISOString();
 
@@ -49,6 +55,21 @@ export function job(row: JobRow) {
     detail: row.detail,
     error: row.error,
     created_at: iso(row.createdAt),
+    updated_at: iso(row.updatedAt),
+  };
+}
+
+export function step(row: StepRow) {
+  return {
+    id: row.id,
+    video_id: row.videoId,
+    sort_order: row.sortOrder,
+    start: row.start,
+    end: row.end,
+    title: row.title,
+    summary: row.summary,
+    source: row.source,
+    confidence: row.confidence,
     updated_at: iso(row.updatedAt),
   };
 }

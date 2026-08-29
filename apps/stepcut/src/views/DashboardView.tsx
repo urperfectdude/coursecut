@@ -1,12 +1,16 @@
-// The signed-in dashboard — Phase 2's whole product surface
-// (docs/stepcut-plan.md §8: "Upload & transcript"). Phase 1 shipped an
-// empty card here; this extends it into an upload button, a list of the
-// org's videos with a status pill, and — once a video is transcribed — an
-// inline view of its transcript. No coursecut counterpart: apps/stepcut's
-// views are original, not ported from desktop.
+// The signed-in dashboard — Phase 2 and Phase 3's product surface
+// (docs/stepcut-plan.md §8: "Upload & transcript", "AI step proposal").
+// Phase 1 shipped an empty card here; Phase 2 extended it into an upload
+// button, a list of the org's videos with a status pill, and an inline view
+// of a transcribed video's transcript. Phase 3 adds a "Find steps" action and
+// a **read-only** list of the steps GPT-5.5 proposes from that transcript —
+// no editing yet (dragging a boundary, retitling, split/merge/delete are all
+// Phase 4's `PATCH`/`split`/`delete` routes and editor UI). No coursecut
+// counterpart: apps/stepcut's views are original, not ported from desktop.
 //
-// No video playback and no step editor here — that's Phase 3+. This view's
-// whole job is "prove a transcript appears after upload."
+// No video playback here — that's Phase 4+, once there is something to edit
+// against. This view's job is now "prove a transcript appears after upload,
+// and AI-proposed steps appear after analyzing it."
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -15,11 +19,16 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import type { OrgSummary } from "@/auth/useOrgs";
 import { ApiError } from "@/api/http";
 import {
+  analyzeVideo,
   deleteVideo,
+  getJobs,
+  getSteps,
   getTranscript,
   listVideos,
   transcribeVideo,
   uploadVideo,
+  type Job,
+  type Step,
   type TranscriptSegment,
   type Video,
 } from "@/api/videos";
@@ -66,12 +75,27 @@ function formatTimestamp(seconds: number): string {
 /** How often the list is re-fetched while at least one video is mid-pipeline. */
 const POLL_INTERVAL_MS = 1500;
 
+/** A video's steps panel state: what `GET /videos/:id/steps` last returned,
+ * plus the most recent `analyze` job — needed because an empty `steps` array
+ * is ambiguous between "still analyzing," "analysis found nothing," and
+ * "analysis failed" (see `apps/stepcut-api/src/routes/videos.ts`'s header). */
+interface StepsPanel {
+  steps: Step[];
+  job: Job | undefined;
+}
+
+function isAnalyzing(panel: StepsPanel | undefined): boolean {
+  return panel?.job?.state === "queued" || panel?.job?.state === "running";
+}
+
 export default function DashboardView({ org }: DashboardViewProps) {
   const [videos, setVideos] = useState<Video[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [expanded, setExpanded] = useState<Record<string, TranscriptSegment[] | undefined>>({});
+  const [stepsExpanded, setStepsExpanded] = useState<Record<string, boolean>>({});
+  const [stepsPanels, setStepsPanels] = useState<Record<string, StepsPanel | undefined>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
@@ -97,6 +121,32 @@ export default function DashboardView({ org }: DashboardViewProps) {
     const timer = setInterval(() => void refresh(), POLL_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [videos, refresh]);
+
+  const loadSteps = useCallback(async (id: string) => {
+    try {
+      const [steps, jobs] = await Promise.all([getSteps(id), getJobs(id)]);
+      setStepsPanels((current) => ({
+        ...current,
+        [id]: { steps, job: jobs.find((job) => job.kind === "analyze") },
+      }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  // Poll only a video whose steps panel is open and whose latest `analyze`
+  // job is still in flight — same "stop once settled" discipline the video
+  // list's own poll uses above, scoped to the one video actually waiting.
+  useEffect(() => {
+    const pending = Object.entries(stepsPanels)
+      .filter(([id, panel]) => stepsExpanded[id] && isAnalyzing(panel))
+      .map(([id]) => id);
+    if (pending.length === 0) return;
+    const timer = setInterval(() => {
+      pending.forEach((id) => void loadSteps(id));
+    }, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [stepsPanels, stepsExpanded, loadSteps]);
 
   const handleFileChosen = async (file: File) => {
     setUploading(true);
@@ -130,8 +180,43 @@ export default function DashboardView({ org }: DashboardViewProps) {
         delete rest[id];
         return rest;
       });
+      setStepsPanels((current) => {
+        const rest = { ...current };
+        delete rest[id];
+        return rest;
+      });
+      setStepsExpanded((current) => {
+        const rest = { ...current };
+        delete rest[id];
+        return rest;
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  /** Opens the steps panel, loading it the first time. Collapsing never
+   * drops the cached panel, so re-opening doesn't re-fetch or lose an
+   * in-flight analysis's place. */
+  const toggleSteps = (id: string) => {
+    setStepsExpanded((current) => ({ ...current, [id]: !current[id] }));
+    if (!stepsPanels[id]) void loadSteps(id);
+  };
+
+  /** Queues analysis, then loads the panel once so it immediately reflects
+   * the freshly-queued job rather than waiting for the next poll tick. */
+  const handleFindSteps = async (id: string) => {
+    setStepsExpanded((current) => ({ ...current, [id]: true }));
+    try {
+      await analyzeVideo(id);
+      await loadSteps(id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      // `analyzeVideo` itself failed (as opposed to the job it queues later
+      // failing) — without a panel, the "Loading…" placeholder has no
+      // condition that would ever clear it. An empty, job-less panel falls
+      // through to the "Find steps" button instead, so Retry is available.
+      setStepsPanels((current) => current[id] ? current : { ...current, [id]: { steps: [], job: undefined } });
     }
   };
 
@@ -154,8 +239,8 @@ export default function DashboardView({ org }: DashboardViewProps) {
         <CardHeader>
           <CardTitle>{org?.name ?? "Your organization"}</CardTitle>
           <CardDescription>
-            Upload a narrated screen recording to see it transcribed. Step detection and editing
-            come in a later phase.
+            Upload a narrated screen recording to see it transcribed, then find its steps.
+            Editing the proposed steps comes in a later phase.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
@@ -213,6 +298,11 @@ export default function DashboardView({ org }: DashboardViewProps) {
                         {expanded[video.id] ? "Hide transcript" : "View transcript"}
                       </Button>
                     )}
+                    {video.transcript_status === "transcribed" && (
+                      <Button variant="outline" size="sm" onClick={() => toggleSteps(video.id)}>
+                        {stepsExpanded[video.id] ? "Hide steps" : "Steps"}
+                      </Button>
+                    )}
                     {video.transcript_status === "error" && (
                       <Button variant="outline" size="sm" onClick={() => void handleRetryTranscribe(video.id)}>
                         Retry transcription
@@ -237,6 +327,75 @@ export default function DashboardView({ org }: DashboardViewProps) {
                           </p>
                         ))
                       )}
+                    </div>
+                  )}
+
+                  {stepsExpanded[video.id] && (
+                    <div className="mt-3 flex flex-col gap-2 rounded-md bg-muted/50 p-2">
+                      {(() => {
+                        const panel = stepsPanels[video.id];
+                        if (!panel) {
+                          return <p className="text-sm text-muted-foreground">Loading…</p>;
+                        }
+                        if (panel.steps.length > 0) {
+                          return (
+                            <ol className="flex flex-col gap-2">
+                              {panel.steps.map((step, index) => (
+                                <li key={step.id} className="text-sm">
+                                  <span className="mr-2 font-mono text-xs text-muted-foreground">
+                                    {index + 1}. {formatTimestamp(step.start)}–{formatTimestamp(step.end)}
+                                  </span>
+                                  <span className="font-medium">{step.title}</span>
+                                  {step.summary && (
+                                    <p className="ml-5 text-sm text-muted-foreground">{step.summary}</p>
+                                  )}
+                                </li>
+                              ))}
+                            </ol>
+                          );
+                        }
+                        if (isAnalyzing(panel)) {
+                          return (
+                            <p className="text-sm text-muted-foreground">
+                              {panel.job?.detail ?? "Finding steps…"}
+                            </p>
+                          );
+                        }
+                        if (panel.job?.state === "failed") {
+                          return (
+                            <div className="flex flex-col gap-2">
+                              <p className="text-sm text-destructive">
+                                {panel.job.error ?? "Step analysis failed."}
+                              </p>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="self-start"
+                                onClick={() => void handleFindSteps(video.id)}
+                              >
+                                Retry
+                              </Button>
+                            </div>
+                          );
+                        }
+                        if (panel.job?.state === "done") {
+                          return (
+                            <p className="text-sm text-muted-foreground">
+                              No steps were found in this recording.
+                            </p>
+                          );
+                        }
+                        return (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="self-start"
+                            onClick={() => void handleFindSteps(video.id)}
+                          >
+                            Find steps
+                          </Button>
+                        );
+                      })()}
                     </div>
                   )}
                 </li>

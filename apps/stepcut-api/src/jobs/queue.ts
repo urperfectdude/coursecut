@@ -1,9 +1,10 @@
 // Enqueuing the long-running work.
 //
-// Own copy of apps/api/src/jobs/queue.ts, trimmed to Phase 2's two stages
-// (`extract`, `transcribe` — no `analyze`/`export`/`render` yet, and
-// correspondingly no `enqueueExportJob`/`requeueExport`/`cancelJobsForExport`/
-// `latestJob`, which are export/retry-surface concerns for later phases).
+// Own copy of apps/api/src/jobs/queue.ts, trimmed to what's shipped so far:
+// `extract`, `transcribe` (Phase 2) and `analyze` (Phase 3) — no
+// `export`/`render` yet, and correspondingly no
+// `enqueueExportJob`/`requeueExport`/`cancelJobsForExport`/`latestJob`, which
+// are export/retry-surface concerns for later phases.
 //
 // **Two tables, one job.** `jobs` is the tenant-visible projection —
 // RLS-covered, and what a future poll/progress surface and a Retry button act
@@ -29,7 +30,7 @@ import { and, eq, sql } from "drizzle-orm";
 import type { Tx } from "../db/client.js";
 import { jobs } from "../db/schema.js";
 
-export type JobKind = "extract" | "transcribe";
+export type JobKind = "extract" | "transcribe" | "analyze";
 
 export type JobRow = typeof jobs.$inferSelect;
 
@@ -40,6 +41,7 @@ export const VIDEO_TASK = "video-pipeline";
 const OPENING_DETAIL: Record<JobKind, string> = {
   extract: "Extracting audio",
   transcribe: "Transcribing audio",
+  analyze: "Finding steps",
 };
 
 /**
