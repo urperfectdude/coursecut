@@ -16,6 +16,9 @@
     "db:reset": "npm run db:create && npm run db:bootstrap && npm run db:migrate"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1099.0",
+    "@aws-sdk/lib-storage": "^3.1100.0",
+    "@aws-sdk/s3-request-presigner": "^3.1099.0",
     "@hono/node-server": "^2.0.12",
     "better-auth": "1.6.25",
     "drizzle-orm": "^0.45.2",

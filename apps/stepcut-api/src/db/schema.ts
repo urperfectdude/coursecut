@@ -1,23 +1,34 @@
-// StepCut's Postgres schema — Phase 1 (docs/stepcut-plan.md §8: "Scaffold").
+// StepCut's Postgres schema.
 //
-// Lean by design (plan decision 2): only the seven better-auth/org tables
-// plus `api_keys`. `videos`/`transcript_segments`/`jobs` arrive in Phase 2,
-// `steps` in Phase 3, `templates`/`renders`/`render_steps` in Phase 5. No
-// stub tables now.
+// Phase 1 (docs/stepcut-plan.md §8: "Scaffold") shipped only the seven
+// better-auth/org tables plus `api_keys`. Phase 2 ("Upload & transcript")
+// adds `videos`, `transcript_segments` and `jobs` together — trimmed to what
+// Phase 2 needs (no `keep` column on transcript segments, `jobs.kind` is only
+// `'extract' | 'transcribe'` for now; see docs/stepcut-plan.md's Phase 2
+// section for the full list of deltas from apps/api's copy of this same
+// shape). `steps` arrives in Phase 3, `templates`/`renders`/`render_steps` in
+// Phase 5.
 //
 // Conventions, copied from apps/api/src/db/schema.ts:
 //
 //  * Ids are `text`, not `uuid` — `better-auth` mints its own ids and they
 //    are not UUIDs.
 //  * `created_at`/`updated_at` are `timestamptz`.
-//  * Every future tenant-scoped row will carry `org_id` directly, so an RLS
-//    policy is a single-column check rather than a join — see `TENANT_TABLES`
-//    at the bottom of this file for why nothing is in that list yet.
+//  * Every tenant-scoped row carries `org_id` directly, so an RLS policy is a
+//    single-column check rather than a join. `videos` has no parent table in
+//    StepCut (no `projects` — plan §3), so it gets a plain `org_id` column
+//    rather than a composite FK up to one; it still exposes
+//    `UNIQUE (id, org_id)` so `jobs`/`transcript_segments` can composite-FK
+//    down to it the same way apps/api's tables do.
 
 import { relations } from "drizzle-orm";
 import {
+  bigint,
   boolean,
+  doublePrecision,
+  foreignKey,
   index,
+  integer,
   pgTable,
   text,
   timestamp,
@@ -219,10 +230,130 @@ export const apiKeys = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Videos, transcripts, jobs — Phase 2 (docs/stepcut-plan.md §8)
+// ---------------------------------------------------------------------------
+//
+// Same shape as apps/api's `videos`/`transcript_segments`/`jobs` (the
+// upload/extract/transcribe problem is identical), reimplemented as
+// StepCut's own copy — a fresh set of tables, never a shared row. See this
+// file's header for the deltas from that reference.
+
+/**
+ * A source video. `duration` stays nullable until `extract` probes it, same
+ * as apps/api's copy.
+ */
+export const videos = pgTable(
+  "videos",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    // The object key `stepcut/{org_id}/{video_id}/{filename}` — a key, never
+    // a URL and never a bucket hostname (see src/storage.ts).
+    storageKey: text("storage_key").notNull(),
+    // 'pending' | 'uploaded' | 'failed'. A row exists from the moment its
+    // presigned PUT is minted, so a browser that dies mid-upload leaves a
+    // `pending` row to garbage-collect rather than a silent gap.
+    uploadStatus: text("upload_status").notNull().default("pending"),
+    duration: doublePrecision("duration"),
+    // 'pending' | 'audio_ready' | 'transcribed' | 'error'.
+    transcriptStatus: text("transcript_status").notNull().default("pending"),
+    // SHA-256 of the source bytes, keying the (per-org) transcript/audio
+    // cache — the org-first index below, plus RLS, is what keeps it per-org.
+    contentHash: text("content_hash"),
+    // The cached-audio object key. Set once `extract` succeeds, so a retry
+    // can skip straight to transcription.
+    audioKey: text("audio_key"),
+    // Size of the source object, recorded when the upload completes.
+    sizeBytes: bigint("size_bytes", { mode: "number" }),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    // The composite-FK target for `transcript_segments` and `jobs` below.
+    // No `projects` table in StepCut, so unlike apps/api's `videos` this has
+    // no `foreignKey()` of its own — just the unique pair a child can point
+    // at.
+    unique("uq_videos_id_org").on(t.id, t.orgId),
+    index("idx_videos_org_id").on(t.orgId),
+    // Per-org content-hash lookup, not unique — the same duplicate-import
+    // case apps/api's copy documents (importing the same recording twice is
+    // ordinary, and the cache finds a sibling by hash, not by uniqueness).
+    index("idx_videos_org_content_hash").on(t.orgId, t.contentHash),
+  ],
+);
+
+/**
+ * `id, org_id, video_id, start, end, text` — exactly the plan's §3 listing,
+ * nothing more. No `keep` column: dead-air trimming is a lesson-analysis
+ * feature StepCut's transcript→steps pipeline doesn't need, so there is no
+ * transcript-editing route either.
+ */
+export const transcriptSegments = pgTable(
+  "transcript_segments",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    videoId: text("video_id").notNull(),
+    start: doublePrecision("start").notNull(),
+    // `end` is a reserved word in Postgres; Drizzle quotes identifiers, so
+    // the column really is named `end`.
+    end: doublePrecision("end").notNull(),
+    text: text("text").notNull(),
+  },
+  (t) => [
+    foreignKey({
+      name: "fk_transcript_segments_video",
+      columns: [t.videoId, t.orgId],
+      foreignColumns: [videos.id, videos.orgId],
+    }).onDelete("cascade"),
+    index("idx_transcript_segments_video_id").on(t.videoId),
+  ],
+);
+
+/**
+ * The tenant-visible projection of a queued pipeline job — what a future
+ * poll/progress surface reads and what a retry acts on.
+ * `graphile-worker` brings its own tables in its own schema and owns
+ * scheduling/retries/locking; this row is kept separate from that so a job
+ * stays tenant-scoped and RLS-covered while the queue's internals are not.
+ *
+ * `kind` is only `'extract' | 'transcribe'` for now — no `'analyze'` (Phase
+ * 3) or `'render'` (Phase 5) yet.
+ */
+export const jobs = pgTable(
+  "jobs",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    // 'extract' | 'transcribe'.
+    kind: text("kind").notNull(),
+    // 'queued' | 'running' | 'done' | 'failed' | 'cancelled'.
+    state: text("state").notNull().default("queued"),
+    videoId: text("video_id"),
+    // Stamped onto the row for a Retry — 1 for a fresh import, higher for a
+    // retry of the same stage.
+    attempt: integer("attempt").notNull().default(1),
+    // null means indeterminate.
+    progress: doublePrecision("progress"),
+    // Free text shown beside a progress bar ("chunk 3 of 11").
+    detail: text("detail"),
+    error: text("error"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    foreignKey({
+      name: "fk_jobs_video",
+      columns: [t.videoId, t.orgId],
+      foreignColumns: [videos.id, videos.orgId],
+    }).onDelete("cascade"),
+    index("idx_jobs_video_id").on(t.videoId),
+    index("idx_jobs_org_state").on(t.orgId, t.state),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Relations — for Drizzle's query API; no effect on the generated DDL.
-// Only what `http/context.ts`'s `listMemberships` actually queries
-// (`members.findMany({ with: { organization: true } })`); more get added
-// alongside whatever later phases need.
 // ---------------------------------------------------------------------------
 
 export const organizationsRelations = relations(organizations, ({ many }) => ({
@@ -243,15 +374,25 @@ export const membersRelations = relations(members, ({ one }) => ({
   user: one(users, { fields: [members.userId], references: [users.id] }),
 }));
 
+export const videosRelations = relations(videos, ({ many }) => ({
+  transcriptSegments: many(transcriptSegments),
+  jobs: many(jobs),
+}));
+
+export const transcriptSegmentsRelations = relations(transcriptSegments, ({ one }) => ({
+  video: one(videos, { fields: [transcriptSegments.videoId], references: [videos.id] }),
+}));
+
+export const jobsRelations = relations(jobs, ({ one }) => ({
+  video: one(videos, { fields: [jobs.videoId], references: [videos.id] }),
+}));
+
 /**
  * The tables RLS must cover — every table holding tenant data that is looked
- * up *after* the caller's org is already known. Empty in Phase 1, and
- * deliberately so on both counts:
+ * up *after* the caller's org is already known. Phase 2 changes this from
+ * empty to `videos`/`transcript_segments`/`jobs`:
  *
- *   * No domain tables exist yet (plan decision 2) — `videos`/`jobs`/`steps`
- *     etc. arrive in later phases and will be added here alongside their own
- *     migration.
- *   * `api_keys` is deliberately **not** in this list even though it is
+ *   * `api_keys` is still deliberately **not** in this list even though it is
  *     tenant data. Verifying a bearer key means finding its row by
  *     `key_hash` *before* any org is known — the same chicken-and-egg
  *     problem that keeps `users`/`sessions` out of RLS above: RLS keyed on
@@ -260,5 +401,7 @@ export const membersRelations = relations(members, ({ one }) => ({
  *     `org_id` FK, no policy, looked up directly by the (future)
  *     `requireApiKey` middleware, which then calls `withOrg(row.orgId, ...)`
  *     for everything downstream of that lookup.
+ *   * `steps`/`templates`/`renders`/`render_steps` will be added here
+ *     alongside their own migrations in Phase 3/5.
  */
-export const TENANT_TABLES = [] as const;
+export const TENANT_TABLES = ["videos", "transcript_segments", "jobs"] as const;
