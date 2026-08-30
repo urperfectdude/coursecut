@@ -6,8 +6,10 @@
 // Phase 2 needed (no `keep` column on transcript segments; see
 // docs/stepcut-plan.md's Phase 2 section for the full list of deltas from
 // apps/api's copy of this same shape). Phase 3 ("AI step proposal") adds
-// `steps` and extends `jobs.kind` with `'analyze'`. `templates`/`renders`/
-// `render_steps` arrive in Phase 5.
+// `steps` and extends `jobs.kind` with `'analyze'`. Phase 5 ("Templates &
+// render") added `templates` in its first slice; this slice adds
+// `renders`/`render_steps` and extends `jobs` with `renderId` and
+// `jobs.kind`'s `'render'` value.
 //
 // Conventions, copied from apps/api/src/db/schema.ts:
 //
@@ -317,19 +319,25 @@ export const transcriptSegments = pgTable(
  * scheduling/retries/locking; this row is kept separate from that so a job
  * stays tenant-scoped and RLS-covered while the queue's internals are not.
  *
- * `kind` is `'extract' | 'transcribe' | 'analyze'` as of Phase 3 — no
- * `'render'` (Phase 5) yet.
+ * `kind` is `'extract' | 'transcribe' | 'analyze' | 'render'` — Phase 5
+ * (this slice) adds `'render'` and the nullable `renderId` column below,
+ * mirroring `videoId`'s composite-FK-down shape exactly: a render job points
+ * at a render the same way a pipeline job points at a video.
  */
 export const jobs = pgTable(
   "jobs",
   {
     id: id(),
     orgId: text("org_id").notNull(),
-    // 'extract' | 'transcribe' | 'analyze'.
+    // 'extract' | 'transcribe' | 'analyze' | 'render'.
     kind: text("kind").notNull(),
     // 'queued' | 'running' | 'done' | 'failed' | 'cancelled'.
     state: text("state").notNull().default("queued"),
     videoId: text("video_id"),
+    // Set only for a `'render'` job — mirrors `videoId`, mutually exclusive
+    // with it in practice (a job is either a video-pipeline stage or a
+    // render), but nothing enforces that at the schema level.
+    renderId: text("render_id"),
     // Stamped onto the row for a Retry — 1 for a fresh import, higher for a
     // retry of the same stage.
     attempt: integer("attempt").notNull().default(1),
@@ -346,6 +354,11 @@ export const jobs = pgTable(
       name: "fk_jobs_video",
       columns: [t.videoId, t.orgId],
       foreignColumns: [videos.id, videos.orgId],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "fk_jobs_render",
+      columns: [t.renderId, t.orgId],
+      foreignColumns: [renders.id, renders.orgId],
     }).onDelete("cascade"),
     index("idx_jobs_video_id").on(t.videoId),
     index("idx_jobs_org_state").on(t.orgId, t.state),
@@ -398,6 +411,146 @@ export const steps = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Templates — Phase 5 (docs/stepcut-plan.md §8: "Templates & render"), slice 1
+// ---------------------------------------------------------------------------
+//
+// An org's reusable render config: brand colors and target output dimensions,
+// plus optional intro/outro/logo assets uploaded the same presigned-PUT way a
+// video is (see `storage.ts`'s `templateAssetKey`). No parent table — same as
+// `videos`, a template belongs directly to an org — and no relation to
+// `steps`/`videos` of its own; `renders` (next slice) is what will
+// composite-FK down to a template, which is the only reason for the
+// `uq_templates_id_org` unique pair below.
+export const templates = pgTable(
+  "templates",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    name: text("name").notNull(),
+    // Set only once its `/assets/:kind/complete` call lands — null until then,
+    // which is fine, since a template's existence doesn't depend on having
+    // assets (unlike a video, there is no upload-in-progress state to track).
+    introKey: text("intro_key"),
+    outroKey: text("outro_key"),
+    logoKey: text("logo_key"),
+    brandPrimaryHex: text("brand_primary_hex"),
+    brandSecondaryHex: text("brand_secondary_hex"),
+    targetWidth: integer("target_width").notNull().default(1920),
+    targetHeight: integer("target_height").notNull().default(1080),
+    targetFps: integer("target_fps").notNull().default(30),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    // The composite-FK target a later `renders` table points at, same pattern
+    // `uq_videos_id_org` establishes for `videos`.
+    unique("uq_templates_id_org").on(t.id, t.orgId),
+    index("idx_templates_org_id").on(t.orgId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Renders — Phase 5 (docs/stepcut-plan.md §8: "Templates & render"), this
+// slice
+// ---------------------------------------------------------------------------
+//
+// `POST /renders` snapshots a video's *current* `steps` into `render_steps`
+// at the moment it is called (plan §4/§5 step 5) — editing a step afterward
+// must not change what a render already in flight produces. `renders` is the
+// tenant-visible status row a poller reads; the worker task that actually
+// cuts/assembles video (Phase 5's next slice) is the only thing that ever
+// moves `status` past `'queued'`/`'cancelled'`.
+//
+// No pause/resume, unlike apps/api's `exports`: a render has exactly one
+// non-terminal transition a caller can request — cancel (see
+// `domain/renders.ts`'s `cancelRender`).
+export const renders = pgTable(
+  "renders",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    videoId: text("video_id").notNull(),
+    templateId: text("template_id").notNull(),
+    // 'queued' | 'running' | 'done' | 'failed' | 'cancelled'.
+    status: text("status").notNull().default("queued"),
+    // null until the worker reports something better than "queued" — same
+    // "null means indeterminate" convention `jobs.progress` uses.
+    progress: doublePrecision("progress"),
+    // Set once the worker's assembled output lands in storage.
+    outputKey: text("output_key"),
+    error: text("error"),
+    // Validated at creation time (`domain/renders.ts`'s
+    // `isPrivateOrLoopbackHost`) — see that file for why an unchecked
+    // caller-supplied URL here would be an SSRF path into the droplet's own
+    // internal services.
+    callbackUrl: text("callback_url"),
+    // Recorded once the finished output is known, for the download surface.
+    sizeBytes: bigint("size_bytes", { mode: "number" }),
+    downloadExpiresAt: timestamp("download_expires_at", { withTimezone: true }),
+    // 'pending' | 'delivered' | 'failed' — set once a `callback_url` exists
+    // and the worker has attempted delivery. Null when there is no callback
+    // to deliver.
+    webhookStatus: text("webhook_status"),
+    webhookAttempts: integer("webhook_attempts").notNull().default(0),
+    webhookLastError: text("webhook_last_error"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    // A render can't outlive its source video.
+    foreignKey({
+      name: "fk_renders_video",
+      columns: [t.videoId, t.orgId],
+      foreignColumns: [videos.id, videos.orgId],
+    }).onDelete("cascade"),
+    // A render with no template to reference is meaningless — same reasoning
+    // as the video FK above.
+    foreignKey({
+      name: "fk_renders_template",
+      columns: [t.templateId, t.orgId],
+      foreignColumns: [templates.id, templates.orgId],
+    }).onDelete("cascade"),
+    // The composite-FK target `render_steps`/`jobs` point at.
+    unique("uq_renders_id_org").on(t.id, t.orgId),
+    index("idx_renders_org_id").on(t.orgId),
+    // `GET /videos/:id/renders`'s own lookup.
+    index("idx_renders_video_id").on(t.videoId),
+  ],
+);
+
+/**
+ * A SNAPSHOT of one step at the moment `POST /renders` was called — see this
+ * file's `renders` comment. Cut/Assemble (Phase 5's worker task) reads only
+ * this table, never `steps` directly.
+ *
+ * `stepId` is nullable and traceability-only, unlike `renderId`: deleting the
+ * live `steps` row a render_step was snapshotted from must not touch the
+ * snapshot, so it is `onDelete: "set null"` rather than the composite,
+ * cascading FK `renderId` gets.
+ */
+export const renderSteps = pgTable(
+  "render_steps",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    renderId: text("render_id").notNull(),
+    stepId: text("step_id").references(() => steps.id, { onDelete: "set null" }),
+    sortOrder: integer("sort_order").notNull(),
+    start: doublePrecision("start").notNull(),
+    end: doublePrecision("end").notNull(),
+    title: text("title").notNull(),
+  },
+  (t) => [
+    foreignKey({
+      name: "fk_render_steps_render",
+      columns: [t.renderId, t.orgId],
+      foreignColumns: [renders.id, renders.orgId],
+    }).onDelete("cascade"),
+    index("idx_render_steps_render_id").on(t.renderId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Relations — for Drizzle's query API; no effect on the generated DDL.
 // ---------------------------------------------------------------------------
 
@@ -423,6 +576,7 @@ export const videosRelations = relations(videos, ({ many }) => ({
   transcriptSegments: many(transcriptSegments),
   jobs: many(jobs),
   steps: many(steps),
+  renders: many(renders),
 }));
 
 export const transcriptSegmentsRelations = relations(transcriptSegments, ({ one }) => ({
@@ -431,10 +585,28 @@ export const transcriptSegmentsRelations = relations(transcriptSegments, ({ one 
 
 export const jobsRelations = relations(jobs, ({ one }) => ({
   video: one(videos, { fields: [jobs.videoId], references: [videos.id] }),
+  render: one(renders, { fields: [jobs.renderId], references: [renders.id] }),
 }));
 
 export const stepsRelations = relations(steps, ({ one }) => ({
   video: one(videos, { fields: [steps.videoId], references: [videos.id] }),
+}));
+
+// `renders`/`render_steps` — this slice. `render_steps` is structurally the
+// same shape as `steps` (a child row FK'd to one parent), so it gets a
+// `one()` back the same way `stepsRelations` does; `renders` additionally
+// gets a `one()` to its template, since (unlike `videos`) nothing else here
+// composite-FKs to `templates` yet, so there is no reciprocal `many()` to add
+// on that side.
+export const rendersRelations = relations(renders, ({ one, many }) => ({
+  video: one(videos, { fields: [renders.videoId], references: [videos.id] }),
+  template: one(templates, { fields: [renders.templateId], references: [templates.id] }),
+  renderSteps: many(renderSteps),
+}));
+
+export const renderStepsRelations = relations(renderSteps, ({ one }) => ({
+  render: one(renders, { fields: [renderSteps.renderId], references: [renders.id] }),
+  step: one(steps, { fields: [renderSteps.stepId], references: [steps.id] }),
 }));
 
 /**
@@ -451,7 +623,13 @@ export const stepsRelations = relations(steps, ({ one }) => ({
  *     `org_id` FK, no policy, looked up directly by the (future)
  *     `requireApiKey` middleware, which then calls `withOrg(row.orgId, ...)`
  *     for everything downstream of that lookup.
- *   * `templates`/`renders`/`render_steps` will be added here alongside their
- *     own migrations in Phase 5.
  */
-export const TENANT_TABLES = ["videos", "transcript_segments", "jobs", "steps"] as const;
+export const TENANT_TABLES = [
+  "videos",
+  "transcript_segments",
+  "jobs",
+  "steps",
+  "templates",
+  "renders",
+  "render_steps",
+] as const;

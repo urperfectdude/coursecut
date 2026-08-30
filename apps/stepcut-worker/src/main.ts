@@ -20,12 +20,14 @@
 
 import { run, type Runner } from "graphile-worker";
 import { closePool, getDb, withOrg } from "../../stepcut-api/src/db/client.js";
-import { eq } from "../../stepcut-api/src/db/ops.js";
+import { and, eq } from "../../stepcut-api/src/db/ops.js";
 import { env } from "../../stepcut-api/src/env.js";
-import { VIDEO_TASK } from "../../stepcut-api/src/jobs/queue.js";
-import { jobs, organizations, videos } from "../../stepcut-api/src/db/schema.js";
+import { RENDER_TASK, VIDEO_TASK, WEBHOOK_TASK } from "../../stepcut-api/src/jobs/queue.js";
+import { jobs, organizations, renders, videos } from "../../stepcut-api/src/db/schema.js";
 import { clearScratch } from "./scratch.js";
+import { runRenderJob, type RenderJobPayload } from "./tasks/render.js";
 import { runVideoJob, type VideoJobPayload } from "./tasks/video.js";
+import { runWebhookJob, type WebhookJobPayload } from "./tasks/webhook.js";
 
 /** Long enough that an idle worker is not a busy loop, short enough that a
  * queued job feels immediate. `graphile-worker` also listens for the insert
@@ -46,6 +48,8 @@ async function main(): Promise<void> {
     pollInterval: POLL_INTERVAL_MS,
     taskList: {
       [VIDEO_TASK]: (payload) => runVideoJob(payload as VideoJobPayload),
+      [RENDER_TASK]: (payload) => runRenderJob(payload as RenderJobPayload),
+      [WEBHOOK_TASK]: (payload, helpers) => runWebhookJob(payload as WebhookJobPayload, helpers),
     },
   });
 
@@ -91,7 +95,7 @@ async function reconcileInterrupted(): Promise<void> {
           updatedAt: new Date(),
         })
         .where(eq(jobs.state, "running"))
-        .returning({ videoId: jobs.videoId });
+        .returning({ videoId: jobs.videoId, renderId: jobs.renderId });
 
       // A video whose extract or transcribe died mid-run has to end up in
       // `error`, or there is no visible way to tell it apart from one still
@@ -102,6 +106,24 @@ async function reconcileInterrupted(): Promise<void> {
           .update(videos)
           .set({ transcriptStatus: "error", updatedAt: new Date() })
           .where(eq(videos.id, job.videoId));
+      }
+
+      // Same reasoning for a render: `runRenderJob` marks both its `jobs` row
+      // and the `renders` row `running` (see `tasks/render.ts`'s header for
+      // why this task, unlike `video.ts`'s, owns the `jobs` row directly), so
+      // a crash mid-render leaves both stuck unless this loop closes the
+      // second one too. No retry surface exists for a render yet — the
+      // message points at starting a fresh one instead.
+      for (const job of stuckJobs) {
+        if (!job.renderId) continue;
+        await tx
+          .update(renders)
+          .set({
+            status: "failed",
+            error: "This render was interrupted (the worker restarted) — start a new render to try again.",
+            updatedAt: new Date(),
+          })
+          .where(and(eq(renders.id, job.renderId), eq(renders.status, "running")));
       }
 
       if (stuckJobs.length > 0) {

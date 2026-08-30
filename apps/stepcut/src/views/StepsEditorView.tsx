@@ -33,6 +33,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import RenderPanel from "@/components/RenderPanel";
 import { useVideoSrc } from "@/hooks/useVideoSrc";
 import {
   addStep,
@@ -365,6 +366,11 @@ export default function StepsEditorView({ videoId, onBack }: StepsEditorViewProp
           <Button type="button" variant="outline" className="mt-4" disabled={adding} onClick={() => void handleAddStep()}>
             {adding ? "Adding…" : `+ Add step at ${formatTimestamp(currentTime)}`}
           </Button>
+
+          {/* Rendering only makes sense once there's something to cut —
+              gated on `sortedSteps` the same way the backend itself refuses
+              a stepless render (`domain/renders.ts`'s `createRender`). */}
+          {sortedSteps.length > 0 && <RenderPanel videoId={videoId} />}
         </>
       )}
 

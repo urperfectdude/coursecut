@@ -103,6 +103,15 @@ export const env = {
    * scratch trees can never collide on the same droplet.
    */
   workerScratchDir: () => optional("WORKER_SCRATCH_DIR", "/tmp/stepcut-worker"),
+  /**
+   * A `.ttf`/`.otf` file for `drawtext` to render title cards with (Phase 5).
+   * Empty ("not set") is fine on a dev machine, which already has system
+   * fonts fontconfig can fall back to — but the worker's Docker image in
+   * production is not guaranteed to ship any font at all, and `drawtext`
+   * without a resolvable font fails the whole render rather than degrading
+   * gracefully. Set this in the worker image; leave it unset locally.
+   */
+  titleCardFontPath: () => optional("TITLE_CARD_FONT_PATH", ""),
 
   // --- Object storage (Phase 2) ---
   //

@@ -116,6 +116,30 @@ export function videoPrefix(orgId: string, videoId: string): string {
   return `${PREFIX}/${orgId}/${videoId}/`;
 }
 
+/** `stepcut/{org}/templates/{template}/{kind}/{filename}` — a template's
+ * assets sit under their own `templates` segment, disjoint from a video's
+ * prefix above, so `templatePrefix` below never collides with `videoPrefix`. */
+export function templateAssetKey(
+  orgId: string,
+  templateId: string,
+  kind: "intro" | "outro" | "logo",
+  filename: string,
+): string {
+  return `${PREFIX}/${orgId}/templates/${templateId}/${kind}/${sanitizeFilename(filename)}`;
+}
+
+/** Everything belonging to one template — its intro/outro/logo assets. */
+export function templatePrefix(orgId: string, templateId: string): string {
+  return `${PREFIX}/${orgId}/templates/${templateId}/`;
+}
+
+/** Where a render's assembled output lands — beside the source video it was
+ * cut from, under its own render id (two renders of the same video, against
+ * different templates, get disjoint keys). */
+export function renderKey(orgId: string, videoId: string, renderId: string): string {
+  return `${PREFIX}/${orgId}/${videoId}/renders/${renderId}/output.mp4`;
+}
+
 // ---------------------------------------------------------------------------
 // Presigned URLs
 // ---------------------------------------------------------------------------
