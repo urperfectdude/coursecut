@@ -1,11 +1,11 @@
 // The database handle, and the one function that is allowed to run a
 // tenant-scoped query.
 //
-// Copied verbatim from apps/api/src/db/client.ts — pure mechanism, and
-// exactly what a later phase's RLS-covered tables will be scoped through.
-// `TENANT_TABLES` is empty in Phase 1 (see src/db/schema.ts), so nothing
-// calls `withOrg` yet, but the mechanism itself does not change when that
-// stops being true.
+// Copied verbatim from apps/api/src/db/client.ts — pure mechanism. Every
+// tenant table in `TENANT_TABLES` (see src/db/schema.ts) is read and written
+// through `withOrg` below. Drizzle's query operators (`eq`, `and`, …) live in
+// the sibling `ops.ts`, not here, for the same reason they are split out
+// upstream — see that file's header.
 //
 // Query outside `withOrg` and you do not get more rows, you get none: a
 // future policy compares against `current_setting('app.current_org_id',

@@ -76,7 +76,12 @@ services:
       #
       # Named explicitly rather than left at MinIO's `*` default so a stray
       # page on another origin cannot drive this bucket from a dev browser.
-      MINIO_API_CORS_ALLOW_ORIGIN: http://localhost:5173
+      # A comma-separated list — apps/stepcut's dev server (5174) shares this
+      # bucket under its own `stepcut/` key prefix (docs/stepcut-plan.md §7),
+      # so its origin needs the same allowance coursecut-web's (5173) already
+      # has, or a real browser upload from Phase 2's upload flow fails CORS
+      # locally even though the code is correct.
+      MINIO_API_CORS_ALLOW_ORIGIN: http://localhost:5173,http://localhost:5174
     ports:
       - "127.0.0.1:${MINIO_PORT:-9000}:9000" # S3 API
       - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001" # web console

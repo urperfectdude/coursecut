@@ -10,9 +10,11 @@
 //                        and the bootstrap, and nothing else. Never used to
 //                        serve a request.
 //
-// Phase 1's surface is deliberately smaller than apps/api's: no OpenAI, S3,
-// quota, retention or mail vars — those arrive with the phases that read
-// them (docs/stepcut-plan.md's phase build order).
+// Phase 1's surface was deliberately smaller than apps/api's: no OpenAI, S3,
+// quota, retention or mail vars. Phase 2 ("Upload & transcript") adds OpenAI
+// (Whisper only — no GPT-5.5 call exists yet) and S3, since `extract` and
+// `transcribe` need both. Quota/retention/mail still don't exist here — that
+// stays true through Phase 6.
 
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -36,6 +38,12 @@ function required(name: string): string {
 
 function optional(name: string, fallback: string): string {
   return process.env[name] || fallback;
+}
+
+function optionalBool(name: string, fallback: boolean): boolean {
+  const value = process.env[name];
+  if (value === undefined || value === "") return fallback;
+  return value === "1" || value.toLowerCase() === "true";
 }
 
 export const env = {
@@ -65,4 +73,59 @@ export const env = {
    * everyone out in a way that looks like a bug in the session code.
    */
   authSecret: () => required("AUTH_SECRET"),
+
+  // --- OpenAI (Phase 2) — Whisper only ---
+  //
+  // One platform-owned key for every tenant, mirroring apps/api's D7: read
+  // here and used only by `src/openai.ts`, never stored in the database and
+  // never sent to the browser. Required rather than optional — a worker that
+  // boots without it would accept transcription jobs and fail every one of
+  // them one at a time instead of refusing to start. No GPT-5.5 call exists
+  // in StepCut yet (that arrives in Phase 3 with its own prompt, never a fork
+  // of coursecut's lesson-analysis one — plan §9), so there is nothing else
+  // OpenAI-related to read here.
+  openAiApiKey: () => required("OPENAI_API_KEY"),
+  /** Overridable so tests can point at a local stub; leave unset for the
+   * real thing. No trailing slash — paths are appended verbatim. */
+  openAiBaseUrl: () => optional("OPENAI_BASE_URL", "https://api.openai.com/v1").replace(/\/+$/, ""),
+
+  // --- Worker only (Phase 2) ---
+  //
+  // Only `apps/stepcut-worker` reads these; the API has no ffmpeg and no
+  // scratch disk.
+  /** ffmpeg/ffprobe binaries — the system binaries locally, pinned in the
+   * worker image for production. */
+  ffmpegPath: () => optional("FFMPEG_PATH", "ffmpeg"),
+  ffprobePath: () => optional("FFPROBE_PATH", "ffprobe"),
+  /**
+   * Where a job's source video and extracted audio live while it runs.
+   * Distinct from apps/worker's `/tmp/coursecut-worker` so the two products'
+   * scratch trees can never collide on the same droplet.
+   */
+  workerScratchDir: () => optional("WORKER_SCRATCH_DIR", "/tmp/stepcut-worker"),
+  /**
+   * A `.ttf`/`.otf` file for `drawtext` to render title cards with (Phase 5).
+   * Empty ("not set") is fine on a dev machine, which already has system
+   * fonts fontconfig can fall back to — but the worker's Docker image in
+   * production is not guaranteed to ship any font at all, and `drawtext`
+   * without a resolvable font fails the whole render rather than degrading
+   * gracefully. Set this in the worker image; leave it unset locally.
+   */
+  titleCardFontPath: () => optional("TITLE_CARD_FONT_PATH", ""),
+
+  // --- Object storage (Phase 2) ---
+  //
+  // Same bucket as coursecut-web (`S3_BUCKET=coursecut` locally), a disjoint
+  // `stepcut/` key prefix — see `src/storage.ts`. MinIO locally, Cloudflare
+  // R2 in production; only the endpoint, credentials and path-style
+  // addressing differ, all of it here.
+  s3Endpoint: () => required("S3_ENDPOINT"),
+  s3Region: () => optional("S3_REGION", "auto"),
+  s3Bucket: () => required("S3_BUCKET"),
+  s3AccessKeyId: () => required("S3_ACCESS_KEY_ID"),
+  s3SecretAccessKey: () => required("S3_SECRET_ACCESS_KEY"),
+  /** MinIO needs path-style addressing; R2 does not. */
+  s3ForcePathStyle: () => optionalBool("S3_FORCE_PATH_STYLE", false),
+  /** Presigned URLs are short-lived by design. */
+  s3UrlTtlSeconds: () => Number(optional("S3_URL_TTL_SECONDS", "3600")),
 };

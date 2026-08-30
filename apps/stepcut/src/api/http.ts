@@ -9,10 +9,12 @@
 // standalone-in-browser fallback, so every caller here imports this file
 // directly.
 //
-// Only `request`/`ApiError`/`setUnauthorizedHandler` are kept — the upload
-// (`putToStorage`/`putPart`) and progress-stream (`subscribeProgress`) helpers
-// from the source file aren't used by anything in Phase 1 (no upload/render
-// routes exist yet) and are left out rather than carried along unused.
+// Phase 1 kept only `request`/`ApiError`/`setUnauthorizedHandler` — no
+// upload or render routes existed yet. Phase 2 adds the upload flow, so
+// `putToStorage`/`putPart` are back (copied from the same source file); the
+// progress-stream helper (`subscribeProgress`) still isn't needed — StepCut
+// has no SSE stream (see `apps/stepcut-worker/src/progress.ts`'s header),
+// and the dashboard polls `GET /api/videos` instead.
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
 
@@ -70,4 +72,40 @@ export async function request<T>(method: string, path: string, body?: unknown): 
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+/** Uploads bytes straight to object storage with a server-minted presigned
+ * URL — the API never proxies video. Deliberately a bare `fetch`, not
+ * `request`: the target is MinIO/R2, not our API, and it must not carry our
+ * session cookie. */
+export async function putToStorage(url: string, file: Blob, contentType: string): Promise<void> {
+  const response = await fetch(url, {
+    method: "PUT",
+    body: file,
+    headers: { "Content-Type": contentType },
+    credentials: "omit",
+  });
+  if (!response.ok) {
+    throw new ApiError(response.status, `Upload failed (${response.status} ${response.statusText})`);
+  }
+}
+
+/**
+ * Uploads one part of a multipart upload and returns its ETag, which the
+ * completion call needs in order to assemble the object.
+ *
+ * No `Content-Type` — S3 takes the type from the `CreateMultipartUpload` that
+ * opened the upload, and sending one here would not match what the URL was
+ * signed for.
+ */
+export async function putPart(url: string, part: Blob): Promise<string> {
+  const response = await fetch(url, { method: "PUT", body: part, credentials: "omit" });
+  if (!response.ok) {
+    throw new ApiError(response.status, `Upload failed (${response.status} ${response.statusText})`);
+  }
+  const etag = response.headers.get("ETag");
+  if (!etag) {
+    throw new ApiError(response.status, "Upload failed: storage did not return an ETag for this part.");
+  }
+  return etag;
 }
