@@ -204,10 +204,14 @@ services:
       retries: 3
       start_period: 20s
 
-  # Phase 1's queue consumer is a single throwaway `ping` task (plan decision
-  # 3) — no scratch volume and no CPU limit here, unlike `worker` above,
-  # because nothing CPU- or disk-heavy runs yet. Both arrive in Phase 5
-  # alongside the render task.
+  # Phase 5 (docs/stepcut-plan.md §8: "Templates & render") landed
+  # `stepcut-worker`'s ffmpeg-based `render` task and `stepcut-worker.Dockerfile`
+  # gained the same `mwader/static-ffmpeg` stage `worker.Dockerfile` uses, but
+  # this service block was never updated to match at the time — the render
+  # task shipped with nowhere to write its scratch files and no CPU ceiling.
+  # Fixed here, mirroring `worker` above exactly (see that block's comments
+  # for why the volume mounts one level above `WORKER_SCRATCH_DIR`, and why a
+  # CPU limit exists at all on a shared droplet).
   stepcut-worker:
     image: ${REGISTRY:?set REGISTRY in .env}/stepcut-worker:${IMAGE_TAG:-latest}
     restart: unless-stopped
@@ -227,6 +231,29 @@ services:
         condition: service_healthy
       stepcut-migrate:
         condition: service_completed_successfully
+    volumes:
+      # Same reasoning as `worker`'s `worker-scratch` mount above: a named
+      # volume so a multi-gigabyte render doesn't grow the container's
+      # writable layer, mounted at `/var/lib/stepcut` (the **parent** of
+      # `WORKER_SCRATCH_DIR=/var/lib/stepcut/scratch`, set in
+      # `stepcut-worker.Dockerfile`) because `clearScratch()` removes and
+      # recreates the scratch root at boot, which needs a writable parent —
+      # mounting the volume directly at the scratch path makes that parent
+      # root-owned and the worker crash-loops on EACCES. A separate volume
+      # from coursecut's `worker-scratch`, not a shared one: the two
+      # products' scratch trees must never collide on the same droplet.
+      - stepcut-worker-scratch:/var/lib/stepcut
+    deploy:
+      resources:
+        limits:
+          # Half of coursecut's `worker` budget (0.8), not the same value —
+          # this is a genuinely new judgment call, not a settled plan
+          # decision: the droplet has exactly 1 vCPU total, so an uncapped
+          # second ffmpeg-running worker could starve both APIs and Caddy
+          # the moment a StepCut render and a coursecut export land at the
+          # same time. 0.4 leaves real headroom even in that overlap case;
+          # raise it (or drop the cap) once either worker gets its own box.
+          cpus: "${STEPCUT_WORKER_CPUS:-0.4}"
 
   # The SPA, on its own internal container rather than baked into `caddy`
   # above (plan decision 5) — coupling stepcut's frontend deploys to a
@@ -363,5 +390,6 @@ services:
 volumes:
   postgres-data:
   worker-scratch:
+  stepcut-worker-scratch:
   caddy-data:
   caddy-config:

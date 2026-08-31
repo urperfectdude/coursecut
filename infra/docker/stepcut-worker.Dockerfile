@@ -1,5 +1,5 @@
 # apps/stepcut-worker — the graphile-worker queue consumer
-# (docs/stepcut-plan.md, Phase 1).
+# (docs/stepcut-plan.md).
 #
 #   docker build -f infra/docker/stepcut-worker.Dockerfile -t stepcut-worker apps/
 #
@@ -11,13 +11,30 @@
 # `apps/stepcut-worker`'s dependencies would leave a bare `import "pg"` inside
 # `apps/stepcut-api/src` unresolvable.
 #
-# No ffmpeg stage and no scratch volume here (unlike `worker.Dockerfile`) —
-# Phase 1's worker runs a single throwaway `ping` task and touches no video
-# (plan decision 4). Both are added back in Phase 5 alongside the render task,
-# mirroring `worker.Dockerfile`'s `mwader/static-ffmpeg` stage and its
-# `/var/lib/coursecut` scratch directory at that point.
+# Phase 1's worker ran a single throwaway `ping` task and touched no video, so
+# this image originally had no ffmpeg and no scratch volume (plan decision 4).
+# Phase 5 (§8: "Templates & render") added the real `render` task
+# (`src/ffmpeg.ts`, `src/tasks/render.ts`) without this file being updated to
+# match — fixed here, mirroring `worker.Dockerfile`'s ffmpeg stage and scratch
+# directory, plus a font for `drawtext` that `src/env.ts`'s own
+# `titleCardFontPath` comment already warned production would need.
+
+# ffmpeg, pinned — same source, same reasoning as `worker.Dockerfile`: a
+# server re-encoding other people's video should not change encoder version
+# because an image rebuilt on a Tuesday.
+FROM mwader/static-ffmpeg:7.1 AS ffmpeg
 
 FROM node:22-alpine
+
+COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
+
+# `drawtext` (title cards, Phase 5) needs a resolvable font file — Alpine
+# ships none by default, and `src/ffmpeg.ts`'s `buildTitleCardFilter` only
+# passes `fontfile` when `TITLE_CARD_FONT_PATH` is set, so an unset one here
+# would fail every render's title card rather than degrading gracefully.
+# `ttf-dejavu` is a small, standard Alpine package; the WOFF-free `.ttf` is
+# all `drawtext` needs.
+RUN apk add --no-cache ttf-dejavu
 
 WORKDIR /app
 
@@ -31,9 +48,22 @@ RUN cd stepcut-worker && npm ci --omit=dev && npm cache clean --force
 COPY stepcut-api/ ./stepcut-api/
 COPY stepcut-worker/ ./stepcut-worker/
 
+# Scratch space for a render job's source video and cut segments. Same
+# parent-not-leaf mounting rule as `worker.Dockerfile`'s `/var/lib/coursecut`
+# — `clearScratch()` removes and recreates the scratch root at startup, which
+# needs a writable parent; mounting `compose.prod.yml`'s volume directly at
+# `WORKER_SCRATCH_DIR` would make that parent root-owned and crash-loop the
+# worker on EACCES. `/var/lib/stepcut`, not `/var/lib/coursecut` — the two
+# products' scratch trees must never collide on the same droplet.
+RUN mkdir -p /var/lib/stepcut && chown node:node /var/lib/stepcut
+
 USER node
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    FFMPEG_PATH=/usr/local/bin/ffmpeg \
+    FFPROBE_PATH=/usr/local/bin/ffprobe \
+    WORKER_SCRATCH_DIR=/var/lib/stepcut/scratch \
+    TITLE_CARD_FONT_PATH=/usr/share/fonts/dejavu/DejaVuSans.ttf
 
 WORKDIR /app/stepcut-worker
 
