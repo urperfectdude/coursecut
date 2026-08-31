@@ -1,6 +1,6 @@
 // Configures the media bucket's CORS policy, and prints it back (M6).
 //
-//   npm run storage:cors            # allow APP_URL's origin
+//   npm run storage:cors            # allow APP_URL's origin (+ StepCut's, below)
 //   npm run storage:cors -- --show  # print the current policy, change nothing
 //   npm run storage:cors -- https://staging.example.com   # extra origins
 //
@@ -12,9 +12,22 @@
 //
 // The S3 calls live in `../storage.ts` with every other one (plan §3.4 rule
 // 2); this file only decides which origins to pass and prints the result.
+//
+// **`PutBucketCors` replaces the whole ruleset — it does not merge.**
+// StepCut (docs/stepcut-plan.md) shares this exact bucket under a `stepcut/`
+// key prefix, so its browser uploads/downloads need their own CORS origin
+// allowed on the *same* bucket, even though `apps/stepcut-api` is a fully
+// separate app with its own `env.ts` this file has no access to. Without
+// `STEPCUT_ORIGIN` below, a plain `npm run storage:cors` run from `apps/api`
+// (the ordinary case — no one thinks to pass StepCut's domain as an "extra
+// origin" when they're only touching coursecut) would silently drop
+// StepCut's rule and break its uploads with a CORS-shaped "Failed to fetch",
+// exactly like the bug this constant was added to stop from recurring.
 
 import { env } from "../env.js";
 import { applyBucketCors, getBucketCors } from "../storage.js";
+
+const STEPCUT_ORIGIN = "https://stepcut.duckdns.org";
 
 function originOf(url: string): string {
   return new URL(url).origin;
@@ -42,8 +55,10 @@ async function main(): Promise<void> {
   // that has to be allowed; anything else is an extra passed on the command
   // line (a staging domain, say). Deriving it rather than taking it as an
   // argument means the bucket and `better-auth`'s trusted origin cannot drift
-  // apart.
-  const origins = [originOf(env.appUrl()), ...args.map(originOf)];
+  // apart. `STEPCUT_ORIGIN` is always included too, unconditionally — see
+  // this file's header for why a sibling product's origin has to survive a
+  // plain, no-args run of this tool.
+  const origins = [originOf(env.appUrl()), STEPCUT_ORIGIN, ...args.map(originOf)];
 
   try {
     await applyBucketCors(origins);
