@@ -17,14 +17,22 @@
 	encode zstd gzip
 	root * /srv
 
-	# Same split `infra/docker/Caddyfile`'s copy for coursecut-web uses, ported
-	# here rather than reinvented: Vite fingerprints everything under /assets,
-	# so those are immutable and cached hard, while index.html must not be —
-	# otherwise a deploy leaves browsers asking for the previous build's asset
-	# names until their cache expires (which, unbounded, can be indefinitely).
+	# Vite fingerprints everything under /assets, so those are immutable and
+	# cached hard, while the SPA shell must not be — otherwise a deploy leaves
+	# browsers asking for the previous build's asset names until their cache
+	# expires (which, unbounded, can be indefinitely).
+	#
+	# Matched on the *request* path, not `/index.html` literally: Caddy runs
+	# `header` before `try_files`, so a matcher on `/index.html` only ever
+	# fires for a client that requests that literal path — never for the
+	# common case of loading `/` (or any client-side route), which is what
+	# `try_files`'s fallback rewrites to *after* headers are already decided.
+	# `infra/docker/Caddyfile`'s coursecut-web copy of this split has the same
+	# gap; ported correctly here rather than reproducing it.
 	@assets path /assets/*
 	header @assets Cache-Control "public, max-age=31536000, immutable"
-	header /index.html Cache-Control "no-cache"
+	@shell not path /assets/*
+	header @shell Cache-Control "no-cache"
 
 	try_files {path} /index.html
 	file_server
