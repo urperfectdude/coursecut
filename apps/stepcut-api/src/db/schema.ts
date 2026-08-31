@@ -519,6 +519,11 @@ export const renders = pgTable(
     projectId: text("project_id").notNull(),
     videoId: text("video_id").notNull(),
     templateId: text("template_id").notNull(),
+    // 'video' | 'markdown' | 'html'. 'video' is the original single-stitched-
+    // MP4 output; 'markdown'/'html' cut each step as its own clip instead —
+    // see `routes/exports-public.ts`'s header for why those two need a
+    // permanent public URL that a presigned GET can't give them.
+    format: text("format").notNull().default("video"),
     // 'queued' | 'running' | 'done' | 'failed' | 'cancelled'.
     status: text("status").notNull().default("queued"),
     // null until the worker reports something better than "queued" — same
@@ -593,6 +598,17 @@ export const renderSteps = pgTable(
     start: doublePrecision("start").notNull(),
     end: doublePrecision("end").notNull(),
     title: text("title").notNull(),
+    // Snapshotted alongside `title` — a 'video' render never reads this (its
+    // title cards use `title` only), but 'markdown'/'html' show it as real
+    // text next to each step's clip.
+    summary: text("summary"),
+    // The individually-cut clip's object key — set only for a 'markdown'/
+    // 'html' render (`renders.format`); null for 'video', which never
+    // uploads a step as its own object. Doubles as this row's public URL
+    // path segment (`routes/exports-public.ts`'s `/api/exports/:renderId/
+    // steps/:stepId` looks the row up by id, not by this key, but the key
+    // only ever gets set once that route can serve it).
+    assetKey: text("asset_key"),
   },
   (t) => [
     foreignKey({

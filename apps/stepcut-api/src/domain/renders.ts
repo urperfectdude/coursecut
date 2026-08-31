@@ -128,6 +128,20 @@ export async function listRendersForVideo(tx: Tx, videoId: string): Promise<Rend
 // Create
 // ---------------------------------------------------------------------------
 
+/** `renders.format` — `'video'` (the original single stitched MP4) or
+ * `'markdown'`/`'html'` (each step cut as its own clip; see
+ * `routes/exports-public.ts`'s header for why those two need a public URL a
+ * presigned GET can't give them). */
+export type RenderFormat = "video" | "markdown" | "html";
+
+const RENDER_FORMATS: readonly RenderFormat[] = ["video", "markdown", "html"];
+
+function validateFormat(value: string | undefined): RenderFormat {
+  if (value === undefined) return "video";
+  if ((RENDER_FORMATS as readonly string[]).includes(value)) return value as RenderFormat;
+  throw badRequest(`format must be one of: ${RENDER_FORMATS.join(", ")}`);
+}
+
 /**
  * Creates a render and snapshots the video's *current* `steps` into
  * `render_steps` — see this file's header. Enqueueing the worker job is the
@@ -139,6 +153,7 @@ export async function createRender(
   orgId: string,
   videoId: string,
   templateId: string,
+  format?: string,
   callbackUrl?: string,
 ): Promise<RenderRow> {
   const video = await requireVideo(tx, videoId);
@@ -146,6 +161,7 @@ export async function createRender(
   if (video.projectId !== template.projectId) {
     throw badRequest("video_id and template_id must belong to the same project");
   }
+  const resolvedFormat = validateFormat(format);
 
   const videoSteps = await tx
     .select()
@@ -166,6 +182,7 @@ export async function createRender(
       projectId: video.projectId,
       videoId,
       templateId,
+      format: resolvedFormat,
       status: "queued",
       progress: null,
       callbackUrl: callbackUrl ?? null,
@@ -182,6 +199,7 @@ export async function createRender(
       start: step.start,
       end: step.end,
       title: step.title,
+      summary: step.summary,
     })),
   );
 

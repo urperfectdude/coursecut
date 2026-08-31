@@ -31,6 +31,7 @@ import {
   getRender,
   listRendersForVideo,
   type Render,
+  type RenderFormat,
   type RenderSummary,
 } from "@/api/renders";
 
@@ -38,6 +39,12 @@ interface RenderPanelProps {
   projectId: string;
   videoId: string;
 }
+
+const FORMAT_OPTIONS: Array<{ value: RenderFormat; label: string }> = [
+  { value: "video", label: "Video (single file)" },
+  { value: "markdown", label: "Markdown (per-step clips)" },
+  { value: "html", label: "Web page (hosted link)" },
+];
 
 /** Same interval `DashboardView.tsx`'s `POLL_INTERVAL_MS` polls video/job
  * status at — reused rather than invented, per this phase's convention. */
@@ -55,6 +62,7 @@ export default function RenderPanel({ projectId, videoId }: RenderPanelProps) {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [templatesLoading, setTemplatesLoading] = useState(true);
   const [templateId, setTemplateId] = useState<string>("");
+  const [format, setFormat] = useState<RenderFormat>("video");
   const [callbackUrl, setCallbackUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [active, setActive] = useState<Render | null>(null);
@@ -131,7 +139,7 @@ export default function RenderPanel({ projectId, videoId }: RenderPanelProps) {
     setSubmitting(true);
     setError(null);
     try {
-      const created = await createRender(videoId, templateId, callbackUrl.trim() || undefined);
+      const created = await createRender(videoId, templateId, format, callbackUrl.trim() || undefined);
       // `createRender` only returns `{ id, status }` — fetch the full row
       // once so the panel below has something to render immediately, same
       // as `DashboardView.handleFindSteps` loading its panel right after
@@ -159,7 +167,8 @@ export default function RenderPanel({ projectId, videoId }: RenderPanelProps) {
   /** History rows never carry `output_url` (only `GET /renders/:id` mints
    * one), so a download from the list re-fetches the single render first —
    * consistent with "never a permanently public object, minted fresh on
-   * every read" (plan §6), not a shortcut this view takes around it. */
+   * every read" (plan §6) for `video`/`markdown`; for `html` the re-fetch is
+   * just how the row learns its (permanent, not re-minted) page URL. */
   const handleDownload = async (id: string) => {
     setDownloadingId(id);
     setError(null);
@@ -208,6 +217,19 @@ export default function RenderPanel({ projectId, videoId }: RenderPanelProps) {
               {templates.map((template) => (
                 <SelectItem key={template.id} value={template.id}>
                   {template.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Select value={format} onValueChange={(value) => setFormat(value as RenderFormat)} disabled={submitting}>
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="Choose a format" />
+            </SelectTrigger>
+            <SelectContent>
+              {FORMAT_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -268,7 +290,11 @@ export default function RenderPanel({ projectId, videoId }: RenderPanelProps) {
               disabled={downloadingId === active.id}
               onClick={() => void handleDownload(active.id)}
             >
-              {downloadingId === active.id ? "Loading…" : "Download"}
+              {downloadingId === active.id
+                ? "Loading…"
+                : active.format === "html"
+                  ? "Open page"
+                  : "Download"}
             </Button>
           )}
         </div>
@@ -291,7 +317,11 @@ export default function RenderPanel({ projectId, videoId }: RenderPanelProps) {
                     disabled={downloadingId === render.id}
                     onClick={() => void handleDownload(render.id)}
                   >
-                    {downloadingId === render.id ? "Loading…" : "Download"}
+                    {downloadingId === render.id
+                      ? "Loading…"
+                      : render.format === "html"
+                        ? "Open page"
+                        : "Download"}
                   </Button>
                 )}
               </li>

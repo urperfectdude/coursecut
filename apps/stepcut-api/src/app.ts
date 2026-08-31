@@ -24,6 +24,7 @@ import { videoRoutes } from "./routes/videos.js";
 import { stepRoutes } from "./routes/steps.js";
 import { templateRoutes } from "./routes/templates.js";
 import { renderRoutes } from "./routes/renders.js";
+import { publicExportRoutes } from "./routes/exports-public.js";
 
 export function createApp() {
   const app = new Hono<AppEnv>();
@@ -43,6 +44,11 @@ export function createApp() {
   // (including set-active, which writes the session column `requireOrg`
   // reads).
   app.all("/api/auth/*", (c) => getAuth().handler(c.req.raw));
+
+  // Mounted before `requireOrg`, same as `/api/auth/*` above — a
+  // `'markdown'`/`'html'`-format render's whole point is a link that works
+  // with no session at all (`routes/exports-public.ts`'s header).
+  app.route("/api/exports", publicExportRoutes);
 
   const api = new Hono<AppEnv>();
   api.use("*", requireOrg);
