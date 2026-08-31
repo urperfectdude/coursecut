@@ -10,6 +10,7 @@ import { putToStorage, request } from "./http";
 
 export interface Template {
   id: string;
+  project_id: string;
   name: string;
   intro_key: string | null;
   outro_key: string | null;
@@ -26,6 +27,7 @@ export interface Template {
 export type TemplateAssetKind = "intro" | "outro" | "logo";
 
 interface TemplateInput {
+  project_id: string;
   name: string;
   brand_primary_hex?: string;
   brand_secondary_hex?: string;
@@ -34,15 +36,15 @@ interface TemplateInput {
   target_fps?: number;
 }
 
-type TemplatePatch = Partial<TemplateInput>;
+type TemplatePatch = Partial<Omit<TemplateInput, "project_id">>;
 
 interface AssetUploadTicket {
   url: string;
   storage_key: string;
 }
 
-export function listTemplates(): Promise<Template[]> {
-  return request<Template[]>("GET", "/templates");
+export function listTemplates(projectId: string): Promise<Template[]> {
+  return request<Template[]>("GET", `/templates?project_id=${encodeURIComponent(projectId)}`);
 }
 
 export function getTemplate(id: string): Promise<Template> {

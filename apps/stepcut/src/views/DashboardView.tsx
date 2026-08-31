@@ -1,15 +1,27 @@
-// The signed-in dashboard — Phase 2 and Phase 3's product surface
-// (docs/stepcut-plan.md §8: "Upload & transcript", "AI step proposal").
-// Phase 1 shipped an empty card here; Phase 2 extended it into an upload
-// button, a list of the org's videos with a status pill, and an inline view
-// of a transcribed video's transcript. Phase 3 adds a "Find steps" action and
-// a **read-only** list of the steps GPT-5.5 proposes from that transcript —
-// no editing yet — Phase 4 (docs/stepcut-plan.md §8: "Manual editing") adds
-// an "Edit steps" action once that list is non-empty, handing off to
-// `StepsEditorView` (via `onEditSteps`, owned by `App.tsx`): dragging a
-// boundary, retitling, split/delete/add all live there now, not in this
-// inline panel. No coursecut counterpart: apps/stepcut's views are
-// original, not ported from desktop.
+// A project's dashboard — Phase 2 and Phase 3's product surface
+// (docs/stepcut-plan.md §8: "Upload & transcript", "AI step proposal"),
+// scoped to one project now that `apps/stepcut` has a Home screen
+// (`HomeView`) sitting above it. Phase 1 shipped an empty card here. Phase 2
+// extended it into an upload button, a list of the project's videos with a
+// status pill, and an inline view of a transcribed video's transcript.
+// Phase 3 adds a "Find steps" action and a **read-only** list of the steps
+// GPT-5.5 proposes from that transcript — no editing yet — Phase 4
+// (docs/stepcut-plan.md §8: "Manual editing") adds an "Edit steps" action
+// once that list is non-empty, handing off to `StepsEditorView` (via
+// `onEditSteps`, owned by `App.tsx`): dragging a boundary, retitling,
+// split/delete/add all live there now, not in this inline panel. No
+// coursecut counterpart: apps/stepcut's views are original, not ported from
+// desktop.
+//
+// Each video is its own `Card` — a self-contained tile with its status pill
+// in the header and every action (view transcript, find/view steps, delete)
+// inside it — rather than a bare bordered `<li>`. That, plus
+// `api/videos.ts`'s `uploadVideo` now aborting a failed single-shot upload
+// instead of leaving its row stuck at `upload_status: "pending"` forever, is
+// what fixes the two-tiles-for-one-file confusion a stuck upload used to
+// cause: before, a failed upload never reached a terminal status, so it sat
+// alongside a since-succeeded retry indefinitely, reading as a duplicate of
+// the same file.
 //
 // No video playback here — that's `StepsEditorView`'s job now. This panel's
 // own job stays "prove a transcript appears after upload, and AI-proposed
@@ -17,11 +29,11 @@
 // something to edit.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import type { OrgSummary } from "@/auth/useOrgs";
 import { ApiError } from "@/api/http";
+import { getProject, type Project } from "@/api/projects";
 import {
   analyzeVideo,
   deleteVideo,
@@ -38,7 +50,7 @@ import {
 } from "@/api/videos";
 
 interface DashboardViewProps {
-  org: OrgSummary | undefined;
+  projectId: string;
   /** Navigates to `StepsEditorView` for a video (Phase 4). */
   onEditSteps: (videoId: string) => void;
 }
@@ -94,7 +106,8 @@ function isAnalyzing(panel: StepsPanel | undefined): boolean {
   return panel?.job?.state === "queued" || panel?.job?.state === "running";
 }
 
-export default function DashboardView({ org, onEditSteps }: DashboardViewProps) {
+export default function DashboardView({ projectId, onEditSteps }: DashboardViewProps) {
+  const [project, setProject] = useState<Project | undefined>(undefined);
   const [videos, setVideos] = useState<Video[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -104,16 +117,20 @@ export default function DashboardView({ org, onEditSteps }: DashboardViewProps) 
   const [stepsPanels, setStepsPanels] = useState<Record<string, StepsPanel | undefined>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  useEffect(() => {
+    void getProject(projectId).then(setProject);
+  }, [projectId]);
+
   const refresh = useCallback(async () => {
     try {
-      setVideos(await listVideos());
+      setVideos(await listVideos(projectId));
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [projectId]);
 
   useEffect(() => {
     void refresh();
@@ -158,7 +175,7 @@ export default function DashboardView({ org, onEditSteps }: DashboardViewProps) 
     setUploading(true);
     setError(null);
     try {
-      const video = await uploadVideo(file);
+      const video = await uploadVideo(projectId, file);
       setVideos((current) => [video, ...current]);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : err instanceof Error ? err.message : String(err));
@@ -240,186 +257,186 @@ export default function DashboardView({ org, onEditSteps }: DashboardViewProps) 
   };
 
   return (
-    <div className="mx-auto max-w-2xl p-8">
-      <Card>
-        <CardHeader>
-          <CardTitle>{org?.name ?? "Your organization"}</CardTitle>
-          <CardDescription>
-            Upload a narrated screen recording to see it transcribed, then find its steps.
-            Editing the proposed steps comes in a later phase.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-4">
-          {error && (
-            <Alert variant="destructive">
-              <AlertTitle>Something went wrong</AlertTitle>
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          )}
+    <div className="mx-auto flex max-w-2xl flex-col gap-4 p-8">
+      <div>
+        <h1 className="text-lg font-semibold">{project?.name ?? "Project"}</h1>
+        <p className="text-sm text-muted-foreground">
+          Upload a narrated screen recording to see it transcribed, then find its steps.
+        </p>
+      </div>
 
-          <div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="video/*"
-              className="hidden"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) void handleFileChosen(file);
-              }}
-            />
-            <Button onClick={() => fileInputRef.current?.click()} disabled={uploading}>
-              {uploading ? "Uploading…" : "Upload a video"}
-            </Button>
-          </div>
+      {error && (
+        <Alert variant="destructive">
+          <AlertTitle>Something went wrong</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
 
-          {loading ? (
-            <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : videos.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              Nothing uploaded yet — pick a video above to get started.
-            </p>
-          ) : (
-            <ul className="flex flex-col gap-3">
-              {videos.map((video) => (
-                <li key={video.id} className="rounded-lg border border-border p-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-sm font-medium" title={video.storage_key}>
-                      {video.storage_key.split("/").pop()}
-                    </span>
-                    <span
-                      className={
-                        statusVariant(video) === "destructive"
-                          ? "shrink-0 rounded-full bg-destructive/10 px-2 py-0.5 text-xs font-medium text-destructive"
-                          : "shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground"
-                      }
-                    >
-                      {statusLabel(video)}
-                    </span>
-                  </div>
+      <div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="video/*"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) void handleFileChosen(file);
+          }}
+        />
+        <Button onClick={() => fileInputRef.current?.click()} disabled={uploading}>
+          {uploading ? "Uploading…" : "Upload a video"}
+        </Button>
+      </div>
 
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {video.transcript_status === "transcribed" && (
-                      <Button variant="outline" size="sm" onClick={() => void toggleTranscript(video.id)}>
-                        {expanded[video.id] ? "Hide transcript" : "View transcript"}
-                      </Button>
-                    )}
-                    {video.transcript_status === "transcribed" && (
-                      <Button variant="outline" size="sm" onClick={() => toggleSteps(video.id)}>
-                        {stepsExpanded[video.id] ? "Hide steps" : "Steps"}
-                      </Button>
-                    )}
-                    {video.transcript_status === "error" && (
-                      <Button variant="outline" size="sm" onClick={() => void handleRetryTranscribe(video.id)}>
-                        Retry transcription
-                      </Button>
-                    )}
-                    <Button variant="ghost" size="sm" onClick={() => void handleDelete(video.id)}>
-                      Delete
+      {loading ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : videos.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          Nothing uploaded yet — pick a video above to get started.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {videos.map((video) => (
+            <Card key={video.id}>
+              <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
+                <CardTitle
+                  className="truncate text-sm font-medium"
+                  title={video.storage_key}
+                >
+                  {video.storage_key.split("/").pop()}
+                </CardTitle>
+                <span
+                  className={
+                    statusVariant(video) === "destructive"
+                      ? "shrink-0 rounded-full bg-destructive/10 px-2 py-0.5 text-xs font-medium text-destructive"
+                      : "shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground"
+                  }
+                >
+                  {statusLabel(video)}
+                </span>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-3">
+                <div className="flex flex-wrap gap-2">
+                  {video.transcript_status === "transcribed" && (
+                    <Button variant="outline" size="sm" onClick={() => void toggleTranscript(video.id)}>
+                      {expanded[video.id] ? "Hide transcript" : "View transcript"}
                     </Button>
+                  )}
+                  {video.transcript_status === "transcribed" && (
+                    <Button variant="outline" size="sm" onClick={() => toggleSteps(video.id)}>
+                      {stepsExpanded[video.id] ? "Hide steps" : "Steps"}
+                    </Button>
+                  )}
+                  {video.transcript_status === "error" && (
+                    <Button variant="outline" size="sm" onClick={() => void handleRetryTranscribe(video.id)}>
+                      Retry transcription
+                    </Button>
+                  )}
+                  <Button variant="ghost" size="sm" onClick={() => void handleDelete(video.id)}>
+                    Delete
+                  </Button>
+                </div>
+
+                {expanded[video.id] && (
+                  <div className="flex max-h-64 flex-col gap-2 overflow-y-auto rounded-md bg-muted/50 p-2">
+                    {expanded[video.id]!.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">No transcript segments.</p>
+                    ) : (
+                      expanded[video.id]!.map((segment) => (
+                        <p key={segment.id} className="text-sm">
+                          <span className="mr-2 font-mono text-xs text-muted-foreground">
+                            {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
+                          </span>
+                          {segment.text}
+                        </p>
+                      ))
+                    )}
                   </div>
+                )}
 
-                  {expanded[video.id] && (
-                    <div className="mt-3 flex max-h-64 flex-col gap-2 overflow-y-auto rounded-md bg-muted/50 p-2">
-                      {expanded[video.id]!.length === 0 ? (
-                        <p className="text-sm text-muted-foreground">No transcript segments.</p>
-                      ) : (
-                        expanded[video.id]!.map((segment) => (
-                          <p key={segment.id} className="text-sm">
-                            <span className="mr-2 font-mono text-xs text-muted-foreground">
-                              {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
-                            </span>
-                            {segment.text}
-                          </p>
-                        ))
-                      )}
-                    </div>
-                  )}
-
-                  {stepsExpanded[video.id] && (
-                    <div className="mt-3 flex flex-col gap-2 rounded-md bg-muted/50 p-2">
-                      {(() => {
-                        const panel = stepsPanels[video.id];
-                        if (!panel) {
-                          return <p className="text-sm text-muted-foreground">Loading…</p>;
-                        }
-                        if (panel.steps.length > 0) {
-                          return (
-                            <>
-                              <ol className="flex flex-col gap-2">
-                                {panel.steps.map((step, index) => (
-                                  <li key={step.id} className="text-sm">
-                                    <span className="mr-2 font-mono text-xs text-muted-foreground">
-                                      {index + 1}. {formatTimestamp(step.start)}–{formatTimestamp(step.end)}
-                                    </span>
-                                    <span className="font-medium">{step.title}</span>
-                                    {step.summary && (
-                                      <p className="ml-5 text-sm text-muted-foreground">{step.summary}</p>
-                                    )}
-                                  </li>
-                                ))}
-                              </ol>
-                              <Button
-                                type="button"
-                                size="sm"
-                                className="self-start"
-                                onClick={() => onEditSteps(video.id)}
-                              >
-                                Edit steps
-                              </Button>
-                            </>
-                          );
-                        }
-                        if (isAnalyzing(panel)) {
-                          return (
-                            <p className="text-sm text-muted-foreground">
-                              {panel.job?.detail ?? "Finding steps…"}
-                            </p>
-                          );
-                        }
-                        if (panel.job?.state === "failed") {
-                          return (
-                            <div className="flex flex-col gap-2">
-                              <p className="text-sm text-destructive">
-                                {panel.job.error ?? "Step analysis failed."}
-                              </p>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="self-start"
-                                onClick={() => void handleFindSteps(video.id)}
-                              >
-                                Retry
-                              </Button>
-                            </div>
-                          );
-                        }
-                        if (panel.job?.state === "done") {
-                          return (
-                            <p className="text-sm text-muted-foreground">
-                              No steps were found in this recording.
-                            </p>
-                          );
-                        }
+                {stepsExpanded[video.id] && (
+                  <div className="flex flex-col gap-2 rounded-md bg-muted/50 p-2">
+                    {(() => {
+                      const panel = stepsPanels[video.id];
+                      if (!panel) {
+                        return <p className="text-sm text-muted-foreground">Loading…</p>;
+                      }
+                      if (panel.steps.length > 0) {
                         return (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="self-start"
-                            onClick={() => void handleFindSteps(video.id)}
-                          >
-                            Find steps
-                          </Button>
+                          <>
+                            <ol className="flex flex-col gap-2">
+                              {panel.steps.map((step, index) => (
+                                <li key={step.id} className="text-sm">
+                                  <span className="mr-2 font-mono text-xs text-muted-foreground">
+                                    {index + 1}. {formatTimestamp(step.start)}–{formatTimestamp(step.end)}
+                                  </span>
+                                  <span className="font-medium">{step.title}</span>
+                                  {step.summary && (
+                                    <p className="ml-5 text-sm text-muted-foreground">{step.summary}</p>
+                                  )}
+                                </li>
+                              ))}
+                            </ol>
+                            <Button
+                              type="button"
+                              size="sm"
+                              className="self-start"
+                              onClick={() => onEditSteps(video.id)}
+                            >
+                              Edit steps
+                            </Button>
+                          </>
                         );
-                      })()}
-                    </div>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </CardContent>
-      </Card>
+                      }
+                      if (isAnalyzing(panel)) {
+                        return (
+                          <p className="text-sm text-muted-foreground">
+                            {panel.job?.detail ?? "Finding steps…"}
+                          </p>
+                        );
+                      }
+                      if (panel.job?.state === "failed") {
+                        return (
+                          <div className="flex flex-col gap-2">
+                            <p className="text-sm text-destructive">
+                              {panel.job.error ?? "Step analysis failed."}
+                            </p>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="self-start"
+                              onClick={() => void handleFindSteps(video.id)}
+                            >
+                              Retry
+                            </Button>
+                          </div>
+                        );
+                      }
+                      if (panel.job?.state === "done") {
+                        return (
+                          <p className="text-sm text-muted-foreground">
+                            No steps were found in this recording.
+                          </p>
+                        );
+                      }
+                      return (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="self-start"
+                          onClick={() => void handleFindSteps(video.id)}
+                        >
+                          Find steps
+                        </Button>
+                      );
+                    })()}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

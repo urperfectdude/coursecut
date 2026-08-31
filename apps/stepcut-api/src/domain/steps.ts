@@ -152,6 +152,59 @@ export async function deleteStep(tx: Tx, id: string): Promise<void> {
   await resequenceSteps(tx, existing.videoId);
 }
 
+export interface StepEditInput {
+  start: number;
+  end: number;
+  title: string;
+  summary: string;
+}
+
+/**
+ * Replaces a video's entire step list with `edits` — the apply half of the
+ * free-text AI edit (`routes/steps.ts`'s `/videos/:id/steps/edit/apply`,
+ * `openai.ts`'s `editSteps`). Modeled on `apps/api/src/domain/lessons.ts`'s
+ * `replaceLessonSegments`, but unlike a lesson's segments an empty result is
+ * allowed: a step list has no parent row an empty list would orphan (a
+ * lesson deletes itself when its last segment goes; a video does not), so
+ * "remove every step" is a legitimate edit rather than one this function
+ * has to reject.
+ *
+ * Every resulting row is `source = 'manual'` and `confidence = null` — the
+ * same "a human (even by prompting an edit) touched this" rule `updateStep`
+ * applies, so a later `analyze` re-run's replace-only-`'ai'`-rows pass
+ * leaves the whole edited list alone.
+ */
+export async function replaceSteps(
+  tx: Tx,
+  orgId: string,
+  videoId: string,
+  edits: readonly StepEditInput[],
+): Promise<StepRow[]> {
+  await requireVideo(tx, videoId);
+  edits.forEach((edit) => validateRange(edit.start, edit.end));
+
+  await tx.delete(steps).where(eq(steps.videoId, videoId));
+  if (edits.length > 0) {
+    await tx.insert(steps).values(
+      edits.map((edit, index) => ({
+        id: newId(),
+        orgId,
+        videoId,
+        sortOrder: index,
+        start: edit.start,
+        end: edit.end,
+        title: requireTitle(edit.title),
+        summary: edit.summary || null,
+        source: "manual" as const,
+        confidence: null,
+      })),
+    );
+  }
+
+  await resequenceSteps(tx, videoId);
+  return tx.select().from(steps).where(eq(steps.videoId, videoId)).orderBy(asc(steps.sortOrder), asc(steps.id));
+}
+
 /**
  * Adds a step by hand: `source = 'manual'`, `confidence = null`, same as any
  * other manually-produced row.

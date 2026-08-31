@@ -11,7 +11,7 @@
 // left unchanged, and validation on `updateTemplate` is identical to
 // `createTemplate`'s for whichever field is actually present.
 
-import { eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import type { Tx } from "../db/client.js";
 import { badRequest, notFound } from "../http/errors.js";
 import { templates } from "../db/schema.js";
@@ -44,11 +44,11 @@ export async function queryTemplate(tx: Tx, id: string): Promise<TemplateRow> {
   return row;
 }
 
-/** The org's templates. RLS already scopes the transaction to the caller's
- * org (same as `videoRoutes`'s `GET /videos`), so there is no explicit
- * `org_id` filter here — only on the insert below. */
-export async function listTemplates(tx: Tx): Promise<TemplateRow[]> {
-  return tx.select().from(templates);
+/** A project's templates, newest first. RLS already scopes the transaction
+ * to the caller's org (same as `videoRoutes`'s `GET /videos`); the explicit
+ * `project_id` filter here is the grouping, not the security boundary. */
+export async function listTemplates(tx: Tx, projectId: string): Promise<TemplateRow[]> {
+  return tx.select().from(templates).where(eq(templates.projectId, projectId)).orderBy(desc(templates.createdAt));
 }
 
 export interface TemplateInput {
@@ -60,7 +60,12 @@ export interface TemplateInput {
   targetFps?: number;
 }
 
-export async function createTemplate(tx: Tx, orgId: string, input: TemplateInput): Promise<TemplateRow> {
+export async function createTemplate(
+  tx: Tx,
+  orgId: string,
+  projectId: string,
+  input: TemplateInput,
+): Promise<TemplateRow> {
   const name = requireName(input.name);
   if (input.brandPrimaryHex !== undefined) validateHex("brand_primary_hex", input.brandPrimaryHex);
   if (input.brandSecondaryHex !== undefined) validateHex("brand_secondary_hex", input.brandSecondaryHex);
@@ -75,6 +80,7 @@ export async function createTemplate(tx: Tx, orgId: string, input: TemplateInput
     .values({
       id: newId(),
       orgId,
+      projectId,
       name,
       brandPrimaryHex: input.brandPrimaryHex ?? null,
       brandSecondaryHex: input.brandSecondaryHex ?? null,

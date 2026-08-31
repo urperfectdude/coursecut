@@ -17,11 +17,20 @@
 //    are not UUIDs.
 //  * `created_at`/`updated_at` are `timestamptz`.
 //  * Every tenant-scoped row carries `org_id` directly, so an RLS policy is a
-//    single-column check rather than a join. `videos` has no parent table in
-//    StepCut (no `projects` — plan §3), so it gets a plain `org_id` column
-//    rather than a composite FK up to one; it still exposes
-//    `UNIQUE (id, org_id)` so `jobs`/`transcript_segments` can composite-FK
-//    down to it the same way apps/api's tables do.
+//    single-column check rather than a join — that stays true even now that
+//    `videos`/`templates`/`renders` also carry a `project_id`: RLS is still
+//    keyed on `org_id` alone (a project is an organizational grouping within
+//    an org, not its own security boundary), and each of those three tables
+//    still exposes `UNIQUE (id, org_id)` so `jobs`/`transcript_segments` can
+//    composite-FK down to it the same way apps/api's tables do.
+//  * `projects` (added after Phase 5; the plan's original §3 had no such
+//    table) is the one exception to "no parent table" below — it groups an
+//    org's videos, templates, and renders into the units `apps/stepcut`'s
+//    Home screen lists/creates. `transcript_segments`/`jobs`/`steps`/
+//    `render_steps` stay scoped through their existing video/render parent
+//    rather than getting their own `project_id` — that would duplicate a fact
+//    already reachable through the parent, for tables that are never listed
+//    by project directly.
 
 import { relations } from "drizzle-orm";
 import {
@@ -232,6 +241,30 @@ export const apiKeys = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Projects — groups an org's videos, templates, and renders into the units
+// `apps/stepcut`'s Home screen lists and creates. See this file's header for
+// why this table carries no RLS policy of its own beyond the standard
+// org-scoped one.
+// ---------------------------------------------------------------------------
+
+export const projects = pgTable(
+  "projects",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    name: text("name").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    // The composite-FK target `videos`/`templates`/`renders` point at below,
+    // same pattern `uq_videos_id_org` establishes for `videos`' own children.
+    unique("uq_projects_id_org").on(t.id, t.orgId),
+    index("idx_projects_org_id").on(t.orgId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Videos, transcripts, jobs — Phase 2 (docs/stepcut-plan.md §8)
 // ---------------------------------------------------------------------------
 //
@@ -249,6 +282,7 @@ export const videos = pgTable(
   {
     id: id(),
     orgId: text("org_id").notNull(),
+    projectId: text("project_id").notNull(),
     // The object key `stepcut/{org_id}/{video_id}/{filename}` — a key, never
     // a URL and never a bucket hostname (see src/storage.ts).
     storageKey: text("storage_key").notNull(),
@@ -272,11 +306,14 @@ export const videos = pgTable(
   },
   (t) => [
     // The composite-FK target for `transcript_segments` and `jobs` below.
-    // No `projects` table in StepCut, so unlike apps/api's `videos` this has
-    // no `foreignKey()` of its own — just the unique pair a child can point
-    // at.
     unique("uq_videos_id_org").on(t.id, t.orgId),
+    foreignKey({
+      name: "fk_videos_project",
+      columns: [t.projectId, t.orgId],
+      foreignColumns: [projects.id, projects.orgId],
+    }).onDelete("cascade"),
     index("idx_videos_org_id").on(t.orgId),
+    index("idx_videos_project_id").on(t.projectId),
     // Per-org content-hash lookup, not unique — the same duplicate-import
     // case apps/api's copy documents (importing the same recording twice is
     // ordinary, and the cache finds a sibling by hash, not by uniqueness).
@@ -416,16 +453,16 @@ export const steps = pgTable(
 //
 // An org's reusable render config: brand colors and target output dimensions,
 // plus optional intro/outro/logo assets uploaded the same presigned-PUT way a
-// video is (see `storage.ts`'s `templateAssetKey`). No parent table — same as
-// `videos`, a template belongs directly to an org — and no relation to
-// `steps`/`videos` of its own; `renders` (next slice) is what will
-// composite-FK down to a template, which is the only reason for the
-// `uq_templates_id_org` unique pair below.
+// video is (see `storage.ts`'s `templateAssetKey`). Belongs to a project —
+// each project keeps its own brand kit — and has no relation to `steps`/
+// `videos` of its own; `renders` is what composite-FKs down to a template,
+// which is the other reason for the `uq_templates_id_org` unique pair below.
 export const templates = pgTable(
   "templates",
   {
     id: id(),
     orgId: text("org_id").notNull(),
+    projectId: text("project_id").notNull(),
     name: text("name").notNull(),
     // Set only once its `/assets/:kind/complete` call lands — null until then,
     // which is fine, since a template's existence doesn't depend on having
@@ -442,10 +479,16 @@ export const templates = pgTable(
     updatedAt: updatedAt(),
   },
   (t) => [
-    // The composite-FK target a later `renders` table points at, same pattern
+    // The composite-FK target `renders` points at, same pattern
     // `uq_videos_id_org` establishes for `videos`.
     unique("uq_templates_id_org").on(t.id, t.orgId),
+    foreignKey({
+      name: "fk_templates_project",
+      columns: [t.projectId, t.orgId],
+      foreignColumns: [projects.id, projects.orgId],
+    }).onDelete("cascade"),
     index("idx_templates_org_id").on(t.orgId),
+    index("idx_templates_project_id").on(t.projectId),
   ],
 );
 
@@ -469,6 +512,11 @@ export const renders = pgTable(
   {
     id: id(),
     orgId: text("org_id").notNull(),
+    // Denormalized off `videoId`/`templateId` (both required to already agree
+    // on it — `domain/renders.ts`'s `createRender` checks that before insert)
+    // — carried directly, like `orgId`, so `GET /projects/:id/renders` is a
+    // single-column filter rather than a join.
+    projectId: text("project_id").notNull(),
     videoId: text("video_id").notNull(),
     templateId: text("template_id").notNull(),
     // 'queued' | 'running' | 'done' | 'failed' | 'cancelled'.
@@ -510,9 +558,15 @@ export const renders = pgTable(
       columns: [t.templateId, t.orgId],
       foreignColumns: [templates.id, templates.orgId],
     }).onDelete("cascade"),
+    foreignKey({
+      name: "fk_renders_project",
+      columns: [t.projectId, t.orgId],
+      foreignColumns: [projects.id, projects.orgId],
+    }).onDelete("cascade"),
     // The composite-FK target `render_steps`/`jobs` point at.
     unique("uq_renders_id_org").on(t.id, t.orgId),
     index("idx_renders_org_id").on(t.orgId),
+    index("idx_renders_project_id").on(t.projectId),
     // `GET /videos/:id/renders`'s own lookup.
     index("idx_renders_video_id").on(t.videoId),
   ],
@@ -572,7 +626,14 @@ export const membersRelations = relations(members, ({ one }) => ({
   user: one(users, { fields: [members.userId], references: [users.id] }),
 }));
 
-export const videosRelations = relations(videos, ({ many }) => ({
+export const projectsRelations = relations(projects, ({ many }) => ({
+  videos: many(videos),
+  templates: many(templates),
+  renders: many(renders),
+}));
+
+export const videosRelations = relations(videos, ({ one, many }) => ({
+  project: one(projects, { fields: [videos.projectId], references: [projects.id] }),
   transcriptSegments: many(transcriptSegments),
   jobs: many(jobs),
   steps: many(steps),
@@ -592,6 +653,10 @@ export const stepsRelations = relations(steps, ({ one }) => ({
   video: one(videos, { fields: [steps.videoId], references: [videos.id] }),
 }));
 
+export const templatesRelations = relations(templates, ({ one }) => ({
+  project: one(projects, { fields: [templates.projectId], references: [projects.id] }),
+}));
+
 // `renders`/`render_steps` — this slice. `render_steps` is structurally the
 // same shape as `steps` (a child row FK'd to one parent), so it gets a
 // `one()` back the same way `stepsRelations` does; `renders` additionally
@@ -599,6 +664,7 @@ export const stepsRelations = relations(steps, ({ one }) => ({
 // composite-FKs to `templates` yet, so there is no reciprocal `many()` to add
 // on that side.
 export const rendersRelations = relations(renders, ({ one, many }) => ({
+  project: one(projects, { fields: [renders.projectId], references: [projects.id] }),
   video: one(videos, { fields: [renders.videoId], references: [videos.id] }),
   template: one(templates, { fields: [renders.templateId], references: [templates.id] }),
   renderSteps: many(renderSteps),
@@ -625,6 +691,7 @@ export const renderStepsRelations = relations(renderSteps, ({ one }) => ({
  *     for everything downstream of that lookup.
  */
 export const TENANT_TABLES = [
+  "projects",
   "videos",
   "transcript_segments",
   "jobs",
