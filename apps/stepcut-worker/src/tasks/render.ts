@@ -31,12 +31,14 @@
 
 import { withOrg } from "../../../stepcut-api/src/db/client.js";
 import { and, eq } from "../../../stepcut-api/src/db/ops.js";
+import { env } from "../../../stepcut-api/src/env.js";
 import { enqueueWebhookJob } from "../../../stepcut-api/src/jobs/queue.js";
 import { jobs, renders, renderSteps, templates, videos } from "../../../stepcut-api/src/db/schema.js";
 import * as storage from "../../../stepcut-api/src/storage.js";
 import { concatVideos, cutSegment, probeDuration, renderTitleCard, type FfmpegRun } from "../ffmpeg.js";
+import { renderHtmlDoc, renderMarkdownDoc, type RenderDocStep } from "./render-docs.js";
 import { withScratchDir } from "../scratch.js";
-import { stat } from "node:fs/promises";
+import { stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export interface RenderJobPayload {
@@ -68,9 +70,18 @@ interface PendingRender {
   id: string;
   orgId: string;
   videoId: string;
+  /** The video's own storage key, filename-derived into a doc title for the
+   * `'markdown'`/`'html'` path (`videoDocTitle` below) — not used by the
+   * `'video'` path, which has no document to title. */
   sourceStorageKey: string;
+  /** `'video'` | `'markdown'` | `'html'` — see `runRenderJob`'s branch and
+   * `apps/stepcut-api/src/domain/renders.ts`'s `RenderFormat`. Left as
+   * `string` rather than importing that type: this worker deliberately
+   * queries `db/schema.ts` directly rather than through the API's domain
+   * layer (this file's header), so the branch below just compares strings. */
+  format: string;
   template: TemplatePlan;
-  steps: Array<{ start: number; end: number; title: string }>;
+  steps: Array<{ id: string; start: number; end: number; title: string; summary: string | null }>;
 }
 
 export async function runRenderJob(payload: RenderJobPayload): Promise<void> {
@@ -96,7 +107,8 @@ export async function runRenderJob(payload: RenderJobPayload): Promise<void> {
   if (claim === "skip") return;
 
   try {
-    const uploaded = await encodeAndUpload(claim);
+    const uploaded =
+      claim.format === "video" ? await encodeAndUpload(claim) : await encodeAndUploadSteps(claim);
     await finalize(orgId, renderId, undefined, uploaded);
   } catch (err) {
     await finalize(orgId, renderId, err instanceof Error ? err.message : String(err));
@@ -115,7 +127,12 @@ export async function runRenderJob(payload: RenderJobPayload): Promise<void> {
 async function claimRender(orgId: string, renderId: string): Promise<PendingRender | "skip"> {
   return withOrg(orgId, async (tx) => {
     const [row] = await tx
-      .select({ status: renders.status, videoId: renders.videoId, templateId: renders.templateId })
+      .select({
+        status: renders.status,
+        videoId: renders.videoId,
+        templateId: renders.templateId,
+        format: renders.format,
+      })
       .from(renders)
       .where(eq(renders.id, renderId))
       .limit(1);
@@ -144,7 +161,13 @@ async function claimRender(orgId: string, renderId: string): Promise<PendingRend
     if (!template) return "skip";
 
     const stepRows = await tx
-      .select({ start: renderSteps.start, end: renderSteps.end, title: renderSteps.title })
+      .select({
+        id: renderSteps.id,
+        start: renderSteps.start,
+        end: renderSteps.end,
+        title: renderSteps.title,
+        summary: renderSteps.summary,
+      })
       .from(renderSteps)
       .where(eq(renderSteps.renderId, renderId))
       .orderBy(renderSteps.sortOrder);
@@ -164,6 +187,7 @@ async function claimRender(orgId: string, renderId: string): Promise<PendingRend
       orgId,
       videoId: row.videoId,
       sourceStorageKey: video.storageKey,
+      format: row.format,
       template,
       steps: stepRows,
     };
@@ -266,6 +290,95 @@ async function encodeAndUpload(job: PendingRender): Promise<{ sizeBytes: number;
     // from the local file rather than a HEAD against storage: it is the same
     // number and it is already on disk.
     return { sizeBytes: (await stat(outputPath)).size, outputKey };
+  });
+}
+
+/** A doc title from the video's own storage key — `stepcut/{org}/{video}/
+ * {filename}` — since there is no separate `videos.title` column to read.
+ * Same "basename, extension stripped" derivation the frontend already uses
+ * for display (`StepsEditorView.tsx`'s breadcrumb), just done server-side
+ * for the generated doc's `<title>`/`# heading`. */
+function videoDocTitle(storageKey: string): string {
+  const filename = storageKey.split("/").pop() ?? storageKey;
+  return filename.replace(/\.[^.]+$/, "") || filename;
+}
+
+/**
+ * Cuts each step as its own clip and uploads it individually — the
+ * `'markdown'`/`'html'` path (`runRenderJob`'s branch), instead of
+ * `encodeAndUpload`'s single stitched MP4. No title cards, no intro/outro,
+ * no concat: those are `'video'`-format production values only, and this
+ * path shows a step's title/summary as real text next to its clip instead
+ * (`render-docs.ts`). Every clip lands at its own public URL
+ * (`apps/stepcut-api/src/routes/exports-public.ts`) so the generated
+ * `.md`/`index.html` this returns as `outputKey` keeps working long after
+ * this job's scratch dir (and any presigned URL) would have expired.
+ */
+async function encodeAndUploadSteps(job: PendingRender): Promise<{ sizeBytes: number; outputKey: string }> {
+  if (job.steps.length === 0) {
+    throw new Error("this render has no steps to cut");
+  }
+
+  const { targetWidth, targetHeight, targetFps } = job.template;
+  const total = job.steps.reduce((sum, s) => sum + Math.max(0, s.end - s.start), 0);
+
+  return withScratchDir(job.id, async (dir) => {
+    const sourcePath = join(dir, "source");
+    await storage.downloadToFile(job.sourceStorageKey, sourcePath);
+
+    let elapsed = 0;
+    const docSteps: RenderDocStep[] = [];
+    const assetUpdates: Array<{ id: string; assetKey: string }> = [];
+
+    for (const step of job.steps) {
+      await assertNotCancelled(job);
+
+      const cutPath = join(dir, `step-${step.id}.mp4`);
+      const stepDuration = Math.max(0, step.end - step.start);
+      const base = elapsed;
+      await watchForCancel(job, () =>
+        cutSegment(sourcePath, step.start, step.end, cutPath, targetWidth, targetHeight, targetFps, (fraction) => {
+          const overall = total > 0 ? (base + fraction * stepDuration) / total : fraction;
+          void setProgress(job, overall);
+        }),
+      );
+      elapsed += stepDuration;
+
+      await assertNotCancelled(job);
+      const assetKey = storage.renderStepAssetKey(job.orgId, job.videoId, job.id, step.id);
+      await storage.uploadFile(assetKey, cutPath, "video/mp4");
+      assetUpdates.push({ id: step.id, assetKey });
+      docSteps.push({
+        title: step.title,
+        summary: step.summary,
+        url: `${env.appUrl()}/api/exports/${job.id}/steps/${step.id}`,
+      });
+    }
+
+    await assertNotCancelled(job);
+    // One update per row rather than a bulk statement — `render_steps` has
+    // no natural "set assetKey by id, one value per row" bulk form in
+    // Drizzle without a `CASE` expression, and this only ever runs once per
+    // render for however many steps it has, not a hot path.
+    await withOrg(job.orgId, async (tx) => {
+      for (const update of assetUpdates) {
+        await tx.update(renderSteps).set({ assetKey: update.assetKey }).where(eq(renderSteps.id, update.id));
+      }
+    });
+
+    const videoTitle = videoDocTitle(job.sourceStorageKey);
+    const brandHex = job.template.brandPrimaryHex ?? "#000000";
+    const isHtml = job.format === "html";
+    const docPath = join(dir, isHtml ? "index.html" : "output.md");
+    const docContent = isHtml ? renderHtmlDoc(videoTitle, brandHex, docSteps) : renderMarkdownDoc(videoTitle, docSteps);
+    await writeFile(docPath, docContent, "utf8");
+
+    await assertNotCancelled(job);
+    const outputKey = isHtml
+      ? storage.renderHtmlKey(job.orgId, job.videoId, job.id)
+      : storage.renderMarkdownKey(job.orgId, job.videoId, job.id);
+    await storage.uploadFile(outputKey, docPath, isHtml ? "text/html" : "text/markdown");
+    return { sizeBytes: (await stat(docPath)).size, outputKey };
   });
 }
 

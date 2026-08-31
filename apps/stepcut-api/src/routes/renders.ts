@@ -17,6 +17,7 @@ import * as serialize from "../http/serialize.js";
 import * as domain from "../domain/renders.js";
 import { cancelJobsForRender, enqueueRenderJob } from "../jobs/queue.js";
 import * as storage from "../storage.js";
+import { env } from "../env.js";
 
 export const renderRoutes = new Hono<AppEnv>();
 
@@ -31,14 +32,26 @@ export const renderRoutes = new Hono<AppEnv>();
  * for everything else.
  */
 renderRoutes.post("/renders", async (c) => {
-  const body = await c.req.json<{ video_id?: string; template_id?: string; callback_url?: string }>();
+  const body = await c.req.json<{
+    video_id?: string;
+    template_id?: string;
+    format?: string;
+    callback_url?: string;
+  }>();
   const videoId = body.video_id;
   const templateId = body.template_id;
   if (!videoId) throw badRequest("video_id is required");
   if (!templateId) throw badRequest("template_id is required");
 
   const row = await tx(c, async (t) => {
-    const render = await domain.createRender(t, c.get("orgId"), videoId, templateId, body.callback_url);
+    const render = await domain.createRender(
+      t,
+      c.get("orgId"),
+      videoId,
+      templateId,
+      body.format,
+      body.callback_url,
+    );
     await enqueueRenderJob(t, c.get("orgId"), render.id);
     return render;
   });
@@ -49,13 +62,21 @@ renderRoutes.post("/renders", async (c) => {
 /**
  * Mints a fresh `output_url` for a finished render rather than storing one —
  * same "never a permanently public object, minted fresh on every read"
- * discipline `routes/videos.ts`'s `/videos/playback-url` follows (plan §6).
+ * discipline `routes/videos.ts`'s `/videos/playback-url` follows (plan §6) —
+ * except for a `'html'`-format render, whose whole point is a URL that
+ * *doesn't* need re-minting: `output_url` there is the permanent
+ * `routes/exports-public.ts` page link, not a presign of anything.
  */
 renderRoutes.get("/renders/:id", async (c) => {
   const id = param(c, "id");
   const row = await tx(c, (t) => domain.queryRender(t, id));
 
-  const outputUrl = row.status === "done" && row.outputKey ? await storage.presignGet(row.outputKey) : null;
+  const outputUrl =
+    row.status !== "done" || !row.outputKey
+      ? null
+      : row.format === "html"
+        ? `${env.appUrl()}/api/exports/${row.id}`
+        : await storage.presignGet(row.outputKey);
   return c.json({ ...serialize.render(row), output_url: outputUrl });
 });
 

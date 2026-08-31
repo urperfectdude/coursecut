@@ -135,9 +135,36 @@ export function templatePrefix(orgId: string, templateId: string): string {
 
 /** Where a render's assembled output lands — beside the source video it was
  * cut from, under its own render id (two renders of the same video, against
- * different templates, get disjoint keys). */
+ * different templates, get disjoint keys). `renders.format = 'video'` only —
+ * `'markdown'`/`'html'` use the three key builders below instead. */
 export function renderKey(orgId: string, videoId: string, renderId: string): string {
   return `${PREFIX}/${orgId}/${videoId}/renders/${renderId}/output.mp4`;
+}
+
+/** One step's individually-cut clip, for a `'markdown'`/`'html'` render —
+ * keyed by the `render_steps` row's own id, the same id
+ * `routes/exports-public.ts`'s `/steps/:stepId` route looks the row up by. */
+export function renderStepAssetKey(
+  orgId: string,
+  videoId: string,
+  renderId: string,
+  stepRowId: string,
+): string {
+  return `${PREFIX}/${orgId}/${videoId}/renders/${renderId}/steps/${stepRowId}.mp4`;
+}
+
+/** A `'markdown'`-format render's generated `.md` — downloaded the same way
+ * `renderKey`'s stitched MP4 is (a fresh presigned GET), unlike the per-step
+ * clips it embeds by public URL. */
+export function renderMarkdownKey(orgId: string, videoId: string, renderId: string): string {
+  return `${PREFIX}/${orgId}/${videoId}/renders/${renderId}/output.md`;
+}
+
+/** A `'html'`-format render's generated page — never presigned; served
+ * straight from `routes/exports-public.ts`'s public `GET /api/exports/:id`,
+ * which is what makes its URL permanent. */
+export function renderHtmlKey(orgId: string, videoId: string, renderId: string): string {
+  return `${PREFIX}/${orgId}/${videoId}/renders/${renderId}/index.html`;
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +354,27 @@ export async function getObjectBytes(key: string): Promise<Uint8Array<ArrayBuffe
   const chunks: Buffer[] = [];
   for await (const chunk of body) chunks.push(chunk as Buffer);
   return new Uint8Array(Buffer.concat(chunks));
+}
+
+/**
+ * Opens a streaming read of one object — what `routes/exports-public.ts`
+ * pipes straight into an HTTP response body, rather than buffering a
+ * multi-megabyte step clip into memory the way `getObjectBytes` above does
+ * for (small, bounded) audio. `null` on a missing key rather than a thrown
+ * error, since the caller's only use of that is a 404, not a 500.
+ */
+export async function getObjectStream(
+  key: string,
+): Promise<{ body: Readable; contentLength?: number } | null> {
+  try {
+    const result = await s3().send(new GetObjectCommand({ Bucket: bucket(), Key: key }));
+    const body = result.Body as Readable | undefined;
+    if (!body) return null;
+    return { body, contentLength: result.ContentLength };
+  } catch (err) {
+    if (isNotFound(err)) return null;
+    throw err;
+  }
 }
 
 /**

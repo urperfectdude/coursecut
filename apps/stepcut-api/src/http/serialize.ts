@@ -104,6 +104,7 @@ export function render(row: RenderRow) {
     project_id: row.projectId,
     video_id: row.videoId,
     template_id: row.templateId,
+    format: row.format,
     status: row.status,
     progress: row.progress,
     error: row.error,
