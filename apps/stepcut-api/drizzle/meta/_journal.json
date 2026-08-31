@@ -85,6 +85,13 @@
       "when": 1788161883623,
       "tag": "0011_silly_miracleman",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1788175449236,
+      "tag": "0012_rls_export_public_read",
+      "breakpoints": true
     }
   ]
 }
