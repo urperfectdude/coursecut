@@ -13,7 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import type { OrgSummary } from "@/auth/useOrgs";
+import { getProject, type Project } from "@/api/projects";
 import {
   createTemplate,
   deleteTemplate,
@@ -24,7 +24,7 @@ import {
 } from "@/api/templates";
 
 interface TemplatesViewProps {
-  org: OrgSummary | undefined;
+  projectId: string;
 }
 
 const ASSET_KINDS: Array<{ kind: TemplateAssetKind; label: string }> = [
@@ -39,7 +39,8 @@ function assetKeyOf(template: Template, kind: TemplateAssetKind): string | null 
   return template.logo_key;
 }
 
-export default function TemplatesView({ org }: TemplatesViewProps) {
+export default function TemplatesView({ projectId }: TemplatesViewProps) {
+  const [project, setProject] = useState<Project | undefined>(undefined);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -50,16 +51,20 @@ export default function TemplatesView({ org }: TemplatesViewProps) {
   const [uploadingKey, setUploadingKey] = useState<string | null>(null);
   const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
+  useEffect(() => {
+    void getProject(projectId).then(setProject);
+  }, [projectId]);
+
   const refresh = useCallback(async () => {
     try {
-      setTemplates(await listTemplates());
+      setTemplates(await listTemplates(projectId));
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [projectId]);
 
   useEffect(() => {
     void refresh();
@@ -71,7 +76,7 @@ export default function TemplatesView({ org }: TemplatesViewProps) {
     setCreating(true);
     setError(null);
     try {
-      const template = await createTemplate({ name: trimmed });
+      const template = await createTemplate({ project_id: projectId, name: trimmed });
       setTemplates((current) => [template, ...current]);
       setName("");
     } catch (err) {
@@ -110,7 +115,7 @@ export default function TemplatesView({ org }: TemplatesViewProps) {
     <div className="mx-auto max-w-2xl p-8">
       <Card>
         <CardHeader>
-          <CardTitle>{org?.name ?? "Your organization"} — templates</CardTitle>
+          <CardTitle>{project?.name ?? "Project"} — templates</CardTitle>
           <CardDescription>
             A template holds an intro, outro, logo, and brand colors a render can reuse. Triggering a
             render from a template comes in a later phase.

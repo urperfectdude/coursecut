@@ -19,6 +19,7 @@ import { HTTPException } from "hono/http-exception";
 import { getAuth } from "./auth.js";
 import { requireOrg, type AppEnv } from "./http/context.js";
 import { orgRoutes } from "./routes/orgs.js";
+import { projectRoutes } from "./routes/projects.js";
 import { videoRoutes } from "./routes/videos.js";
 import { stepRoutes } from "./routes/steps.js";
 import { templateRoutes } from "./routes/templates.js";
@@ -46,6 +47,7 @@ export function createApp() {
   const api = new Hono<AppEnv>();
   api.use("*", requireOrg);
   api.route("/", orgRoutes);
+  api.route("/", projectRoutes);
   api.route("/", videoRoutes);
   api.route("/", stepRoutes);
   api.route("/", templateRoutes);

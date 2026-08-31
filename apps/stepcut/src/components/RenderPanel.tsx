@@ -35,6 +35,7 @@ import {
 } from "@/api/renders";
 
 interface RenderPanelProps {
+  projectId: string;
   videoId: string;
 }
 
@@ -50,7 +51,7 @@ function formatDateTime(iso: string): string {
   return new Date(iso).toLocaleString();
 }
 
-export default function RenderPanel({ videoId }: RenderPanelProps) {
+export default function RenderPanel({ projectId, videoId }: RenderPanelProps) {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [templatesLoading, setTemplatesLoading] = useState(true);
   const [templateId, setTemplateId] = useState<string>("");
@@ -63,7 +64,7 @@ export default function RenderPanel({ videoId }: RenderPanelProps) {
 
   useEffect(() => {
     let cancelled = false;
-    listTemplates()
+    listTemplates(projectId)
       .then((rows) => {
         if (cancelled) return;
         setTemplates(rows);
@@ -78,7 +79,7 @@ export default function RenderPanel({ videoId }: RenderPanelProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [projectId]);
 
   const refreshHistory = useCallback(async () => {
     try {

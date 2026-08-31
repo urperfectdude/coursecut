@@ -14,6 +14,7 @@ import { putPart, putToStorage, request } from "./http";
 
 export interface Video {
   id: string;
+  project_id: string;
   storage_key: string;
   upload_status: string;
   duration: number | null;
@@ -76,8 +77,8 @@ interface PartUrl {
  * retry. Same value apps/web's uploader uses. */
 const PART_CONCURRENCY = 3;
 
-export function listVideos(): Promise<Video[]> {
-  return request<Video[]>("GET", "/videos");
+export function listVideos(projectId: string): Promise<Video[]> {
+  return request<Video[]>("GET", `/videos?project_id=${encodeURIComponent(projectId)}`);
 }
 
 export function getVideo(id: string): Promise<Video> {
@@ -106,8 +107,14 @@ export function analyzeVideo(videoId: string): Promise<Step[]> {
   return request<Step[]>("POST", `/videos/${videoId}/analyze`);
 }
 
-function createUploadTicket(filename: string, size: number, contentType: string): Promise<UploadTicket> {
+function createUploadTicket(
+  projectId: string,
+  filename: string,
+  size: number,
+  contentType: string,
+): Promise<UploadTicket> {
   return request<UploadTicket>("POST", "/videos/uploads", {
+    project_id: projectId,
     filename,
     size,
     content_type: contentType,
@@ -155,6 +162,41 @@ export function splitStep(id: string, at: number): Promise<Step[]> {
 
 export function deleteStep(id: string): Promise<void> {
   return request<void>("DELETE", `/steps/${id}`);
+}
+
+/** A proposed step from a free-text AI edit — same shape a real `Step` uses
+ * for the fields the model can propose, minus the ones only a persisted row
+ * has (`id`, `source`, `confidence`, ...). */
+export interface StepEdit {
+  start: number;
+  end: number;
+  title: string;
+  summary: string;
+}
+
+/**
+ * Proposes a revised step list for `videoId`, per `instruction`. Writes
+ * nothing — see `apps/stepcut-api/src/routes/steps.ts`'s `.../edit/preview`.
+ *
+ * `baseline` is omitted for the prompt box's first submission (the video's
+ * current steps are the baseline); pass the previous, not-yet-applied
+ * proposal when refining inside the review dialog.
+ */
+export function previewStepsEdit(
+  videoId: string,
+  instruction: string,
+  baseline?: StepEdit[],
+): Promise<StepEdit[]> {
+  return request<StepEdit[]>("POST", `/videos/${videoId}/steps/edit/preview`, {
+    instruction,
+    baseline,
+  });
+}
+
+/** Replaces `videoId`'s entire step list with `steps` — the Apply half of
+ * the AI edit dialog. Every resulting row lands `source = "manual"`. */
+export function applyStepsEdit(videoId: string, steps: StepEdit[]): Promise<Step[]> {
+  return request<Step[]>("POST", `/videos/${videoId}/steps/edit/apply`, { steps });
 }
 
 /** Adds a manual step to a video. */
@@ -208,14 +250,27 @@ async function uploadParts(
  * dashboard's "upload" button is one call that runs the whole pipeline up to
  * "waiting for the worker" rather than three separate steps a caller has to
  * remember to chain.
+ *
+ * Both branches now abort-on-failure (`/upload/abort` flips the row to
+ * `failed` even with no `upload_id` — `routes/videos.ts` only uses it to
+ * clean up multipart parts, which single-shot has none of). Before this, a
+ * single-shot failure between the PUT and `/complete` left its row stuck at
+ * `upload_status: "pending"` forever: `statusLabel` reads that as
+ * "Uploading" indefinitely, with only Delete available — the permanently
+ * stuck ghost tile a re-attempted upload was leaving behind.
  */
-export async function uploadVideo(file: File): Promise<Video> {
+export async function uploadVideo(projectId: string, file: File): Promise<Video> {
   const contentType = file.type || "application/octet-stream";
-  const ticket = await createUploadTicket(file.name, file.size, contentType);
+  const ticket = await createUploadTicket(projectId, file.name, file.size, contentType);
 
   if (ticket.upload.mode === "single") {
-    await putToStorage(ticket.upload.url, file, contentType);
-    await request<Video>("POST", `/videos/${ticket.video_id}/complete`, {});
+    try {
+      await putToStorage(ticket.upload.url, file, contentType);
+      await request<Video>("POST", `/videos/${ticket.video_id}/complete`, {});
+    } catch (err) {
+      await request("POST", `/videos/${ticket.video_id}/upload/abort`, {}).catch(() => undefined);
+      throw err;
+    }
     return extractVideo(ticket.video_id);
   }
 

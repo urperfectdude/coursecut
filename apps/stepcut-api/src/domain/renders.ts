@@ -23,9 +23,14 @@ export const newId = () => crypto.randomUUID();
 
 export type RenderRow = typeof renders.$inferSelect;
 
-async function requireVideo(tx: Tx, videoId: string): Promise<void> {
-  const [row] = await tx.select({ id: videos.id }).from(videos).where(eq(videos.id, videoId)).limit(1);
+async function requireVideo(tx: Tx, videoId: string): Promise<{ projectId: string }> {
+  const [row] = await tx
+    .select({ projectId: videos.projectId })
+    .from(videos)
+    .where(eq(videos.id, videoId))
+    .limit(1);
   if (!row) throw notFound(`video ${videoId}`);
+  return row;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +141,11 @@ export async function createRender(
   templateId: string,
   callbackUrl?: string,
 ): Promise<RenderRow> {
-  await requireVideo(tx, videoId);
-  await queryTemplate(tx, templateId);
+  const video = await requireVideo(tx, videoId);
+  const template = await queryTemplate(tx, templateId);
+  if (video.projectId !== template.projectId) {
+    throw badRequest("video_id and template_id must belong to the same project");
+  }
 
   const videoSteps = await tx
     .select()
@@ -155,6 +163,7 @@ export async function createRender(
     .values({
       id: newId(),
       orgId,
+      projectId: video.projectId,
       videoId,
       templateId,
       status: "queued",

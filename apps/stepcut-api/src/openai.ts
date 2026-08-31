@@ -379,3 +379,175 @@ export function parseStepSuggestions(
 
   return suggestions;
 }
+
+// ---------------------------------------------------------------------------
+// GPT-5.5 step-list edit (Phase 6 — free-text editing, docs/stepcut-plan.md
+// §8's "Manual editing" note that an AI-assisted pass belongs alongside it)
+// ---------------------------------------------------------------------------
+//
+// Modeled on apps/api/src/openai.ts's `editLessonSegments`/
+// `parseEditSegments` (a model call *inside* a request, so a review step can
+// wait on it, rather than a queued worker job like `analyzeSteps` above) —
+// but not a port: a step carries its own `title`/`summary`, not just a
+// range, so an edit here can rewrite those too, and there is no
+// `lesson_segments`-style child list to reassemble — the whole video's
+// `steps` array is the unit being revised, same as `analyzeSteps` produces
+// it fresh.
+
+/** A proposed step from an edit instruction — same shape `analyzeSteps`
+ * proposes, minus `confidence` (nothing here is a first-pass guess to rate). */
+export interface StepEdit {
+  start: number;
+  end: number;
+  title: string;
+  summary: string;
+}
+
+const STEP_EDIT_SYSTEM_PROMPT =
+  "You are an assistant that revises a video's step list for a step-by-step tutorial editing tool, " +
+  "per a user's free-text instruction. You are given: the video's current steps (start/end in " +
+  "seconds, title, summary, in playback order), a window of the underlying recording's transcript " +
+  "as timestamped segments (also in seconds, via `[start-end]` prefixes, on the same timeline as " +
+  "the steps), and the user's instruction. Respond with a single JSON object of the exact shape " +
+  '{"steps": [{"start": number, "end": number, "title": string, "summary": string}, ...]} and ' +
+  "nothing else — no prose, no markdown fences. Revise the steps per the instruction: you may " +
+  "split a step into more steps than were given, merge or remove steps (returning fewer steps, or " +
+  "none at all if the instruction amounts to removing every step), reorder them, retitle a step, " +
+  "rewrite a summary, or trim a step's start/end. Return every step that should remain in the " +
+  "final list, in order — not only the ones you changed. Every returned range must fall within " +
+  "the transcript context given, with `start` < `end`, and returned steps must not overlap. The " +
+  'instruction may contain literal timestamps (for example "split at 1:20", "trim everything ' +
+  'after 4:15") on this same source-video timeline — the same seconds-based timeline every ' +
+  "transcript line's `[start-end]` prefix, and every given step's range, already use. Treat any " +
+  "such timestamp as a precise, authoritative boundary: convert it to seconds and use it " +
+  "directly, rather than approximating it from nearby transcript wording. Use the transcript " +
+  "content/wording only for whatever the instruction doesn't pin to a specific time. Keep each " +
+  'title short and imperative (for example "Open the settings menu") and each summary a one- or ' +
+  "two-sentence description of what the user does and why, written for someone following along " +
+  "afterward.";
+
+/** A step's own bounds, for the baseline the prompt is shown — `title`/
+ * `summary` travel alongside so the model can revise them, not just ranges. */
+export interface StepEditBaseline {
+  start: number;
+  end: number;
+  title: string;
+  summary: string;
+}
+
+/**
+ * Parses `{"steps": [...]}` into validated edits, **dropping** rather than
+ * erroring on any individual malformed entry — same convention
+ * `parseStepSuggestions` uses. A missing `steps` array is an error, since
+ * that is a malformed response; a well-formed but empty array is a valid
+ * proposal ("remove every step"), and nothing is written until the caller's
+ * own apply step runs.
+ */
+export function parseStepEdits(
+  content: string,
+  rangeStart: number,
+  rangeEnd: number,
+): StepEdit[] {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(content);
+  } catch (err) {
+    throw new Error(
+      `could not parse GPT-5.5 JSON payload: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const rawSteps = (payload as { steps?: unknown })?.steps;
+  if (!Array.isArray(rawSteps)) {
+    throw new Error('GPT-5.5 JSON payload is missing a "steps" array');
+  }
+
+  const edits: StepEdit[] = [];
+  for (const raw of rawSteps) {
+    const entry = raw as Record<string, unknown>;
+    const start = valueAsNumber(entry.start);
+    const end = valueAsNumber(entry.end);
+    if (start === undefined || end === undefined) continue;
+    if (end <= start || start < rangeStart - 1 || end > rangeEnd + 1) continue;
+
+    const trimmedTitle = typeof entry.title === "string" ? entry.title.trim() : "";
+    const title = trimmedTitle.length > 0 ? trimmedTitle : "Untitled step";
+
+    edits.push({
+      start,
+      end,
+      title,
+      summary: typeof entry.summary === "string" ? entry.summary : "",
+    });
+  }
+
+  return edits;
+}
+
+/**
+ * Timestamps typed into the instruction, in seconds — same extraction
+ * `apps/api/src/openai.ts`'s copy of this function uses for lesson-segment
+ * edits, so a route can widen the transcript context window around any time
+ * the user names, not just around the steps already in view.
+ */
+export function extractTimestampsSeconds(text: string): number[] {
+  const pattern = /\b\d{1,3}(?::\d{1,3}){1,3}\b/g;
+
+  const found: number[] = [];
+  for (const match of text.matchAll(pattern)) {
+    const rawParts = match[0].split(":");
+    const parts = rawParts.map((part) => Number.parseInt(part, 10));
+    if (parts.some((part) => !Number.isFinite(part))) continue;
+
+    if (parts.length === 2) {
+      found.push(parts[0]! * 60 + parts[1]!);
+    } else if (parts.length === 3) {
+      found.push(parts[0]! * 3600 + parts[1]! * 60 + parts[2]!);
+    } else if (parts.length === 4) {
+      const divisor = 10 ** rawParts[3]!.length;
+      found.push(parts[0]! * 3600 + parts[1]! * 60 + parts[2]! + parts[3]! / divisor);
+    }
+  }
+  return found;
+}
+
+/**
+ * Proposes a revised step list for one video. Only transcript text, the
+ * steps' own `start`/`end`/`title`/`summary`, and the instruction (also
+ * text) are sent — never audio, never video (plan §9 / `openai.ts`'s own
+ * header above).
+ */
+export async function editSteps(
+  baselineSteps: readonly StepEditBaseline[],
+  transcriptSegments: readonly TranscriptLine[],
+  instruction: string,
+): Promise<StepEdit[]> {
+  const baselineText =
+    baselineSteps.length === 0
+      ? "(none — this video currently has no steps)"
+      : baselineSteps
+          .map(
+            (step, index) =>
+              `${index + 1}. [${step.start.toFixed(2)}-${step.end.toFixed(2)}] ${step.title}` +
+              (step.summary ? ` — ${step.summary}` : ""),
+          )
+          .join("\n");
+
+  const content = await chatCompletion(
+    STEP_EDIT_SYSTEM_PROMPT,
+    `Current steps:\n${baselineText}\n\n` +
+      `Transcript context (timestamps in seconds):\n\n${renderTranscript(transcriptSegments)}\n\n` +
+      `Instruction: ${instruction}`,
+  );
+
+  const rangeStart =
+    transcriptSegments.length === 0
+      ? Number.NEGATIVE_INFINITY
+      : Math.min(...transcriptSegments.map((segment) => segment.start));
+  const rangeEnd =
+    transcriptSegments.length === 0
+      ? Number.POSITIVE_INFINITY
+      : Math.max(...transcriptSegments.map((segment) => segment.end));
+
+  return parseStepEdits(content, rangeStart, rangeEnd);
+}

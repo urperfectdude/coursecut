@@ -5,9 +5,12 @@
 // transcribe shapes, trimmed to what Phase 2 needs. The differences from
 // that reference, all deliberate:
 //
-//   * **No `projects` parent.** StepCut's `videos` belong directly to an org
-//     (plan §3 has no `projects` table), so routes are `/videos/uploads`, not
-//     `/projects/:id/uploads`.
+//   * **Flat routes, not nested under a project.** `videos` does belong to a
+//     `projects` row (`project_id`, required on `/videos/uploads` and on the
+//     `GET /videos?project_id=` list), but the route paths stay
+//     `/videos/uploads` rather than `/projects/:id/uploads` — consistent with
+//     this file's existing flat-route convention rather than introducing a
+//     nesting style used nowhere else here.
 //   * **Mounted under `/api` directly, not `/v1`.** The plan's §4 API surface
 //     sketch uses `/v1/...` for the *eventual public API surface*; Phase 1's
 //     `app.ts` already mounts everything at `/api`, so these routes stay
@@ -43,7 +46,7 @@ import { asc, desc, eq } from "drizzle-orm";
 import { param, tx, type AppEnv } from "../http/context.js";
 import { badRequest, notFound } from "../http/errors.js";
 import * as serialize from "../http/serialize.js";
-import { jobs, steps, transcriptSegments, videos } from "../db/schema.js";
+import { jobs, projects, steps, transcriptSegments, videos } from "../db/schema.js";
 import { cancelJobsForVideo, enqueueVideoJob } from "../jobs/queue.js";
 import * as storage from "../storage.js";
 import type { Tx } from "../db/client.js";
@@ -56,6 +59,11 @@ async function requireVideoRow(t: Tx, id: string) {
   const [row] = await t.select().from(videos).where(eq(videos.id, id)).limit(1);
   if (!row) throw notFound("video");
   return row;
+}
+
+async function requireProjectRow(t: Tx, id: string) {
+  const [row] = await t.select({ id: projects.id }).from(projects).where(eq(projects.id, id)).limit(1);
+  if (!row) throw notFound("project");
 }
 
 // ---------------------------------------------------------------------------
@@ -71,7 +79,14 @@ async function requireVideoRow(t: Tx, id: string) {
  * belongs next to the storage module, not in the browser.
  */
 videoRoutes.post("/videos/uploads", async (c) => {
-  const body = await c.req.json<{ filename?: string; size?: number; content_type?: string }>();
+  const body = await c.req.json<{
+    project_id?: string;
+    filename?: string;
+    size?: number;
+    content_type?: string;
+  }>();
+  const projectId = body.project_id;
+  if (!projectId) throw badRequest("project_id is required");
   const filename = (body.filename ?? "").trim();
   if (filename.length === 0) throw badRequest("filename is required");
   const size = Number(body.size ?? 0);
@@ -82,14 +97,16 @@ videoRoutes.post("/videos/uploads", async (c) => {
   const videoId = newId();
   const key = storage.videoKey(orgId, videoId, filename);
 
-  await tx(c, (t) =>
-    t.insert(videos).values({
+  await tx(c, async (t) => {
+    await requireProjectRow(t, projectId);
+    await t.insert(videos).values({
       id: videoId,
       orgId,
+      projectId,
       storageKey: key,
       uploadStatus: "pending",
-    }),
-  );
+    });
+  });
 
   if (size <= storage.MULTIPART_THRESHOLD) {
     return c.json({
@@ -190,9 +207,13 @@ videoRoutes.post("/videos/:id/upload/abort", async (c) => {
 // Reads
 // ---------------------------------------------------------------------------
 
-/** The org's videos, newest first — the dashboard's list. */
+/** A project's videos, newest first — the project dashboard's list. */
 videoRoutes.get("/videos", async (c) => {
-  const rows = await tx(c, (t) => t.select().from(videos).orderBy(desc(videos.createdAt)));
+  const projectId = c.req.query("project_id");
+  if (!projectId) throw badRequest("project_id is required");
+  const rows = await tx(c, (t) =>
+    t.select().from(videos).where(eq(videos.projectId, projectId)).orderBy(desc(videos.createdAt)),
+  );
   return c.json(rows.map(serialize.video));
 });
 

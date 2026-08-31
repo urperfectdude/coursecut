@@ -18,11 +18,9 @@
 // only gets written once `/complete`'s `headObject` check passes.
 
 import { Hono } from "hono";
-import { desc } from "drizzle-orm";
 import { param, tx, type AppEnv } from "../http/context.js";
 import { badRequest } from "../http/errors.js";
 import * as serialize from "../http/serialize.js";
-import { templates } from "../db/schema.js";
 import * as domain from "../domain/templates.js";
 import * as storage from "../storage.js";
 
@@ -42,6 +40,7 @@ function optionalNumber(value: unknown, field: string): number | undefined {
 }
 
 interface TemplateBody {
+  project_id?: string;
   name?: string;
   brand_primary_hex?: string | null;
   brand_secondary_hex?: string | null;
@@ -54,9 +53,11 @@ templateRoutes.post("/templates", async (c) => {
   const body = await c.req.json<TemplateBody>();
   const name = body.name;
   if (typeof name !== "string") throw badRequest("name is required");
+  const projectId = body.project_id;
+  if (!projectId) throw badRequest("project_id is required");
 
   const row = await tx(c, (t) =>
-    domain.createTemplate(t, c.get("orgId"), {
+    domain.createTemplate(t, c.get("orgId"), projectId, {
       name,
       brandPrimaryHex: body.brand_primary_hex ?? undefined,
       brandSecondaryHex: body.brand_secondary_hex ?? undefined,
@@ -68,9 +69,11 @@ templateRoutes.post("/templates", async (c) => {
   return c.json(serialize.template(row));
 });
 
-/** The org's templates, newest first — same convention `GET /videos` uses. */
+/** A project's templates, newest first — same convention `GET /videos` uses. */
 templateRoutes.get("/templates", async (c) => {
-  const rows = await tx(c, (t) => t.select().from(templates).orderBy(desc(templates.createdAt)));
+  const projectId = c.req.query("project_id");
+  if (!projectId) throw badRequest("project_id is required");
+  const rows = await tx(c, (t) => domain.listTemplates(t, projectId));
   return c.json(rows.map(serialize.template));
 });
 

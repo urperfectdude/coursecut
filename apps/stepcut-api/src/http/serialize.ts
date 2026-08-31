@@ -9,6 +9,7 @@
 import type { InferSelectModel } from "drizzle-orm";
 import type {
   jobs as jobsTable,
+  projects as projectsTable,
   renders as rendersTable,
   steps as stepsTable,
   templates as templatesTable,
@@ -16,6 +17,7 @@ import type {
   videos as videosTable,
 } from "../db/schema.js";
 
+type ProjectRow = InferSelectModel<typeof projectsTable>;
 type VideoRow = InferSelectModel<typeof videosTable>;
 type TranscriptSegmentRow = InferSelectModel<typeof transcriptSegmentsTable>;
 type JobRow = InferSelectModel<typeof jobsTable>;
@@ -25,9 +27,19 @@ type RenderRow = InferSelectModel<typeof rendersTable>;
 
 const iso = (value: Date) => value.toISOString();
 
+export function project(row: ProjectRow) {
+  return {
+    id: row.id,
+    name: row.name,
+    created_at: iso(row.createdAt),
+    updated_at: iso(row.updatedAt),
+  };
+}
+
 export function video(row: VideoRow) {
   return {
     id: row.id,
+    project_id: row.projectId,
     storage_key: row.storageKey,
     upload_status: row.uploadStatus,
     duration: row.duration,
@@ -89,6 +101,7 @@ export function step(row: StepRow) {
 export function render(row: RenderRow) {
   return {
     id: row.id,
+    project_id: row.projectId,
     video_id: row.videoId,
     template_id: row.templateId,
     status: row.status,
@@ -106,6 +119,7 @@ export function render(row: RenderRow) {
 export function template(row: TemplateRow) {
   return {
     id: row.id,
+    project_id: row.projectId,
     name: row.name,
     intro_key: row.introKey,
     outro_key: row.outroKey,
