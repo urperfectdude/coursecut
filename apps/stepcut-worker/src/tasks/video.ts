@@ -314,25 +314,47 @@ async function runAnalyze(
 ): Promise<void> {
   report(null, "Finding steps");
 
-  const segments = await withOrg(orgId, (tx) =>
-    tx
-      .select({
-        start: transcriptSegments.start,
-        end: transcriptSegments.end,
-        text: transcriptSegments.text,
-      })
-      .from(transcriptSegments)
-      .where(eq(transcriptSegments.videoId, videoId))
-      .orderBy(transcriptSegments.start, transcriptSegments.id),
-  );
+  const [video, segments] = await Promise.all([
+    withOrg(orgId, async (tx) => {
+      const [row] = await tx.select({ duration: videos.duration }).from(videos).where(eq(videos.id, videoId)).limit(1);
+      if (!row) throw new Error(`video ${videoId} does not exist`);
+      return row;
+    }),
+    withOrg(orgId, (tx) =>
+      tx
+        .select({
+          start: transcriptSegments.start,
+          end: transcriptSegments.end,
+          text: transcriptSegments.text,
+        })
+        .from(transcriptSegments)
+        .where(eq(transcriptSegments.videoId, videoId))
+        .orderBy(transcriptSegments.start, transcriptSegments.id),
+    ),
+  ]);
 
   if (segments.length === 0) {
     throw new Error("This video has no transcript yet — transcribe it before analyzing.");
   }
 
-  const suggestions = await analyzeSteps(segments);
+  // Falls back to the transcript's own last timestamp only if `extract`
+  // somehow never recorded a duration — `analyzeSteps` already treats that
+  // as "nothing past the transcript to reach for."
+  const videoDuration = video.duration ?? Math.max(...segments.map((segment) => segment.end));
+
+  const suggestions = await analyzeSteps(segments, videoDuration);
   // Sorted by start, because `sort_order` is assigned by this order.
   suggestions.sort((a, b) => a.start - b.start);
+
+  // Deterministic safety net: the transcript only covers speech, so GPT-5.5
+  // can only ever *see* as far as the narrator's last word even though the
+  // prompt now asks it to reach past that — this is what actually guarantees
+  // the rendered video isn't cut off before the recording's real end,
+  // regardless of whether the model followed that instruction.
+  const lastStep = suggestions[suggestions.length - 1];
+  if (lastStep && videoDuration > lastStep.end) {
+    lastStep.end = videoDuration;
+  }
 
   await withOrg(orgId, (tx) => replaceAiSteps(tx, orgId, videoId, suggestions));
 }

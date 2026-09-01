@@ -238,19 +238,23 @@ const STEP_ANALYSIS_SYSTEM_PROMPT =
   "walking through a task on their computer while describing what they are doing — and proposes " +
   "the discrete steps that make up that task, for a tool that turns the recording into a " +
   "step-by-step tutorial video. You are given the transcript as a sequence of timestamped " +
-  'segments (in seconds). Respond with a single JSON object of the exact shape {"steps": ' +
-  '[{"start": number, "end": number, "title": string, "summary": string, "confidence": number}, ' +
-  '...]} and nothing else — no prose, no markdown fences. A step is one contiguous, ordered ' +
-  'action the narrator performs and describes — for example "open the settings page", "rename ' +
-  'the project", or "click Save" — not a topic, a lesson, or a question. Order steps by `start` ' +
-  "and do not let them overlap; it is fine, and expected, for there to be a gap between two steps " +
-  "for narration that is not itself a step (a preamble, a false start, dead air, an aside) rather " +
-  "than forcing that material into the nearest step. Give each step a short, imperative title " +
-  '(for example "Open the settings menu") and a one- or two-sentence summary of what the user ' +
-  "does and why, written for someone following along afterward. Every `start` and `end` must be a " +
-  "real timestamp in seconds, drawn from (or falling between) the given segment boundaries, with " +
-  "`start` < `end`. Every step must include a `confidence` between 0 and 1 reflecting how sure " +
-  "you are about that step's boundaries.";
+  "segments (in seconds), and the recording's total duration in seconds. Respond with a single " +
+  'JSON object of the exact shape {"steps": [{"start": number, "end": number, "title": string, ' +
+  '"summary": string, "confidence": number}, ...]} and nothing else — no prose, no markdown ' +
+  'fences. A step is one contiguous, ordered action the narrator performs and describes — for ' +
+  'example "open the settings page", "rename the project", or "click Save" — not a topic, a ' +
+  "lesson, or a question. Order steps by `start` and do not let them overlap; it is fine, and " +
+  "expected, for there to be a gap between two steps for narration that is not itself a step (a " +
+  "preamble, a false start, dead air, an aside) rather than forcing that material into the " +
+  "nearest step. Give each step a short, imperative title (for example \"Open the settings " +
+  "menu\") and a one- or two-sentence summary of what the user does and why, written for someone " +
+  "following along afterward. Every `start` and `end` must be a real timestamp in seconds, drawn " +
+  "from (or falling between) the given segment boundaries, with `start` < `end` — except the " +
+  "very last step's `end`, which should reach the recording's total duration (not just the last " +
+  "transcript timestamp) whenever the on-screen action plausibly continues briefly after the " +
+  "narrator's last relevant word — for instance a dialog still closing, a page still loading, or " +
+  "a result still appearing on screen. Every step must include a `confidence` between 0 and 1 " +
+  "reflecting how sure you are about that step's boundaries.";
 
 interface ChatCompletionResponse {
   choices?: Array<{ message?: { content?: string | null } }>;
@@ -314,19 +318,32 @@ function renderTranscript(segments: readonly TranscriptLine[]): string {
 /**
  * Sends transcript **text only** — timestamps and words, never audio, never
  * video — to GPT-5.5 and parses the reply into validated step suggestions.
+ *
+ * `videoDuration` (the recording's actual length, already known from
+ * `probeDuration` at extract time — `apps/stepcut-worker/src/tasks/video.ts`)
+ * is passed alongside the transcript so the model can see, and the
+ * validation below can accept, an end timestamp past the last transcribed
+ * word — Whisper only transcribes speech, so without this the last step
+ * could never reach further than the narrator's last sentence, cutting the
+ * rendered video off before any on-screen action that outlasts it.
  */
-export async function analyzeSteps(segments: readonly TranscriptLine[]): Promise<StepSuggestion[]> {
+export async function analyzeSteps(
+  segments: readonly TranscriptLine[],
+  videoDuration: number,
+): Promise<StepSuggestion[]> {
   if (segments.length === 0) throw new Error("no transcript segments to analyze");
 
   const transcriptStart = Math.min(...segments.map((segment) => segment.start));
   const transcriptEnd = Math.max(...segments.map((segment) => segment.end));
+  const rangeEnd = Math.max(transcriptEnd, videoDuration);
 
   const content = await chatCompletion(
     STEP_ANALYSIS_SYSTEM_PROMPT,
-    `Transcript (timestamps in seconds):\n\n${renderTranscript(segments)}`,
+    `Recording duration: ${videoDuration.toFixed(2)} seconds.\n\n` +
+      `Transcript (timestamps in seconds):\n\n${renderTranscript(segments)}`,
   );
 
-  return parseStepSuggestions(content, transcriptStart, transcriptEnd);
+  return parseStepSuggestions(content, transcriptStart, rangeEnd);
 }
 
 /**
