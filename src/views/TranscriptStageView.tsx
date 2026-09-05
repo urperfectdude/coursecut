@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Loader2, RotateCw } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { Loader2, Pause, Play, RotateCw } from "lucide-react";
 import Breadcrumbs from "../components/Breadcrumbs";
 import { basename } from "./ProjectDetailView";
 import {
@@ -8,7 +9,10 @@ import {
   getVideo,
   listLessons,
   listTranscriptSegments,
+  retranscribeChunk,
   updateTranscriptSegment,
+  TRANSCRIPT_CHUNK_MIN_TRAILING_SECONDS,
+  TRANSCRIPT_CHUNK_SECONDS,
   type Project,
   type TranscriptSegment,
   type Video,
@@ -92,6 +96,113 @@ export default function TranscriptStageView({
 
   const [undoStack, setUndoStack] = useState<UndoableAction[]>([]);
   const [redoStack, setRedoStack] = useState<UndoableAction[]>([]);
+
+  // Chunk sidebar (only shown for recordings long enough to have been
+  // chunked at transcription time — see `TRANSCRIPT_CHUNK_SECONDS`).
+  const [selectedChunkIndex, setSelectedChunkIndex] = useState<number | null>(null);
+  const [busyChunkIndex, setBusyChunkIndex] = useState<number | null>(null);
+  // Per-chunk attempt counter, same idea as `ProjectDetailView`'s
+  // `attemptCountsRef` — bumped on each retry of the same chunk so repeated
+  // retries show "attempt 2" etc. in progress text.
+  const attemptCountsRef = useRef<Record<number, number>>({});
+
+  // Per-segment audio playback — lets a user click a segment's timestamp to
+  // hear just that slice and check it against the transcribed text. One
+  // shared `<audio>` element (not one per row) is enough since only one
+  // segment ever plays at a time. Sourced from the *original source video*
+  // (`video.file_path`), not the extracted Opus/Ogg `audio_path` — Tauri's
+  // macOS webview (WKWebView, Safari's engine) generally can't decode
+  // Ogg/Opus at all, so pointing `<audio>` at `audio_path` played silently
+  // and failed; the source video's own audio track (almost always AAC in
+  // an MP4 container from screen-recording tools) is natively supported.
+  // Local-only either way — this is playback, not an upload, so it's outside
+  // `coursecut-privacy-invariants`' scope (which is about what leaves the
+  // device).
+  const audioRef = useRef<HTMLAudioElement>(null);
+  // The currently-armed clip's absolute [start, end) in the recording —
+  // read by the shared `timeupdate` listener to know when to auto-stop and
+  // to compute the progress-ring fraction, and by `handlePlaySegment` to
+  // know which segment a `playing` event actually corresponds to (native
+  // media events don't carry that themselves).
+  const playingRangeRef = useRef<{ segmentId: string; start: number; end: number } | null>(null);
+  const [playingSegmentId, setPlayingSegmentId] = useState<string | null>(null);
+  // 0–1 progress through the *currently playing* segment's own clip, for
+  // the progress ring around its Play/Pause button — meaningless (and
+  // ignored) for any other row.
+  const [playbackProgress, setPlaybackProgress] = useState(0);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    // Only flips `playingSegmentId` once the browser actually confirms
+    // playback started — never set optimistically in the click handler —
+    // so a source the webview can't decode can't leave the button stuck
+    // showing Pause with nothing real to pause.
+    const handlePlaying = () => setPlayingSegmentId(playingRangeRef.current?.segmentId ?? null);
+    const handleStopped = () => {
+      setPlayingSegmentId(null);
+      setPlaybackProgress(0);
+    };
+    const handleTimeUpdate = () => {
+      const range = playingRangeRef.current;
+      if (!range) return;
+      if (audio.currentTime >= range.end) {
+        audio.pause();
+        return;
+      }
+      const fraction = (audio.currentTime - range.start) / (range.end - range.start);
+      setPlaybackProgress(Math.min(1, Math.max(0, fraction)));
+    };
+    audio.addEventListener("playing", handlePlaying);
+    audio.addEventListener("pause", handleStopped);
+    audio.addEventListener("ended", handleStopped);
+    audio.addEventListener("error", handleStopped);
+    audio.addEventListener("timeupdate", handleTimeUpdate);
+    return () => {
+      audio.removeEventListener("playing", handlePlaying);
+      audio.removeEventListener("pause", handleStopped);
+      audio.removeEventListener("ended", handleStopped);
+      audio.removeEventListener("error", handleStopped);
+      audio.removeEventListener("timeupdate", handleTimeUpdate);
+    };
+  }, [video?.file_path]);
+
+  const handlePlaySegment = useCallback(
+    (segment: TranscriptSegment) => {
+      const audio = audioRef.current;
+      if (!audio) return;
+      if (playingSegmentId === segment.id) {
+        audio.pause();
+        return;
+      }
+      playingRangeRef.current = { segmentId: segment.id, start: segment.start, end: segment.end };
+      const seekAndPlay = () => {
+        audio.currentTime = segment.start;
+        audio.play().catch((err) => {
+          setError(err instanceof Error ? err.message : String(err));
+          playingRangeRef.current = null;
+        });
+      };
+      // `preload="none"` means nothing is loaded yet on the very first
+      // click — setting `currentTime` before metadata exists is unreliable
+      // in WebKit, so wait for it rather than racing.
+      if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
+        seekAndPlay();
+      } else {
+        audio.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+        audio.load();
+      }
+    },
+    [playingSegmentId],
+  );
+
+  // Stop playback if this view unmounts (e.g. navigating away) mid-clip.
+  useEffect(() => {
+    const audio = audioRef.current;
+    return () => {
+      audio?.pause();
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -181,11 +292,65 @@ export default function TranscriptStageView({
     [pushUndo],
   );
 
+  // Chunk boundaries are derived purely from the video's duration and
+  // `TRANSCRIPT_CHUNK_SECONDS` — no `chunk_index` is stored anywhere (see
+  // `retranscribe_chunk` in `src-tauri/src/openai.rs`). Only meaningful
+  // (and only rendered) for a recording that was actually chunked at
+  // transcription time.
+  const chunkCount = useMemo(() => {
+    if (video?.duration == null || video.duration <= TRANSCRIPT_CHUNK_SECONDS) return 0;
+    // Mirrors `split_audio_by_time`'s own loop condition (`remaining >=
+    // MIN_TRAILING_CHUNK_SECS`) exactly, not a plain `Math.ceil` — a
+    // duration landing in the last second before a chunk boundary (e.g.
+    // 1200.5s) was only ever split into 2 real chunks, not 3, and a naive
+    // ceil would show a phantom final chunk that was never transcribed.
+    return (
+      Math.floor(
+        (video.duration - TRANSCRIPT_CHUNK_MIN_TRAILING_SECONDS) / TRANSCRIPT_CHUNK_SECONDS,
+      ) + 1
+    );
+  }, [video?.duration]);
+
+  const chunkRange = useCallback(
+    (chunkIndex: number): [number, number] => {
+      const start = chunkIndex * TRANSCRIPT_CHUNK_SECONDS;
+      const end = Math.min((chunkIndex + 1) * TRANSCRIPT_CHUNK_SECONDS, video?.duration ?? start);
+      return [start, end];
+    },
+    [video?.duration],
+  );
+
   const filteredSegments = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-    if (!query) return segments;
-    return segments.filter((segment) => segment.text.toLowerCase().includes(query));
-  }, [segments, searchQuery]);
+    let result = segments;
+    if (selectedChunkIndex != null) {
+      const [chunkStart, chunkEnd] = chunkRange(selectedChunkIndex);
+      result = result.filter((segment) => segment.start >= chunkStart && segment.start < chunkEnd);
+    }
+    if (query) {
+      result = result.filter((segment) => segment.text.toLowerCase().includes(query));
+    }
+    return result;
+  }, [segments, searchQuery, selectedChunkIndex, chunkRange]);
+
+  const handleRetranscribeChunk = useCallback(
+    async (chunkIndex: number) => {
+      if (busyChunkIndex !== null) return;
+      const nextAttempt = (attemptCountsRef.current[chunkIndex] ?? 0) + 1;
+      attemptCountsRef.current[chunkIndex] = nextAttempt;
+      setBusyChunkIndex(chunkIndex);
+      clearProgress(videoId);
+      try {
+        await retranscribeChunk(videoId, chunkIndex, nextAttempt);
+        setSegments(await listTranscriptSegments(videoId));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setBusyChunkIndex(null);
+      }
+    },
+    [videoId, busyChunkIndex, clearProgress],
+  );
 
   const handleAnalyze = useCallback(async () => {
     if (analyzing) return;
@@ -228,6 +393,14 @@ export default function TranscriptStageView({
 
       {video && (
         <>
+          {/* No `controls` — playback is driven entirely by each segment's
+           * own Play button (see `handlePlaySegment`), not a visible
+           * transport. Sourced from the source video's own audio track
+           * (see the playback state comment above for why, not `audio_path`),
+           * same `convertFileSrc` pattern `SourceVideoPreview`/
+           * `LessonPreviewPlayer` already use. */}
+          <audio ref={audioRef} src={convertFileSrc(video.file_path)} preload="none" />
+
           <div className="my-3 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <Button
@@ -270,7 +443,7 @@ export default function TranscriptStageView({
                 type="button"
                 variant={hasLessons ? "outline" : "default"}
                 onClick={() => void handleAnalyze()}
-                disabled={analyzing}
+                disabled={analyzing || busyChunkIndex !== null}
               >
                 {hasLessons && <RotateCw />}
                 {hasLessons ? "Analyze again" : "Analyze"}
@@ -297,39 +470,133 @@ export default function TranscriptStageView({
             aria-label="Search transcript"
           />
 
-          {filteredSegments.length === 0 ? (
-            <p>No matching transcript segments.</p>
-          ) : (
-            <ul className="m-0 flex max-h-[60vh] list-none flex-col gap-1.5 overflow-y-auto p-0">
-              {filteredSegments.map((segment) => {
-                const isBusy = segmentBusyIds.has(segment.id);
-                const checkboxId = `transcript-segment-keep-${segment.id}`;
-                return (
-                  <li
-                    key={segment.id}
-                    className={cn(
-                      "flex items-center gap-3 text-sm",
-                      !segment.keep && "opacity-45 line-through",
-                    )}
-                  >
-                    <span className="shrink-0 tabular-nums opacity-60">
-                      {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
-                    </span>
-                    <span className="flex-1">{segment.text}</span>
-                    <div className="flex shrink-0 items-center gap-1 whitespace-nowrap text-xs">
-                      <Checkbox
-                        id={checkboxId}
-                        checked={segment.keep}
-                        disabled={isBusy}
-                        onCheckedChange={() => void handleToggleKeep(segment)}
-                      />
-                      <Label htmlFor={checkboxId}>Keep</Label>
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+          {/* Chunk sidebar and segment list flow together as normal page
+           * content (no inner max-height/scroll box) — a short transcript
+           * takes only the space it needs instead of leaving a reserved gap
+           * below it, and a long one scrolls the whole page as one unit
+           * (chunk sidebar included) rather than fighting an inner scrollbar
+           * sized independently of the window. */}
+          <div className="flex gap-4">
+            {chunkCount > 0 && (
+              <ul className="m-0 flex w-40 shrink-0 list-none flex-col gap-1.5 p-0">
+                {Array.from({ length: chunkCount }, (_, chunkIndex) => {
+                  const [chunkStart, chunkEnd] = chunkRange(chunkIndex);
+                  const isBusy = busyChunkIndex === chunkIndex;
+                  const chunkProgress = isBusy ? progress[videoId] : undefined;
+                  return (
+                    <li key={chunkIndex} className="flex flex-col gap-1">
+                      <Button
+                        type="button"
+                        variant={selectedChunkIndex === chunkIndex ? "default" : "outline"}
+                        size="sm"
+                        className="w-full justify-start"
+                        onClick={() =>
+                          setSelectedChunkIndex((prev) => (prev === chunkIndex ? null : chunkIndex))
+                        }
+                      >
+                        {formatTimestamp(chunkStart)}–{formatTimestamp(chunkEnd)}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="w-full justify-start gap-1.5"
+                        disabled={busyChunkIndex !== null || analyzing}
+                        onClick={() => void handleRetranscribeChunk(chunkIndex)}
+                      >
+                        {isBusy && <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden="true" />}
+                        {isBusy
+                          ? `${chunkProgress ? stageLabel(chunkProgress.stage) : "Working…"}`
+                          : "Re-transcribe"}
+                      </Button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            {filteredSegments.length === 0 ? (
+              <p className="min-w-0 flex-1">No matching transcript segments.</p>
+            ) : (
+              <ul className="m-0 flex min-w-0 flex-1 list-none flex-col gap-1.5 p-0">
+                {filteredSegments.map((segment) => {
+                  const isBusy = segmentBusyIds.has(segment.id);
+                  const checkboxId = `transcript-segment-keep-${segment.id}`;
+                  const isPlaying = playingSegmentId === segment.id;
+                  // Ring geometry for the progress indicator below: a
+                  // 24×24 box (matches the `icon-xs` button size) with a
+                  // radius-10 circle, stroke-dashoffset counting down from
+                  // the full circumference as `playbackProgress` (0–1)
+                  // rises — only meaningful while this exact row is the one
+                  // playing.
+                  const ringCircumference = 2 * Math.PI * 10;
+                  return (
+                    <li
+                      key={segment.id}
+                      className={cn(
+                        "flex items-center gap-3 text-sm",
+                        !segment.keep && "opacity-45 line-through",
+                      )}
+                    >
+                      <div className="relative inline-flex size-6 shrink-0 items-center justify-center">
+                        {isPlaying && (
+                          <svg
+                            className="pointer-events-none absolute inset-0 -rotate-90"
+                            viewBox="0 0 24 24"
+                            aria-hidden="true"
+                          >
+                            <circle
+                              cx="12"
+                              cy="12"
+                              r="10"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeOpacity="0.25"
+                              strokeWidth="2"
+                            />
+                            <circle
+                              cx="12"
+                              cy="12"
+                              r="10"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeDasharray={ringCircumference}
+                              strokeDashoffset={(1 - playbackProgress) * ringCircumference}
+                            />
+                          </svg>
+                        )}
+                        <Button
+                          type="button"
+                          size="icon-xs"
+                          variant="ghost"
+                          className="relative"
+                          onClick={() => handlePlaySegment(segment)}
+                          aria-label={isPlaying ? "Pause segment audio" : "Play segment audio"}
+                        >
+                          {isPlaying ? <Pause /> : <Play />}
+                        </Button>
+                      </div>
+                      <span className="shrink-0 tabular-nums opacity-60">
+                        {formatTimestamp(segment.start)}–{formatTimestamp(segment.end)}
+                      </span>
+                      <span className="flex-1">{segment.text}</span>
+                      <div className="flex shrink-0 items-center gap-1 whitespace-nowrap text-xs">
+                        <Checkbox
+                          id={checkboxId}
+                          checked={segment.keep}
+                          disabled={isBusy}
+                          onCheckedChange={() => void handleToggleKeep(segment)}
+                        />
+                        <Label htmlFor={checkboxId}>Keep</Label>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
         </>
       )}
     </div>

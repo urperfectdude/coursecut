@@ -287,6 +287,42 @@ export default function ProjectDetailView({
     [processVideo],
   );
 
+  /** Re-runs Whisper transcription on a video that already has a transcript
+   * (`transcript_status === "transcribed"`), replacing its existing segments.
+   * Distinct from `handleRetry` (which resumes a failed attempt via
+   * `processVideo`): audio is already extracted here, so this calls
+   * `transcribeVideo` directly rather than the full extract/transcribe
+   * chain. */
+  const handleRetranscribe = useCallback(
+    async (video: Video) => {
+      if (inFlightRef.current.has(video.id)) return;
+      inFlightRef.current.add(video.id);
+      setInFlightIds(new Set(inFlightRef.current));
+      attemptCountsRef.current[video.id] = (attemptCountsRef.current[video.id] ?? 1) + 1;
+      const attempt = attemptCountsRef.current[video.id];
+      clearProgress(video.id);
+      setVideoErrors((prev) => {
+        if (!(video.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[video.id];
+        return next;
+      });
+      try {
+        await transcribeVideo(video.id, attempt);
+      } catch (err) {
+        setVideoErrors((prev) => ({
+          ...prev,
+          [video.id]: err instanceof Error ? err.message : String(err),
+        }));
+      } finally {
+        setVideos(await listVideos(projectId));
+        inFlightRef.current.delete(video.id);
+        setInFlightIds(new Set(inFlightRef.current));
+      }
+    },
+    [projectId, clearProgress],
+  );
+
   /** Opens the shared Remove confirmation dialog for `video` — the actual
    * delete happens in `handleConfirmRemove` once the user confirms. */
   const handleRemove = useCallback((video: Video) => {
@@ -430,8 +466,8 @@ export default function ProjectDetailView({
                   <li key={video.id} className="border-b border-border py-2">
                     <div
                       className={cn(
-                        "flex items-center gap-4",
-                        canShowTranscript && "cursor-pointer",
+                        "flex items-center gap-4 transition-colors",
+                        canShowTranscript && "cursor-pointer hover:bg-muted/50",
                       )}
                       onClick={canShowTranscript ? () => onOpenVideo(video.id) : undefined}
                       role={canShowTranscript ? "button" : undefined}
@@ -492,6 +528,20 @@ export default function ProjectDetailView({
                           }}
                         >
                           Retry
+                        </Button>
+                      )}
+                      {video.transcript_status === "transcribed" && !isInFlight && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleRetranscribe(video);
+                          }}
+                          aria-label={`Re-transcribe ${basename(video.file_path)}`}
+                        >
+                          Re-transcribe
                         </Button>
                       )}
                       <Button

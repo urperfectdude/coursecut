@@ -119,6 +119,32 @@ export async function transcribeVideo(videoId: string, attempt: number): Promise
   return invoke<Video>("transcribe_video", { videoId, attempt });
 }
 
+// Must match `CHUNK_DURATION_THRESHOLD_SECS` in src-tauri/src/openai.rs —
+// used to derive chunk boundaries client-side for the chunk sidebar
+// (TranscriptStageView) without a round-trip, since chunking is purely a
+// function of a video's duration and this constant.
+export const TRANSCRIPT_CHUNK_SECONDS = 600;
+
+// Must match `ffmpeg::MIN_TRAILING_CHUNK_SECS` in src-tauri/src/ffmpeg.rs —
+// a trailing sliver shorter than this was never actually split into its own
+// chunk during transcription, so the sidebar's chunk count must account for
+// it too or it'll show a "phantom" final chunk that was never transcribed
+// (and that `retranscribe_chunk` would then reject as out of range).
+export const TRANSCRIPT_CHUNK_MIN_TRAILING_SECONDS = 1;
+
+// Re-cuts and re-transcribes just `chunkIndex`'s ~10-minute time range of
+// an already-transcribed long recording (see `retranscribe_chunk` in
+// `src-tauri/src/openai.rs`), replacing only that range's
+// `transcript_segments` rows — the rest of the transcript is untouched.
+// Only the locally re-cut audio for that one chunk is uploaded to Whisper.
+export async function retranscribeChunk(
+  videoId: string,
+  chunkIndex: number,
+  attempt: number,
+): Promise<Video> {
+  return invoke<Video>("retranscribe_chunk", { videoId, chunkIndex, attempt });
+}
+
 export async function listTranscriptSegments(videoId: string): Promise<TranscriptSegment[]> {
   return invoke<TranscriptSegment[]>("list_transcript_segments", { videoId });
 }

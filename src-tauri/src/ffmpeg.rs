@@ -271,6 +271,123 @@ async fn run_extraction(
         .map_err(|err| err.to_string())
 }
 
+/// Cuts `[start_secs, start_secs + duration_secs)` from `audio_path` into a
+/// single re-encoded Opus/Ogg temp file in the system temp dir, returning
+/// its path. Shared by `split_audio_by_time` (called once per chunk when
+/// first transcribing a long recording) and single-chunk re-transcription
+/// (`openai::retranscribe_chunk`), so both cut audio identically — same
+/// accurate-seek-plus-re-encode approach, same settings `extract_audio`
+/// itself uses. See `split_audio_by_time`'s doc comment for why this
+/// re-encodes rather than a fast `-c copy` stream-copy. Caller owns
+/// deleting the returned temp file.
+pub async fn cut_audio_range(
+    app: &AppHandle,
+    audio_path: &str,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Result<PathBuf, String> {
+    let chunk_path = std::env::temp_dir().join(format!("coursecut-chunk-{}.ogg", uuid::Uuid::new_v4()));
+    let chunk_path_str = chunk_path
+        .to_str()
+        .ok_or_else(|| "audio chunk path is not valid UTF-8".to_string())?
+        .to_string();
+
+    let output = app
+        .shell()
+        .sidecar("ffmpeg")
+        .map_err(|err| format!("could not resolve ffmpeg sidecar: {err}"))?
+        .args([
+            "-i",
+            audio_path,
+            "-ss",
+            &start_secs.to_string(),
+            "-t",
+            &duration_secs.to_string(),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
+            "-y",
+            &chunk_path_str,
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("ffmpeg failed to run: {err}"))?;
+
+    if !output.status.success() {
+        // ffmpeg can write a partial file before exiting non-zero — clean it
+        // up rather than leaking it into the OS temp dir.
+        let _ = std::fs::remove_file(&chunk_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg exited with an error: {}", stderr.trim()));
+    }
+
+    Ok(chunk_path)
+}
+
+/// Minimum chunk length worth its own Whisper request. A trailing sliver
+/// shorter than this (e.g. `total_duration_secs` landing just past an exact
+/// multiple of a chunk length) is folded into silence rather than uploaded
+/// as a near-empty final chunk. Shared (not just `split_audio_by_time`-local)
+/// so `openai::retranscribe_chunk`'s chunk-existence check agrees exactly
+/// with which chunks `split_audio_by_time` actually created — otherwise the
+/// two could disagree for a duration landing in the last second before a
+/// chunk boundary.
+pub const MIN_TRAILING_CHUNK_SECS: f64 = 1.0;
+
+/// Splits `audio_path` into sequential `chunk_secs`-long pieces via ffmpeg,
+/// each written to its own Opus/Ogg temp file in the system temp dir (same
+/// convention as `concat_videos`'s filelist). Returns each chunk's path
+/// paired with its start offset (in seconds) into the original file, in
+/// chunk order — the offset is needed by the caller to re-align each
+/// chunk's Whisper-returned segment timestamps back onto the full
+/// recording's timeline (see `openai.rs::merge_chunk_segments`).
+///
+/// Seeks with `-ss` *after* `-i` and re-encodes (`-c:a libopus`) rather
+/// than a fast pre-`-i` stream-copy: a stream-copy cut can only land on the
+/// nearest container page/packet boundary, which for Ogg/Opus can drift
+/// the actual cut point by up to roughly a second from the requested
+/// boundary — introducing timestamp drift and occasional duplicated words
+/// at chunk seams once segments are offset and merged. Audio-only
+/// re-encoding is cheap (unlike `export_lesson`'s video re-encode), so
+/// trading a little CPU for sample-accurate boundaries is worth it here.
+/// Re-encodes with the same settings `extract_audio` uses (mono/16kHz/
+/// Opus@24k), so every chunk stays exactly as small/Whisper-compatible as
+/// the original regardless of what `audio_path`'s own format is.
+///
+/// On any failure partway through, every chunk file already written by
+/// this call is deleted (best-effort) before returning `Err` — callers
+/// only ever receive paths for a fully successful split and never have to
+/// reason about a partial one. The caller still owns deleting the
+/// returned temp files once done with them.
+pub async fn split_audio_by_time(
+    app: &AppHandle,
+    audio_path: &str,
+    total_duration_secs: f64,
+    chunk_secs: f64,
+) -> Result<Vec<(PathBuf, f64)>, String> {
+    let mut chunks: Vec<(PathBuf, f64)> = Vec::new();
+    let mut start = 0.0_f64;
+    while total_duration_secs - start >= MIN_TRAILING_CHUNK_SECS {
+        match cut_audio_range(app, audio_path, start, chunk_secs).await {
+            Ok(chunk_path) => chunks.push((chunk_path, start)),
+            Err(err) => {
+                for (existing_path, _) in &chunks {
+                    let _ = std::fs::remove_file(existing_path);
+                }
+                return Err(err);
+            }
+        }
+        start += chunk_secs;
+    }
+
+    Ok(chunks)
+}
+
 /// Trims `[start, end)` from `video_path` into a frame-accurate re-encoded
 /// MP4 at `output_path` (PRD §10 export). Invocation, and why:
 ///

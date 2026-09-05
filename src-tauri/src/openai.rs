@@ -12,7 +12,9 @@
 //! (`transcript_status = 'transcribed'`), and copies its segments instead of
 //! re-calling the API.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
 
 use regex::Regex;
 use rusqlite::{params, OptionalExtension};
@@ -20,17 +22,80 @@ use tauri::AppHandle;
 
 use crate::app_settings;
 use crate::db::{self, DbConnection, LessonRow, LessonSegmentRow, TranscriptSegmentRow, Video};
+use crate::ffmpeg;
 use crate::progress::{self, Stage};
 use crate::settings;
 use crate::wav;
 
+/// Video ids currently undergoing a transcript-mutating operation —
+/// `transcribe_video` (whole recording) and `retranscribe_chunk` (a single
+/// chunk) both replace rows in that video's `transcript_segments`, so
+/// running two concurrently for the same video (e.g. one kicked off from
+/// the project list, another from the transcript page before the first
+/// finished) would otherwise let whichever commits last silently clobber
+/// the other's just-written segments, with no error surfaced to either
+/// caller. Managed as Tauri state (see `lib.rs`), same pattern as
+/// `export::ExportRunning`.
+pub struct TranscriptionLocks(pub Mutex<HashSet<String>>);
+
+impl TranscriptionLocks {
+    pub fn new() -> Self {
+        Self(Mutex::new(HashSet::new()))
+    }
+}
+
+impl Default for TranscriptionLocks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII guard for one video id's entry in `TranscriptionLocks` — acquired
+/// for the duration of `transcribe_video`/`retranscribe_chunk` and always
+/// released on drop (including on an early `?` return), so a lock can never
+/// leak and strand a video permanently "busy".
+struct TranscriptionLockGuard<'a> {
+    locks: &'a TranscriptionLocks,
+    video_id: String,
+}
+
+impl<'a> TranscriptionLockGuard<'a> {
+    /// Acquires the lock for `video_id`, or a clear error if another
+    /// transcription-mutating operation is already running for it.
+    fn acquire(locks: &'a TranscriptionLocks, video_id: &str) -> Result<Self, String> {
+        let mut in_flight = locks.0.lock().map_err(|err| err.to_string())?;
+        if !in_flight.insert(video_id.to_string()) {
+            return Err(
+                "This video's transcript is already being updated — wait for it to finish."
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            locks,
+            video_id: video_id.to_string(),
+        })
+    }
+}
+
+impl Drop for TranscriptionLockGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.locks.0.lock() {
+            in_flight.remove(&self.video_id);
+        }
+    }
+}
+
 /// A single transcript segment as returned by Whisper — timestamps in
-/// seconds relative to the start of the audio.
+/// seconds relative to the start of the audio. `keep` starts `true` for
+/// every segment Whisper actually returns and is only ever flipped to
+/// `false` by `flag_likely_hallucinations` before persisting — never by
+/// anything upstream of that.
 #[derive(Debug, Clone)]
 pub struct TranscriptSegment {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    pub keep: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -58,6 +123,20 @@ const SAFE_UPLOAD_BYTES: u64 = 24_000_000;
 /// boundary picker nudges a cut a few tens of seconds away from this
 /// target in either direction.
 const CHUNK_TARGET_BYTES: usize = 19_200_000;
+
+/// Duration (seconds) above which a recording is proactively split into
+/// smaller pieces before ever reaching Whisper — independent of, and
+/// checked before, `SAFE_UPLOAD_BYTES`. Long single-request audio is a
+/// known Whisper failure mode: past a certain length the model can drift
+/// and start looping/hallucinating repeated (sometimes wrong-language) text
+/// rather than erroring out, so this can't be caught by a byte-size check
+/// alone. `extract_audio`'s Opus output (~3 KB/s) keeps even a 2-hour
+/// lecture under `SAFE_UPLOAD_BYTES`, so without this check such a
+/// recording would otherwise sail through as a single request and silently
+/// produce a garbled transcript instead of a clean error. 10 minutes
+/// matches the existing `CHUNK_TARGET_BYTES` chunk-size target used by the
+/// legacy byte-size-based WAV chunking path below, for consistency.
+const CHUNK_DURATION_THRESHOLD_SECS: f64 = 600.0;
 
 /// Uploads the local file at `audio_path` to OpenAI's Whisper API
 /// (`POST /v1/audio/transcriptions`, `model=whisper-1`,
@@ -88,6 +167,12 @@ pub async fn transcribe_audio(
     audio_path: &str,
     api_key: &str,
 ) -> Result<Vec<TranscriptSegment>, String> {
+    let duration = ffmpeg::probe_duration(app, audio_path).await?;
+    if duration > CHUNK_DURATION_THRESHOLD_SECS {
+        return transcribe_in_time_chunks(app, video_id, attempt, audio_path, api_key, duration)
+            .await;
+    }
+
     let audio_bytes = tokio::fs::read(audio_path)
         .await
         .map_err(|err| format!("could not read audio file {audio_path}: {err}"))?;
@@ -134,6 +219,70 @@ pub async fn transcribe_audio(
         chunk_results.push((segments, start_offset_secs));
     }
 
+    Ok(merge_chunk_segments(chunk_results))
+}
+
+/// Splits a recording longer than `CHUNK_DURATION_THRESHOLD_SECS` into
+/// ~10-minute pieces via `ffmpeg::split_audio_by_time` and transcribes each
+/// sequentially, offsetting and merging results via `merge_chunk_segments`
+/// — the same merge path the legacy byte-size-based WAV chunking (below)
+/// already uses and already has test coverage for. Temp chunk files are
+/// always cleaned up (best-effort) whether or not a chunk upload fails.
+async fn transcribe_in_time_chunks(
+    app: &AppHandle,
+    video_id: &str,
+    attempt: u32,
+    audio_path: &str,
+    api_key: &str,
+    total_duration_secs: f64,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let chunk_paths = ffmpeg::split_audio_by_time(
+        app,
+        audio_path,
+        total_duration_secs,
+        CHUNK_DURATION_THRESHOLD_SECS,
+    )
+    .await?;
+    let total = chunk_paths.len();
+    progress::emit(app, video_id, Stage::Transcribing, None, None, attempt);
+
+    // Every chunk `split_audio_by_time` writes is a fresh Opus/Ogg re-encode
+    // regardless of `audio_path`'s own format (see that function's doc
+    // comment) — the mime must match that, not whatever `audio_path` itself
+    // happens to be.
+    let mime = "audio/ogg";
+    let mut chunk_results: Vec<(Vec<TranscriptSegment>, f64)> = Vec::with_capacity(total);
+
+    let upload_result: Result<(), String> = async {
+        for (index, (chunk_path, start_offset_secs)) in chunk_paths.iter().enumerate() {
+            progress::emit(
+                app,
+                video_id,
+                Stage::Transcribing,
+                Some((index + 1) as f64 / total as f64),
+                Some(format!("chunk {} of {}", index + 1, total)),
+                attempt,
+            );
+            let chunk_bytes = tokio::fs::read(chunk_path).await.map_err(|err| {
+                format!("could not read chunk file {}: {err}", chunk_path.display())
+            })?;
+            let chunk_name = chunk_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("chunk.ogg")
+                .to_string();
+            let segments = upload_chunk(chunk_bytes, chunk_name, mime, api_key).await?;
+            chunk_results.push((segments, *start_offset_secs));
+        }
+        Ok(())
+    }
+    .await;
+
+    for (chunk_path, _) in &chunk_paths {
+        let _ = tokio::fs::remove_file(chunk_path).await;
+    }
+
+    upload_result?;
     Ok(merge_chunk_segments(chunk_results))
 }
 
@@ -207,6 +356,7 @@ async fn upload_chunk(
             start: segment.start,
             end: segment.end,
             text: segment.text,
+            keep: true,
         })
         .collect())
 }
@@ -223,9 +373,150 @@ fn merge_chunk_segments(chunks: Vec<(Vec<TranscriptSegment>, f64)>) -> Vec<Trans
                 start: segment.start + offset,
                 end: segment.end + offset,
                 text: segment.text,
+                keep: segment.keep,
             })
         })
         .collect()
+}
+
+/// Minimum number of near-identical occurrences of a short phrase across
+/// one transcription batch before every instance of it is flagged as
+/// likely Whisper hallucination rather than real repeated speech.
+const HALLUCINATION_REPEAT_THRESHOLD: usize = 3;
+
+/// A repeated phrase is only considered a candidate stock hallucination if
+/// it's at most this many words — Whisper's documented long-silence
+/// hallucinations are short, generic sign-offs ("Thank you for watching
+/// the video.", "Thanks for watching!", "Please subscribe."), a bias from
+/// its YouTube-heavy training data. A long sentence repeating this many
+/// times is far more likely to be a real speaker's habit (e.g. restating a
+/// key point) than a hallucination loop, so it's left alone.
+const HALLUCINATION_MAX_WORDS: usize = 12;
+
+/// Case/punctuation-insensitive normalization used only to compare
+/// segment text for the hallucination check below — collapses whitespace
+/// and strips punctuation so "Thank you for watching the video." and
+/// "thank you for watching the video" count as the same phrase.
+fn normalize_for_hallucination_check(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Flags (`keep = false`) every segment whose text is a short phrase
+/// repeating near-identically `HALLUCINATION_REPEAT_THRESHOLD`+ times
+/// across `segments`. Whisper has a documented failure mode where long
+/// silence in the source audio (a real lecture recording routinely has
+/// this — a pause, a silent on-screen demo) gets filled with a generic
+/// sign-off phrase instead of being transcribed as nothing, and it repeats
+/// that same phrase once per silent stretch rather than erroring out.
+///
+/// Segments are only ever flagged, never dropped or excluded from what's
+/// returned (PRD principle 4: AI-assisted, not AI-decided) — they still
+/// appear in Transcript Mode via the existing `keep` flag (crossed out,
+/// already excluded from GPT-5.5 lesson analysis's `keep = 1` query) so
+/// the user can restore any segment this flagged incorrectly. Deliberately
+/// does not try to distinguish "silence" from "an important on-screen step
+/// with no narration" — it only ever touches segments whose *text* itself
+/// is a suspicious repeat; a real silent demo simply has no segments here
+/// to flag in the first place.
+fn flag_likely_hallucinations(segments: &mut [TranscriptSegment]) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for segment in segments.iter() {
+        let normalized = normalize_for_hallucination_check(&segment.text);
+        if normalized.is_empty() || normalized.split_whitespace().count() > HALLUCINATION_MAX_WORDS {
+            continue;
+        }
+        *counts.entry(normalized).or_insert(0) += 1;
+    }
+
+    for segment in segments.iter_mut() {
+        let normalized = normalize_for_hallucination_check(&segment.text);
+        if counts.get(&normalized).copied().unwrap_or(0) >= HALLUCINATION_REPEAT_THRESHOLD {
+            segment.keep = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod hallucination_flagging_tests {
+    use super::{flag_likely_hallucinations, TranscriptSegment};
+
+    fn seg(start: f64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start,
+            end: start + 5.0,
+            text: text.to_string(),
+            keep: true,
+        }
+    }
+
+    #[test]
+    fn flags_a_short_phrase_repeating_three_or_more_times() {
+        let mut segments = vec![
+            seg(0.0, "Thank you for watching the video."),
+            seg(200.0, "Real content the speaker actually said."),
+            seg(400.0, "Thank you for watching the video."),
+            seg(600.0, "More real lecture content here."),
+            seg(800.0, "thank you for watching the video"),
+        ];
+
+        flag_likely_hallucinations(&mut segments);
+
+        assert!(!segments[0].keep, "first repeat should be flagged");
+        assert!(segments[1].keep, "unrelated real content should be untouched");
+        assert!(!segments[2].keep, "second repeat should be flagged");
+        assert!(segments[3].keep, "unrelated real content should be untouched");
+        assert!(
+            !segments[4].keep,
+            "case/punctuation-different repeat should still be flagged"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_a_phrase_repeating_only_twice() {
+        let mut segments = vec![
+            seg(0.0, "Let's move on to the next topic."),
+            seg(200.0, "Let's move on to the next topic."),
+        ];
+
+        flag_likely_hallucinations(&mut segments);
+
+        assert!(segments.iter().all(|segment| segment.keep));
+    }
+
+    #[test]
+    fn does_not_flag_a_long_sentence_even_if_repeated_many_times() {
+        let long_sentence = "In this lecture we are going to carefully work through \
+            every single step of the algorithm together as a group.";
+        let mut segments = vec![
+            seg(0.0, long_sentence),
+            seg(200.0, long_sentence),
+            seg(400.0, long_sentence),
+            seg(600.0, long_sentence),
+        ];
+
+        flag_likely_hallucinations(&mut segments);
+
+        assert!(
+            segments.iter().all(|segment| segment.keep),
+            "a long repeated sentence looks like real speech, not a hallucinated sign-off"
+        );
+    }
+
+    #[test]
+    fn leaves_already_unkept_segments_alone_when_not_repeated() {
+        let mut segments = vec![seg(0.0, "Just one normal segment.")];
+        segments[0].keep = false;
+
+        flag_likely_hallucinations(&mut segments);
+
+        assert!(!segments[0].keep);
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +528,7 @@ mod chunk_merge_tests {
             start,
             end,
             text: text.to_string(),
+            keep: true,
         }
     }
 
@@ -311,9 +603,11 @@ fn mark_error(conn: &DbConnection, video_id: &str) -> Result<(), String> {
 pub async fn transcribe_video(
     app: AppHandle,
     conn: tauri::State<'_, DbConnection>,
+    locks: tauri::State<'_, TranscriptionLocks>,
     video_id: String,
     attempt: u32,
 ) -> Result<Video, String> {
+    let _lock = TranscriptionLockGuard::acquire(&locks, &video_id)?;
     match run_transcription(&app, &conn, &video_id, attempt).await {
         Ok(video) => Ok(video),
         Err(message) => {
@@ -398,16 +692,18 @@ async fn run_transcription(
         None => Vec::new(),
     };
 
-    let segments: Vec<TranscriptSegment> = if !cached_segments.is_empty() {
+    let mut segments: Vec<TranscriptSegment> = if !cached_segments.is_empty() {
         cached_segments
             .into_iter()
-            .map(|(start, end, text)| TranscriptSegment { start, end, text })
+            .map(|(start, end, text)| TranscriptSegment { start, end, text, keep: true })
             .collect()
     } else {
         let api_key = settings::read_stored_key()?
             .ok_or_else(|| "No OpenAI API key saved — add one in Settings".to_string())?;
         transcribe_audio(app, video_id, attempt, &audio_path, &api_key).await?
     };
+
+    flag_likely_hallucinations(&mut segments);
 
     let now = chrono::Utc::now().to_rfc3339();
     {
@@ -428,13 +724,155 @@ async fn run_transcription(
             let id = uuid::Uuid::new_v4().to_string();
             tx.execute(
                 "INSERT INTO transcript_segments (id, video_id, start, end, text, keep)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-                params![id, video_id, segment.start, segment.end, segment.text],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, video_id, segment.start, segment.end, segment.text, segment.keep],
             )
             .map_err(|err| err.to_string())?;
         }
         tx.execute(
             "UPDATE videos SET transcript_status = 'transcribed', updated_at = ?1 WHERE id = ?2",
+            params![now, video_id],
+        )
+        .map_err(|err| err.to_string())?;
+
+        tx.commit().map_err(|err| err.to_string())?;
+    }
+
+    let guard = conn.0.lock().map_err(|err| err.to_string())?;
+    guard
+        .query_row(
+            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path
+             FROM videos WHERE id = ?1",
+            params![video_id],
+            db::row_to_video,
+        )
+        .map_err(|err| err.to_string())
+}
+
+/// Re-transcribes a single ~`CHUNK_DURATION_THRESHOLD_SECS`-long chunk of
+/// an already-transcribed long recording — chunk `chunk_index`'s time
+/// range is `[chunk_index * CHUNK_DURATION_THRESHOLD_SECS, min((chunk_index
+/// + 1) * CHUNK_DURATION_THRESHOLD_SECS, video's duration))`, the exact
+/// same grid `transcribe_in_time_chunks` used to produce the original
+/// segments in that range. Lets the UI retry just the slice that came out
+/// garbled instead of re-uploading (and re-paying Whisper for) the whole
+/// recording. Replaces only the `transcript_segments` rows whose `start`
+/// falls in that chunk's range — every segment outside it (including its
+/// `keep` flags) is left untouched. Unlike a whole-video transcription
+/// failure, a single bad chunk re-try failing does NOT flip the video's
+/// `transcript_status` to `'error'` — the rest of its transcript is still
+/// good, so the row should stay exactly as it was.
+#[tauri::command(async)]
+pub async fn retranscribe_chunk(
+    app: AppHandle,
+    conn: tauri::State<'_, DbConnection>,
+    locks: tauri::State<'_, TranscriptionLocks>,
+    video_id: String,
+    chunk_index: u32,
+    attempt: u32,
+) -> Result<Video, String> {
+    let _lock = TranscriptionLockGuard::acquire(&locks, &video_id)?;
+    let (audio_path, duration): (Option<String>, Option<f64>) = {
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        guard
+            .query_row(
+                "SELECT audio_path, duration FROM videos WHERE id = ?1",
+                params![video_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                    ))
+                },
+            )
+            .map_err(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    format!("video {video_id} does not exist")
+                }
+                other => other.to_string(),
+            })?
+    };
+
+    let audio_path =
+        audio_path.ok_or_else(|| "audio not extracted yet for this video".to_string())?;
+    let duration = duration.ok_or_else(|| "duration not known yet for this video".to_string())?;
+
+    let chunk_start = chunk_index as f64 * CHUNK_DURATION_THRESHOLD_SECS;
+    // Match `split_audio_by_time`'s own `MIN_TRAILING_CHUNK_SECS` cutoff
+    // exactly — otherwise a duration landing in the last second before a
+    // chunk boundary could disagree with that function about whether this
+    // chunk was ever actually transcribed as its own request.
+    if duration - chunk_start < ffmpeg::MIN_TRAILING_CHUNK_SECS {
+        return Err(format!("chunk {chunk_index} is out of range for this video"));
+    }
+    let chunk_len = (duration - chunk_start).min(CHUNK_DURATION_THRESHOLD_SECS);
+    let chunk_end = chunk_start + chunk_len;
+
+    // Checked before doing any ffmpeg work, same ordering `run_transcription`
+    // uses — a user with no key configured shouldn't pay for a re-encode
+    // just to see "No OpenAI API key saved" afterward.
+    let api_key = settings::read_stored_key()?
+        .ok_or_else(|| "No OpenAI API key saved — add one in Settings".to_string())?;
+
+    progress::emit(
+        &app,
+        &video_id,
+        Stage::Transcribing,
+        None,
+        Some(format!("re-transcribing chunk {}", chunk_index + 1)),
+        attempt,
+    );
+
+    let chunk_path = ffmpeg::cut_audio_range(&app, &audio_path, chunk_start, chunk_len).await?;
+
+    let upload_result = async {
+        let chunk_bytes = tokio::fs::read(&chunk_path)
+            .await
+            .map_err(|err| format!("could not read chunk file {}: {err}", chunk_path.display()))?;
+        let chunk_name = chunk_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("chunk.ogg")
+            .to_string();
+        upload_chunk(chunk_bytes, chunk_name, "audio/ogg", &api_key).await
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&chunk_path).await;
+
+    let mut segments = upload_result?;
+    flag_likely_hallucinations(&mut segments);
+
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let mut guard = conn.0.lock().map_err(|err| err.to_string())?;
+        let tx = guard.transaction().map_err(|err| err.to_string())?;
+
+        tx.execute(
+            "DELETE FROM transcript_segments WHERE video_id = ?1 AND start >= ?2 AND start < ?3",
+            params![video_id, chunk_start, chunk_end],
+        )
+        .map_err(|err| err.to_string())?;
+
+        for segment in &segments {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO transcript_segments (id, video_id, start, end, text, keep)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    video_id,
+                    segment.start + chunk_start,
+                    segment.end + chunk_start,
+                    segment.text,
+                    segment.keep
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+
+        tx.execute(
+            "UPDATE videos SET updated_at = ?1 WHERE id = ?2",
             params![now, video_id],
         )
         .map_err(|err| err.to_string())?;
