@@ -29,3 +29,8 @@ npm-debug.log*
 
 # Tauri generated schemas
 src-tauri/gen/schemas/
+
+# Local test recordings, dropped at repo root
+/Recordings
+/Adding row and column.mp4
+/HCM-FEB-26-58-060826_Recording.mp4
