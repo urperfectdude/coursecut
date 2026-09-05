@@ -33,6 +33,30 @@ fn audio_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Directory transient segment-playback clips (`extract_playback_clip`) are
+/// written to: `<app_cache_dir>/playback/<uuid>.wav`. Deliberately *not*
+/// the OS system temp dir (`std::env::temp_dir()`, what this used
+/// initially) — the webview's asset protocol only serves paths within its
+/// configured `scope` (see `tauri.conf.json`'s `assetProtocol.scope`,
+/// `$APPCACHE/**`) plus whatever the user has explicitly picked via the
+/// native file dialog; an arbitrary system temp path is neither, so
+/// `convertFileSrc` on one throws `NotSupportedError` when the webview
+/// tries to load it. The app's own cache dir is a location this app
+/// controls and can explicitly grant itself scope over. Created on first
+/// use; unlike `audio_cache_dir`, entries here aren't content-hash-keyed —
+/// each clip is deleted right after use (see `delete_playback_clip`), not
+/// cached long-term.
+fn playback_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|err| format!("could not resolve app cache dir: {err}"))?
+        .join("playback");
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("could not create playback cache dir: {err}"))?;
+    Ok(dir)
+}
+
 /// Runs the bundled `ffprobe` sidecar to read `video_path`'s duration, in
 /// seconds. Local-only: the path is passed as a CLI arg, nothing is
 /// uploaded.
@@ -269,6 +293,248 @@ async fn run_extraction(
             db::row_to_video,
         )
         .map_err(|err| err.to_string())
+}
+
+/// Cuts `[start_secs, start_secs + duration_secs)` from `audio_path` into a
+/// single re-encoded Opus/Ogg temp file in the system temp dir, returning
+/// its path. Shared by `split_audio_by_time` (called once per chunk when
+/// first transcribing a long recording) and single-chunk re-transcription
+/// (`openai::retranscribe_chunk`), so both cut audio identically — same
+/// accurate-seek-plus-re-encode approach, same settings `extract_audio`
+/// itself uses. See `split_audio_by_time`'s doc comment for why this
+/// re-encodes rather than a fast `-c copy` stream-copy. Caller owns
+/// deleting the returned temp file.
+pub async fn cut_audio_range(
+    app: &AppHandle,
+    audio_path: &str,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Result<PathBuf, String> {
+    let chunk_path = std::env::temp_dir().join(format!("coursecut-chunk-{}.ogg", uuid::Uuid::new_v4()));
+    let chunk_path_str = chunk_path
+        .to_str()
+        .ok_or_else(|| "audio chunk path is not valid UTF-8".to_string())?
+        .to_string();
+
+    let output = app
+        .shell()
+        .sidecar("ffmpeg")
+        .map_err(|err| format!("could not resolve ffmpeg sidecar: {err}"))?
+        .args([
+            "-i",
+            audio_path,
+            "-ss",
+            &start_secs.to_string(),
+            "-t",
+            &duration_secs.to_string(),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
+            "-y",
+            &chunk_path_str,
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("ffmpeg failed to run: {err}"))?;
+
+    if !output.status.success() {
+        // ffmpeg can write a partial file before exiting non-zero — clean it
+        // up rather than leaking it into the OS temp dir.
+        let _ = std::fs::remove_file(&chunk_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg exited with an error: {}", stderr.trim()));
+    }
+
+    Ok(chunk_path)
+}
+
+/// Cuts `[start_secs, start_secs + duration_secs)` from `source_path` (the
+/// original source video, not the extracted Opus/Ogg cache) into a small
+/// PCM WAV clip in `playback_cache_dir`, for local playback only — never
+/// uploaded anywhere. WAV rather than `cut_audio_range`'s Opus/Ogg because
+/// this clip has to play natively in the app's own webview, and some real
+/// recordings have a container layout WebKit's demuxer is balky about
+/// picking the right track from (or decoding at all) when handed
+/// directly — observed cases: the audio track ordered before the video
+/// track plus an extra unrecognized data track, and internally
+/// inconsistent video color metadata that can make a strict hardware
+/// decoder reject the whole file. A short, uncompressed, single-track WAV
+/// sidesteps all of that: ffmpeg (which already handles this file fine
+/// everywhere else in this app) does the real decoding, and the webview
+/// only ever has to play a plain, universally-supported PCM file with
+/// nothing else in the container to get confused by. Caller owns deleting
+/// the returned clip file once done with it (see `delete_playback_clip`).
+pub async fn extract_playback_clip(
+    app: &AppHandle,
+    source_path: &str,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Result<PathBuf, String> {
+    let clip_path = playback_cache_dir(app)?.join(format!("{}.wav", uuid::Uuid::new_v4()));
+    let clip_path_str = clip_path
+        .to_str()
+        .ok_or_else(|| "playback clip path is not valid UTF-8".to_string())?
+        .to_string();
+
+    let output = app
+        .shell()
+        .sidecar("ffmpeg")
+        .map_err(|err| format!("could not resolve ffmpeg sidecar: {err}"))?
+        .args([
+            "-i",
+            source_path,
+            "-ss",
+            &start_secs.to_string(),
+            "-t",
+            &duration_secs.to_string(),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            "-c:a",
+            "pcm_s16le",
+            "-y",
+            &clip_path_str,
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("ffmpeg failed to run: {err}"))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&clip_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg exited with an error: {}", stderr.trim()));
+    }
+
+    Ok(clip_path)
+}
+
+/// Reads `video_id`'s `file_path` and cuts `[start, end)` from it into a
+/// playback-ready WAV clip via `extract_playback_clip`, returning the temp
+/// clip's path as a string for the frontend to hand straight to
+/// `convertFileSrc`. One clip per Play click (see `TranscriptStageView`'s
+/// `handlePlaySegment`) — the frontend deletes the previous clip (via
+/// `delete_playback_clip`) once a new one successfully starts playing, so
+/// at most one stray clip can ever be left behind by an interrupted session.
+#[tauri::command(async)]
+pub async fn prepare_segment_playback_clip(
+    app: AppHandle,
+    conn: tauri::State<'_, DbConnection>,
+    video_id: String,
+    start: f64,
+    end: f64,
+) -> Result<String, String> {
+    let file_path = {
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        guard
+            .query_row(
+                "SELECT file_path FROM videos WHERE id = ?1",
+                params![video_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    format!("video {video_id} does not exist")
+                }
+                other => other.to_string(),
+            })?
+    };
+
+    let clip_path = extract_playback_clip(&app, &file_path, start, end - start).await?;
+    clip_path
+        .to_str()
+        .map(|path| path.to_string())
+        .ok_or_else(|| "playback clip path is not valid UTF-8".to_string())
+}
+
+/// Deletes a temp playback clip previously returned by
+/// `prepare_segment_playback_clip`. Scoped to `playback_cache_dir` — refuses
+/// to touch anything else, so this can't become a general-purpose
+/// arbitrary file-delete primitive even though it's invoked with a
+/// caller-supplied path. Best-effort: a missing/already-deleted file is
+/// not an error.
+#[tauri::command(async)]
+pub fn delete_playback_clip(app: AppHandle, path: String) -> Result<(), String> {
+    let candidate = Path::new(&path);
+    let cache_dir = playback_cache_dir(&app)?;
+    let is_own_clip = candidate.parent() == Some(cache_dir.as_path())
+        && candidate
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"));
+    if !is_own_clip {
+        return Err(format!("refusing to delete non-playback-clip path: {path}"));
+    }
+    match std::fs::remove_file(candidate) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Minimum chunk length worth its own Whisper request. A trailing sliver
+/// shorter than this (e.g. `total_duration_secs` landing just past an exact
+/// multiple of a chunk length) is folded into silence rather than uploaded
+/// as a near-empty final chunk. Shared (not just `split_audio_by_time`-local)
+/// so `openai::retranscribe_chunk`'s chunk-existence check agrees exactly
+/// with which chunks `split_audio_by_time` actually created — otherwise the
+/// two could disagree for a duration landing in the last second before a
+/// chunk boundary.
+pub const MIN_TRAILING_CHUNK_SECS: f64 = 1.0;
+
+/// Splits `audio_path` into sequential `chunk_secs`-long pieces via ffmpeg,
+/// each written to its own Opus/Ogg temp file in the system temp dir (same
+/// convention as `concat_videos`'s filelist). Returns each chunk's path
+/// paired with its start offset (in seconds) into the original file, in
+/// chunk order — the offset is needed by the caller to re-align each
+/// chunk's Whisper-returned segment timestamps back onto the full
+/// recording's timeline (see `openai.rs::merge_chunk_segments`).
+///
+/// Seeks with `-ss` *after* `-i` and re-encodes (`-c:a libopus`) rather
+/// than a fast pre-`-i` stream-copy: a stream-copy cut can only land on the
+/// nearest container page/packet boundary, which for Ogg/Opus can drift
+/// the actual cut point by up to roughly a second from the requested
+/// boundary — introducing timestamp drift and occasional duplicated words
+/// at chunk seams once segments are offset and merged. Audio-only
+/// re-encoding is cheap (unlike `export_lesson`'s video re-encode), so
+/// trading a little CPU for sample-accurate boundaries is worth it here.
+/// Re-encodes with the same settings `extract_audio` uses (mono/16kHz/
+/// Opus@24k), so every chunk stays exactly as small/Whisper-compatible as
+/// the original regardless of what `audio_path`'s own format is.
+///
+/// On any failure partway through, every chunk file already written by
+/// this call is deleted (best-effort) before returning `Err` — callers
+/// only ever receive paths for a fully successful split and never have to
+/// reason about a partial one. The caller still owns deleting the
+/// returned temp files once done with them.
+pub async fn split_audio_by_time(
+    app: &AppHandle,
+    audio_path: &str,
+    total_duration_secs: f64,
+    chunk_secs: f64,
+) -> Result<Vec<(PathBuf, f64)>, String> {
+    let mut chunks: Vec<(PathBuf, f64)> = Vec::new();
+    let mut start = 0.0_f64;
+    while total_duration_secs - start >= MIN_TRAILING_CHUNK_SECS {
+        match cut_audio_range(app, audio_path, start, chunk_secs).await {
+            Ok(chunk_path) => chunks.push((chunk_path, start)),
+            Err(err) => {
+                for (existing_path, _) in &chunks {
+                    let _ = std::fs::remove_file(existing_path);
+                }
+                return Err(err);
+            }
+        }
+        start += chunk_secs;
+    }
+
+    Ok(chunks)
 }
 
 /// Trims `[start, end)` from `video_path` into a frame-accurate re-encoded

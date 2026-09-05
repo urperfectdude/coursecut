@@ -39,6 +39,9 @@ pub fn run() {
             // running, so `cancel_export` can find and kill it (see
             // `export.rs`'s `ExportRunning`).
             app.manage(export::ExportRunning::new());
+            // Guards against `transcribe_video`/`retranscribe_chunk` running
+            // concurrently for the same video (see `openai::TranscriptionLocks`).
+            app.manage(openai::TranscriptionLocks::new());
             // The single, sequential, app-wide export queue processor (PRD
             // §10) — one background task for the whole app's lifetime, not
             // per-video/per-lesson, so only one ffmpeg export subprocess
@@ -71,7 +74,10 @@ pub fn run() {
             db::delete_lesson_segment,
             db::reorder_lesson_segments,
             ffmpeg::extract_audio_for_video,
+            ffmpeg::prepare_segment_playback_clip,
+            ffmpeg::delete_playback_clip,
             openai::transcribe_video,
+            openai::retranscribe_chunk,
             openai::analyze_video,
             openai::preview_lesson_segment_edit,
             openai::apply_lesson_segment_edit,
