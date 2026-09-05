@@ -3,6 +3,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { Maximize, Minimize2, Pause, Play } from "lucide-react";
 import type { LessonSegment } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
+import { useContainedVideoRect } from "../lib/useContainedVideoRect";
 import SegmentedScrubber from "./SegmentedScrubber";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -35,6 +36,15 @@ interface SourceVideoPreviewProps {
    * scrubber, per `docs/lesson-segments-plan.md`'s seek-bar overlay. Unused
    * in `"minimal"` layout, which has no lesson selection. */
   selectedLessonSegments?: LessonSegment[];
+  /** This video's image-overlay ranges (`frame_overlays`) — rendered two
+   * ways: as a second amber marker band on the scrubber (see
+   * `SegmentedScrubber`'s `markers` prop), and, for whichever overlay(s)
+   * currently contain `currentTime`, as a live `<img>` composited on top of
+   * the `<video>` element itself (an approximation of the real ffmpeg
+   * export-time compositing — sized/centered the same way, but not a
+   * pixel-accurate render). Video-scoped like the overlays themselves, not
+   * tied to `selectedLessonSegments`. */
+  overlayMarkers?: { id: string; image_path: string; start: number; end: number; scale_percent: number }[];
   /** Whether a lesson is currently selected — gates the Mark In/Out/Add
    * Segment controls, since a segment always needs a target lesson. Unused
    * in `"minimal"` layout, which doesn't render those controls at all. */
@@ -110,6 +120,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     {
       filePath,
       selectedLessonSegments = [],
+      overlayMarkers = [],
       hasSelectedLesson = false,
       onTimeUpdate,
       onAddSegment,
@@ -118,8 +129,13 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     ref,
   ) {
     const videoRef = useRef<HTMLVideoElement | null>(null);
+    const overlayContainerRef = useRef<HTMLDivElement | null>(null);
     const [currentTime, setCurrentTime] = useState(0);
     const [duration, setDuration] = useState(0);
+    // Bumped on `loadedmetadata` to tell `useContainedVideoRect` the video's
+    // intrinsic dimensions are now readable — see that hook.
+    const [metadataVersion, setMetadataVersion] = useState(0);
+    const contentRect = useContainedVideoRect(videoRef, overlayContainerRef, metadataVersion);
     // Native `<video controls>` is gone (see the module doc above), so this
     // component now owns play/pause state itself for the custom control
     // row's button label — driven by the video element's own `onPlay`/
@@ -253,6 +269,16 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
       return () => document.removeEventListener("keydown", handleKeyDown);
     }, []);
 
+    // Live-preview approximation of the export-time compositing: whichever
+    // overlay(s) contain the current real playhead position, rendered as
+    // absolutely-positioned `<img>`s over the video below. Array order
+    // (start-time order, from `listFrameOverlays`) doubles as z-order,
+    // matching the sequential chaining `build_overlay_filter_complex` does
+    // in the real export.
+    const activeOverlayMarkers = overlayMarkers.filter(
+      (marker) => currentTime >= marker.start && currentTime < marker.end,
+    );
+
     return (
       <div
         className={cn(
@@ -287,22 +313,55 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
           )}
         >
           <div className="min-w-0 flex-1">
-            <video
-              ref={videoRef}
-              src={convertFileSrc(filePath)}
-              // `source-preview-video` is likewise kept as a hook className —
-              // `LessonSegmentsView`'s stylesheet forces this element to a
-              // shared height alongside `LessonPreviewPlayer`'s video via
-              // `.lesson-segments-preview-row .source-preview-video`.
-              className={cn(
-                "source-preview-video block max-h-[30vh] w-full bg-black",
-                isFullscreen && "h-auto max-h-[82vh] w-full",
-              )}
-              onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
-              onTimeUpdate={handleTimeUpdate}
-              onPlay={() => setIsPaused(false)}
-              onPause={() => setIsPaused(true)}
-            />
+            <div ref={overlayContainerRef} className="relative">
+              <video
+                ref={videoRef}
+                src={convertFileSrc(filePath)}
+                // `source-preview-video` is likewise kept as a hook className —
+                // `LessonSegmentsView`'s stylesheet forces this element to a
+                // shared height alongside `LessonPreviewPlayer`'s video via
+                // `.lesson-segments-preview-row .source-preview-video`.
+                className={cn(
+                  "source-preview-video block max-h-[30vh] w-full bg-black",
+                  isFullscreen && "h-auto max-h-[82vh] w-full",
+                )}
+                onLoadedMetadata={(event) => {
+                  setDuration(event.currentTarget.duration || 0);
+                  setMetadataVersion((v) => v + 1);
+                }}
+                onTimeUpdate={handleTimeUpdate}
+                onPlay={() => setIsPaused(false)}
+                onPause={() => setIsPaused(true)}
+              />
+              {/* Positioned against `contentRect` (the video's actual
+                 letterboxed content area — see `useContainedVideoRect`), not
+                 this wrapper's raw box, so the overlay's own box matches the
+                 video's true aspect ratio instead of whatever shape
+                 `object-fit: contain`'s letterboxing left this `<div>` at.
+                 `object-fit: contain` on the `<img>` itself then keeps the
+                 image's own content from stretching to fill that box —
+                 mirrors `force_original_aspect_ratio=decrease` in the real
+                 export's ffmpeg filter. */}
+              {contentRect &&
+                activeOverlayMarkers.map((marker) => {
+                  const width = contentRect.width * (marker.scale_percent / 100);
+                  const height = contentRect.height * (marker.scale_percent / 100);
+                  return (
+                    <img
+                      key={marker.id}
+                      src={convertFileSrc(marker.image_path)}
+                      alt=""
+                      className="pointer-events-none absolute object-contain"
+                      style={{
+                        left: contentRect.left + (contentRect.width - width) / 2,
+                        top: contentRect.top + (contentRect.height - height) / 2,
+                        width,
+                        height,
+                      }}
+                    />
+                  );
+                })}
+            </div>
 
             {/* Replaces native `<video controls>` (dropped above — shadow DOM
                controls can't carry the yellow segment-highlight overlay, see
@@ -353,6 +412,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
               onChange={handleScrub}
               aria-label="Scrub source video"
               segments={selectedLessonSegments}
+              markers={overlayMarkers}
               duration={duration}
             />
           </div>

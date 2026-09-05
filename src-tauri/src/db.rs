@@ -130,6 +130,34 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|err| format!("could not update schema version: {err}"))?;
     }
 
+    if version < 7 {
+        conn.execute_batch(include_str!("../migrations/0007_frame_overlays.sql"))
+            .map_err(|err| format!("migration 0007_frame_overlays failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 7)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
+    if version < 8 {
+        conn.execute_batch(include_str!("../migrations/0008_frame_overlay_scale_percent.sql"))
+            .map_err(|err| format!("migration 0008_frame_overlay_scale_percent failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 8)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
+    if version < 9 {
+        conn.execute_batch(include_str!("../migrations/0009_frame_overlay_lesson_scoped.sql"))
+            .map_err(|err| format!("migration 0009_frame_overlay_lesson_scoped failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 9)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
+    if version < 10 {
+        conn.execute_batch(include_str!("../migrations/0010_frame_overlay_position.sql"))
+            .map_err(|err| format!("migration 0010_frame_overlay_position failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 10)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
     Ok(())
 }
 
@@ -958,6 +986,204 @@ pub fn reorder_lesson_segments(
     let tx = conn.transaction().map_err(|err| err.to_string())?;
     reorder_lesson_segments_tx(&tx, &lesson_id, &ordered_ids)?;
     tx.commit().map_err(|err| err.to_string())
+}
+
+// ---------------------------------------------------------------------
+// Frame overlays (0007_frame_overlays.sql, lesson-scoped since
+// 0009_frame_overlay_lesson_scoped.sql): a still image composited over a
+// lesson's existing frames for [start, end) during export only — never
+// spliced into the timeline, never changes video
+// duration/transcript_segments/audio. `start`/`end` are *virtual, stitched*
+// seconds into this lesson's own final-video timeline (0 = the start of
+// this lesson's output — same coordinate space as `LessonPreviewPlayer`'s
+// scrubber and `segmentOffsets` there), not the source recording's raw
+// seconds — deliberately lesson-scoped (not shareable across lessons of the
+// same video) so a position picked against one lesson's Final-video preview
+// can't silently land outside that lesson's own kept content. See
+// `export.rs`'s `overlays_for_segment` for how a virtual range maps onto
+// the lesson's actual `lesson_segments` at export time. `scale_percent`
+// sizes the image relative to the main video (100 = fills the frame, lower
+// shrinks it toward the center). `video_id` is still stored (derived from
+// `lesson_id` at insert time, not taken from the caller) only to satisfy
+// the original `NOT NULL` column from 0007 — not used by any query since
+// the lesson-scoping pivot.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct FrameOverlayRow {
+    pub id: String,
+    pub lesson_id: String,
+    pub image_path: String,
+    pub start: f64,
+    pub end: f64,
+    pub scale_percent: f64,
+    /// 0-100: 0 = image's left edge at the frame's left edge, 100 = its
+    /// right edge at the frame's right edge, 50 = centered (see
+    /// `0010_frame_overlay_position.sql`).
+    pub x_percent: f64,
+    /// Same convention as `x_percent`, vertically (top/bottom edges).
+    pub y_percent: f64,
+    pub created_at: String,
+}
+
+fn row_to_frame_overlay(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameOverlayRow> {
+    Ok(FrameOverlayRow {
+        id: row.get("id")?,
+        lesson_id: row.get("lesson_id")?,
+        image_path: row.get("image_path")?,
+        start: row.get("start")?,
+        end: row.get("end")?,
+        scale_percent: row.get("scale_percent")?,
+        x_percent: row.get("x_percent")?,
+        y_percent: row.get("y_percent")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+/// Read-only listing of a lesson's frame overlays, in start-time order.
+#[tauri::command]
+pub fn list_frame_overlays(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+) -> Result<Vec<FrameOverlayRow>, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, lesson_id, image_path, start, end, scale_percent, x_percent, y_percent, created_at
+             FROM frame_overlays WHERE lesson_id = ?1 ORDER BY start",
+        )
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map(params![lesson_id], row_to_frame_overlay)
+        .map_err(|err| err.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())
+}
+
+fn validate_overlay_bounds(
+    start: f64,
+    end: f64,
+    scale_percent: f64,
+    x_percent: f64,
+    y_percent: f64,
+) -> Result<(), String> {
+    if start < 0.0 {
+        return Err(format!("invalid overlay start: {start} must be 0 or greater"));
+    }
+    if start >= end {
+        return Err(format!(
+            "invalid overlay range: start ({start}) must be before end ({end})"
+        ));
+    }
+    if !(scale_percent > 0.0 && scale_percent <= 100.0) {
+        return Err(format!(
+            "invalid overlay scale: {scale_percent}% must be greater than 0 and at most 100"
+        ));
+    }
+    if !(0.0..=100.0).contains(&x_percent) {
+        return Err(format!("invalid overlay x position: {x_percent}% must be between 0 and 100"));
+    }
+    if !(0.0..=100.0).contains(&y_percent) {
+        return Err(format!("invalid overlay y position: {y_percent}% must be between 0 and 100"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn add_frame_overlay(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+    image_path: String,
+    start: f64,
+    end: f64,
+    scale_percent: f64,
+    x_percent: f64,
+    y_percent: f64,
+) -> Result<FrameOverlayRow, String> {
+    validate_overlay_bounds(start, end, scale_percent, x_percent, y_percent)?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    let video_id: String = conn
+        .query_row(
+            "SELECT video_id FROM lessons WHERE id = ?1",
+            params![lesson_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => format!("lesson {lesson_id} does not exist"),
+            other => other.to_string(),
+        })?;
+    conn.execute(
+        "INSERT INTO frame_overlays (id, video_id, lesson_id, image_path, start, end, scale_percent, x_percent, y_percent, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![id, video_id, lesson_id, image_path, start, end, scale_percent, x_percent, y_percent, now],
+    )
+    .map_err(|err| err.to_string())?;
+
+    Ok(FrameOverlayRow {
+        id,
+        lesson_id,
+        image_path,
+        start,
+        end,
+        scale_percent,
+        x_percent,
+        y_percent,
+        created_at: now,
+    })
+}
+
+/// Updates an overlay's timing/size/position in place — unlike
+/// `lesson_segments`, this *does* get a real update command (not delete-
+/// and-re-add): editing an overlay is a routine, frequent action (nudging a
+/// start time, tweaking scale or position) that deserves a proper in-place
+/// edit in the UI rather than forcing a fresh id and losing the row's place
+/// in the list on every tweak. `image_path`/`lesson_id` aren't editable
+/// here — swapping the picture or moving an overlay to a different lesson
+/// is a delete + re-add, same as before.
+#[tauri::command]
+pub fn update_frame_overlay(
+    conn: tauri::State<'_, DbConnection>,
+    id: String,
+    start: f64,
+    end: f64,
+    scale_percent: f64,
+    x_percent: f64,
+    y_percent: f64,
+) -> Result<FrameOverlayRow, String> {
+    validate_overlay_bounds(start, end, scale_percent, x_percent, y_percent)?;
+
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    let affected = conn
+        .execute(
+            "UPDATE frame_overlays SET start = ?1, end = ?2, scale_percent = ?3, x_percent = ?4, y_percent = ?5
+             WHERE id = ?6",
+            params![start, end, scale_percent, x_percent, y_percent, id],
+        )
+        .map_err(|err| err.to_string())?;
+    if affected == 0 {
+        return Err(format!("frame overlay {id} does not exist"));
+    }
+
+    conn.query_row(
+        "SELECT id, lesson_id, image_path, start, end, scale_percent, x_percent, y_percent, created_at
+         FROM frame_overlays WHERE id = ?1",
+        params![id],
+        row_to_frame_overlay,
+    )
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn delete_frame_overlay(conn: tauri::State<'_, DbConnection>, id: String) -> Result<(), String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    conn.execute("DELETE FROM frame_overlays WHERE id = ?1", params![id])
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 /// One `{start, end}` range. Originally just the frontend's Create Lesson

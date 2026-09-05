@@ -351,6 +351,74 @@ export async function reorderLessonSegments(lessonId: string, orderedIds: string
   await invoke("reorder_lesson_segments", { lessonId, orderedIds });
 }
 
+// A still-image overlay composited over a lesson's existing frames for
+// [start, end) *during export only* (`0007_frame_overlays.sql`, lesson-
+// scoped since `0009_frame_overlay_lesson_scoped.sql`) — never spliced into
+// the timeline, never changes video duration/transcript segments/audio.
+// `start`/`end` are *virtual, stitched* seconds into this lesson's own
+// final-video timeline (0 = the start of this lesson's output — same
+// coordinate space as `LessonPreviewPlayer`'s scrubber), not the source
+// recording's raw seconds. `scale_percent` is the image's size as a
+// percentage of the main video's own dimensions at export time (100 = fills
+// the frame; below 100 shrinks the image toward the center, video visible
+// around it). `x_percent`/`y_percent` place the (possibly shrunk) image
+// within the frame: 0 = its left/top edge at the frame's left/top edge, 100
+// = its right/bottom edge at the frame's right/bottom edge, 50 = centered
+// on that axis (`0010_frame_overlay_position.sql`).
+export interface FrameOverlay {
+  id: string;
+  lesson_id: string;
+  image_path: string;
+  start: number;
+  end: number;
+  scale_percent: number;
+  x_percent: number;
+  y_percent: number;
+  created_at: string;
+}
+
+// Read-only listing of a lesson's frame overlays, in start-time order.
+export async function listFrameOverlays(lessonId: string): Promise<FrameOverlay[]> {
+  return invoke<FrameOverlay[]>("list_frame_overlays", { lessonId });
+}
+
+export async function addFrameOverlay(
+  lessonId: string,
+  imagePath: string,
+  start: number,
+  end: number,
+  scalePercent: number,
+  xPercent: number,
+  yPercent: number,
+): Promise<FrameOverlay> {
+  return invoke<FrameOverlay>("add_frame_overlay", {
+    lessonId,
+    imagePath,
+    start,
+    end,
+    scalePercent,
+    xPercent,
+    yPercent,
+  });
+}
+
+// `image_path`/`lesson_id` aren't editable — swapping the picture or moving
+// an overlay to a different lesson is a delete + re-add, same as before.
+export async function updateFrameOverlay(
+  id: string,
+  start: number,
+  end: number,
+  scalePercent: number,
+  xPercent: number,
+  yPercent: number,
+): Promise<FrameOverlay> {
+  return invoke<FrameOverlay>("update_frame_overlay", { id, start, end, scalePercent, xPercent, yPercent });
+}
+
+export async function deleteFrameOverlay(id: string): Promise<void> {
+  await invoke("delete_frame_overlay", { id });
+}
+
 export async function deleteLesson(id: string): Promise<void> {
   await invoke("delete_lesson", { id });
 }

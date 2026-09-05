@@ -3,6 +3,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { Maximize, Minimize2, Pause, Play } from "lucide-react";
 import type { LessonSegment } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
+import { useContainedVideoRect } from "../lib/useContainedVideoRect";
 import SegmentedScrubber from "./SegmentedScrubber";
 import { Button } from "@/components/ui/button";
 import {
@@ -24,6 +25,29 @@ interface LessonPreviewPlayerProps {
    * which operate on the real time, not the virtual stitched-timeline one
    * this component shows in its own scrubber/readout. */
   onTimeUpdate?: (time: number) => void;
+  /** Mirrors this component's own *virtual* (stitched-lesson) current time
+   * up to the parent — needed for placing a new `frame_overlays` row at
+   * "wherever the user is looking in the Final video," since overlays are
+   * now timed in this same virtual coordinate space (see `overlays` below)
+   * rather than the source recording's real seconds. */
+  onVirtualTimeUpdate?: (time: number) => void;
+  /** This lesson's image-overlay ranges (`frame_overlays`, lesson-scoped
+   * since `0009_frame_overlay_lesson_scoped.sql`), with `start`/`end`
+   * already in this component's own virtual (stitched) timeline — no
+   * translation needed against `segmentOffsets` the way a real-time-based
+   * range would (that translation now happens once, at export time, in
+   * `export.rs`'s `overlays_for_segment`, not here). Used two ways: as a
+   * live `<img>` composited over the video (gated on `virtualCurrentTime`),
+   * and as amber marker bands directly on this component's own scrubber. */
+  overlays?: {
+    id: string;
+    image_path: string;
+    start: number;
+    end: number;
+    scale_percent: number;
+    x_percent: number;
+    y_percent: number;
+  }[];
 }
 
 /** The lesson-preview video + its custom controls — factored out of
@@ -37,9 +61,16 @@ export default function LessonPreviewPlayer({
   segments,
   lessonTitle,
   onTimeUpdate,
+  onVirtualTimeUpdate,
+  overlays = [],
 }: LessonPreviewPlayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const overlayContainerRef = useRef<HTMLDivElement | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
+  // Bumped on `loadedmetadata` to tell `useContainedVideoRect` the video's
+  // intrinsic dimensions are now readable — see that hook.
+  const [metadataVersion, setMetadataVersion] = useState(0);
+  const contentRect = useContainedVideoRect(videoRef, overlayContainerRef, metadataVersion);
   const [isPaused, setIsPaused] = useState(true);
   const [playbackRate, setPlaybackRate] = useState(1);
   // A CSS-driven full-viewport overlay rather than the native browser
@@ -133,6 +164,22 @@ export default function LessonPreviewPlayer({
       activeSegment.start
     : 0;
 
+  useEffect(() => {
+    onVirtualTimeUpdate?.(virtualCurrentTime);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [virtualCurrentTime]);
+
+  // Live-preview approximation of the export-time compositing — whichever
+  // overlay(s) contain the current *virtual* playhead position. `overlays`
+  // is already in this same virtual coordinate space (lesson-scoped since
+  // the frame-overlay rework), so no translation is needed here — unlike
+  // the old video-scoped/real-time design, which needed a whole
+  // `segmentOffsets`-based translation step just to place markers on this
+  // scrubber (removed; `markers={overlays}` below is now direct).
+  const activeOverlays = overlays.filter(
+    (overlay) => virtualCurrentTime >= overlay.start && virtualCurrentTime < overlay.end,
+  );
+
   function handleTimeUpdate(event: React.SyntheticEvent<HTMLVideoElement>) {
     const time = event.currentTarget.currentTime;
     setCurrentTime(time);
@@ -187,23 +234,48 @@ export default function LessonPreviewPlayer({
           "lesson-card-player-fullscreen fixed inset-0 z-[1000] flex max-w-none flex-col justify-center bg-black p-4",
       )}
     >
-      <video
-        ref={videoRef}
-        src={convertFileSrc(videoFilePath)}
-        // `lesson-card-video` is kept as a plain hook className (styled
-        // entirely via the Tailwind utilities alongside it) because
-        // `LessonSegmentsView`'s stylesheet forces this element to a shared
-        // height alongside `SourceVideoPreview`'s video via
-        // `.lesson-segments-preview-row .lesson-card-video` — see
-        // styles.css and this phase's report.
-        className={cn(
-          "lesson-card-video block max-h-[25vh] w-full bg-black",
-          isFullscreen && "h-auto max-h-[82vh] w-full",
-        )}
-        onTimeUpdate={handleTimeUpdate}
-        onPlay={() => setIsPaused(false)}
-        onPause={() => setIsPaused(true)}
-      />
+      <div ref={overlayContainerRef} className="relative">
+        <video
+          ref={videoRef}
+          src={convertFileSrc(videoFilePath)}
+          // `lesson-card-video` is kept as a plain hook className (styled
+          // entirely via the Tailwind utilities alongside it) because
+          // `LessonSegmentsView`'s stylesheet forces this element to a shared
+          // height alongside `SourceVideoPreview`'s video via
+          // `.lesson-segments-preview-row .lesson-card-video` — see
+          // styles.css and this phase's report.
+          className={cn(
+            "lesson-card-video block max-h-[25vh] w-full bg-black",
+            isFullscreen && "h-auto max-h-[82vh] w-full",
+          )}
+          onLoadedMetadata={() => setMetadataVersion((v) => v + 1)}
+          onTimeUpdate={handleTimeUpdate}
+          onPlay={() => setIsPaused(false)}
+          onPause={() => setIsPaused(true)}
+        />
+        {/* Positioned against `contentRect` (the video's actual letterboxed
+           content area — see `useContainedVideoRect`), same reasoning as
+           `SourceVideoPreview`'s identical block. */}
+        {contentRect &&
+          activeOverlays.map((overlay) => {
+            const width = contentRect.width * (overlay.scale_percent / 100);
+            const height = contentRect.height * (overlay.scale_percent / 100);
+            return (
+              <img
+                key={overlay.id}
+                src={convertFileSrc(overlay.image_path)}
+                alt=""
+                className="pointer-events-none absolute object-contain"
+                style={{
+                  left: contentRect.left + (contentRect.width - width) * (overlay.x_percent / 100),
+                  top: contentRect.top + (contentRect.height - height) * (overlay.y_percent / 100),
+                  width,
+                  height,
+                }}
+              />
+            );
+          })}
+      </div>
 
       <div className="mt-1 flex items-center gap-2">
         <Button
@@ -252,6 +324,8 @@ export default function LessonPreviewPlayer({
         disabled={segments.length === 0}
         onChange={handleVirtualScrub}
         aria-label={`Scrub lesson ${lessonTitle}`}
+        markers={overlays}
+        duration={totalVirtualDuration}
       />
     </div>
   );

@@ -631,6 +631,78 @@ fn next_queued_export(app: &AppHandle) -> Result<Option<PendingExport>, String> 
     }))
 }
 
+/// Loads the `frame_overlays` rows (lesson-scoped, `start`/`end` in
+/// *virtual* stitched-lesson seconds — see `0009_frame_overlay_lesson_scoped.sql`)
+/// that intersect one particular segment's slice of the lesson's virtual
+/// timeline, translated into that segment's own real, segment-relative
+/// seconds (0 = the start of the cut `export_lesson` is about to make) —
+/// what `crate::ffmpeg::SegmentOverlay` needs.
+///
+/// `segment_offset` is that segment's cumulative virtual-timeline position
+/// (same quantity as `LessonPreviewPlayer.tsx`'s `segmentOffsets[i]` on the
+/// frontend: the summed length of every earlier segment in the lesson) and
+/// `segment_length` is its own duration (`segment.end - segment.start`).
+/// Within one segment, virtual time and real time advance at the same
+/// rate and only differ by a constant offset, so `local_start`/`local_end`
+/// computed relative to `segment_offset` are *already* the real,
+/// segment-relative seconds `SegmentOverlay` wants — no further
+/// translation back through `segment.start` needed, unlike the old
+/// video-scoped/absolute-time version of this function. An overlay that
+/// only partially covers the segment's virtual slice is clipped to just
+/// the overlapping sub-window, not the whole segment.
+///
+/// Takes a plain `&Connection` rather than `&AppHandle` (unlike most of
+/// this module's helpers) so it's directly unit-testable against an
+/// in-memory DB, matching `reconcile_interrupted_exports`'s pattern —
+/// callers lock the app's `DbConnection` state themselves and pass the
+/// guard through.
+fn overlays_for_segment(
+    conn: &Connection,
+    lesson_id: &str,
+    segment_offset: f64,
+    segment_length: f64,
+) -> Result<Vec<crate::ffmpeg::SegmentOverlay>, String> {
+    let segment_virtual_end = segment_offset + segment_length;
+    let mut stmt = conn
+        .prepare(
+            "SELECT image_path, start, end, scale_percent, x_percent, y_percent FROM frame_overlays
+             WHERE lesson_id = ?1 AND start < ?2 AND end > ?3 ORDER BY start",
+        )
+        .map_err(|err| err.to_string())?;
+    let rows: Vec<(String, f64, f64, f64, f64, f64)> = stmt
+        .query_map(params![lesson_id, segment_virtual_end, segment_offset], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    let mut overlays = Vec::with_capacity(rows.len());
+    for (image_path, row_start, row_end, scale_percent, x_percent, y_percent) in rows {
+        let local_start = (row_start - segment_offset).max(0.0);
+        let local_end = (row_end - segment_offset).min(segment_length);
+        if local_end <= local_start {
+            continue;
+        }
+        overlays.push(crate::ffmpeg::SegmentOverlay {
+            image_path,
+            start: local_start,
+            end: local_end,
+            scale_percent,
+            x_percent,
+            y_percent,
+        });
+    }
+    Ok(overlays)
+}
+
 /// Atomically claims `id` for running: `queued` -> `running`, guarded by
 /// `AND status = 'queued'` so this can't clobber a `cancel_export` that runs
 /// in the narrow window between `next_queued_export` picking this row and
@@ -835,6 +907,13 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
 
     if job.segments.len() == 1 {
         let segment = &job.segments[0];
+        let overlays = {
+            let conn = app.state::<DbConnection>();
+            let guard = conn.0.lock().map_err(|err| err.to_string())?;
+            // A single-segment lesson's one segment starts at virtual t=0 —
+            // it *is* the whole lesson's timeline.
+            overlays_for_segment(&guard, &job.lesson_id, 0.0, (segment.end - segment.start).max(0.0))?
+        };
         let register_child = register_child_closure(app, &job.id);
         let on_progress = progress_closure(app, &job.id, 0.0, 1.0, 1.0);
         let result = crate::ffmpeg::export_lesson(
@@ -843,6 +922,7 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
             segment.start,
             segment.end,
             &job.output_path,
+            &overlays,
             register_child,
             on_progress,
         )
@@ -872,6 +952,26 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
             return Err("segment temp path is not valid UTF-8".to_string());
         };
         let segment_duration = (segment.end - segment.start).max(0.0);
+        let overlays = {
+            let conn = app.state::<DbConnection>();
+            let guard = match conn.0.lock() {
+                Ok(guard) => guard,
+                Err(err) => {
+                    cleanup_segment_temp_files(&temp_dir, &temp_paths);
+                    return Err(err.to_string());
+                }
+            };
+            // `elapsed` is this segment's own cumulative virtual-timeline
+            // offset — the summed duration of every segment already cut in
+            // this loop, before this iteration adds its own.
+            match overlays_for_segment(&guard, &job.lesson_id, elapsed, segment_duration) {
+                Ok(overlays) => overlays,
+                Err(err) => {
+                    cleanup_segment_temp_files(&temp_dir, &temp_paths);
+                    return Err(err);
+                }
+            }
+        };
         let register_child = register_child_closure(app, &job.id);
         let on_progress = progress_closure(app, &job.id, elapsed, segment_duration, total_duration);
 
@@ -881,6 +981,7 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
             segment.start,
             segment.end,
             &temp_path_str,
+            &overlays,
             register_child,
             on_progress,
         )
@@ -1157,5 +1258,163 @@ mod reconcile_tests {
             .query_row("SELECT status FROM exports WHERE id = 'e2'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(status, "queued");
+    }
+}
+
+#[cfg(test)]
+mod overlays_for_segment_tests {
+    use super::*;
+
+    /// In-memory, fully-migrated DB seeded with one project/video/lesson —
+    /// `frame_overlays` is lesson-scoped since 0009, with `start`/`end` in
+    /// virtual (stitched-lesson) seconds, not the segment's own real bounds.
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        crate::db::migrate(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Test', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO videos (id, project_id, file_path, created_at, updated_at)
+             VALUES ('v1', 'p1', '/tmp/video.mp4', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO lessons (id, video_id, title, start, end) VALUES ('l1', 'v1', 'Lesson', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        conn
+    }
+
+    fn insert_overlay(conn: &Connection, id: &str, image_path: &str, start: f64, end: f64) {
+        conn.execute(
+            "INSERT INTO frame_overlays (id, video_id, lesson_id, image_path, start, end, created_at)
+             VALUES (?1, 'v1', 'l1', ?2, ?3, ?4, 't')",
+            params![id, image_path, start, end],
+        )
+        .unwrap();
+    }
+
+    /// A segment whose virtual slice is `[10, 20)` — i.e. 10 seconds of
+    /// earlier segments already played (`segment_offset: 10.0`) before this
+    /// one's own 10-second length.
+    const SEGMENT_OFFSET: f64 = 10.0;
+    const SEGMENT_LENGTH: f64 = 10.0;
+
+    #[test]
+    fn overlay_fully_inside_the_segment_is_returned_unclipped() {
+        let conn = seeded_conn();
+        // Virtual [12, 15) falls entirely inside this segment's virtual
+        // slice [10, 20).
+        insert_overlay(&conn, "o1", "/tmp/img.png", 12.0, 15.0);
+
+        let overlays = overlays_for_segment(&conn, "l1", SEGMENT_OFFSET, SEGMENT_LENGTH).unwrap();
+
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].image_path, "/tmp/img.png");
+        assert_eq!(overlays[0].start, 2.0);
+        assert_eq!(overlays[0].end, 5.0);
+        // `insert_overlay` omits `scale_percent`, relying on the column's
+        // `DEFAULT 100` — asserting it here confirms the default actually
+        // flows all the way through the query, not just that the schema has
+        // one.
+        assert_eq!(overlays[0].scale_percent, 100.0);
+    }
+
+    /// A non-default `scale_percent` is read back correctly, not silently
+    /// hardcoded to 100 anywhere in the query/translation path.
+    #[test]
+    fn overlay_scale_percent_is_read_from_the_row() {
+        let conn = seeded_conn();
+        conn.execute(
+            "INSERT INTO frame_overlays (id, video_id, lesson_id, image_path, start, end, scale_percent, created_at)
+             VALUES ('o1', 'v1', 'l1', '/tmp/img.png', 12.0, 15.0, 40.0, 't')",
+            [],
+        )
+        .unwrap();
+
+        let overlays = overlays_for_segment(&conn, "l1", SEGMENT_OFFSET, SEGMENT_LENGTH).unwrap();
+
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].scale_percent, 40.0);
+    }
+
+    /// The overlay only partially covers the segment's virtual slice (it
+    /// starts before the slice and ends inside it) — the sub-window
+    /// returned should be clipped to just the overlapping part, not the
+    /// whole segment.
+    #[test]
+    fn overlay_spanning_a_segment_boundary_is_clipped_to_the_overlap() {
+        let conn = seeded_conn();
+        insert_overlay(&conn, "o1", "/tmp/img.png", 5.0, 15.0);
+
+        let overlays = overlays_for_segment(&conn, "l1", SEGMENT_OFFSET, SEGMENT_LENGTH).unwrap();
+
+        assert_eq!(overlays.len(), 1);
+        // Overlay covers virtual [5, 15); this segment's virtual slice is
+        // [10, 20), so the overlap translated to segment-relative real time
+        // is [0, 5).
+        assert_eq!(overlays[0].start, 0.0);
+        assert_eq!(overlays[0].end, 5.0);
+    }
+
+    /// An overlay spanning *two adjacent* segments (the scenario the whole
+    /// lesson-scoped/virtual-time rework exists for) produces two correctly
+    /// clipped ranges, one per segment call — mirrors what `do_export`'s
+    /// multi-segment loop actually does, one `overlays_for_segment` call
+    /// per segment with its own running `elapsed` offset.
+    #[test]
+    fn overlay_spanning_two_segments_is_clipped_per_segment() {
+        let conn = seeded_conn();
+        // Segment A: virtual [0, 10). Segment B: virtual [10, 20) (matches
+        // SEGMENT_OFFSET/LENGTH above). Overlay covers virtual [8, 14).
+        insert_overlay(&conn, "o1", "/tmp/img.png", 8.0, 14.0);
+
+        let in_a = overlays_for_segment(&conn, "l1", 0.0, 10.0).unwrap();
+        assert_eq!(in_a.len(), 1);
+        assert_eq!(in_a[0].start, 8.0);
+        assert_eq!(in_a[0].end, 10.0);
+
+        let in_b = overlays_for_segment(&conn, "l1", SEGMENT_OFFSET, SEGMENT_LENGTH).unwrap();
+        assert_eq!(in_b.len(), 1);
+        assert_eq!(in_b[0].start, 0.0);
+        assert_eq!(in_b[0].end, 4.0);
+    }
+
+    #[test]
+    fn overlay_outside_the_segment_is_excluded() {
+        let conn = seeded_conn();
+        insert_overlay(&conn, "o1", "/tmp/img.png", 0.0, 5.0);
+
+        let overlays = overlays_for_segment(&conn, "l1", SEGMENT_OFFSET, SEGMENT_LENGTH).unwrap();
+
+        assert!(overlays.is_empty());
+    }
+
+    #[test]
+    fn overlay_for_a_different_lesson_is_excluded() {
+        let conn = seeded_conn();
+        conn.execute(
+            "INSERT INTO lessons (id, video_id, title, start, end) VALUES ('l2', 'v1', 'Other', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frame_overlays (id, video_id, lesson_id, image_path, start, end, created_at)
+             VALUES ('o1', 'v1', 'l2', '/tmp/img.png', 12.0, 15.0, 't')",
+            [],
+        )
+        .unwrap();
+
+        let overlays = overlays_for_segment(&conn, "l1", SEGMENT_OFFSET, SEGMENT_LENGTH).unwrap();
+
+        assert!(overlays.is_empty());
     }
 }

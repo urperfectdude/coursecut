@@ -5,19 +5,24 @@ import LessonPreviewPlayer from "../components/LessonPreviewPlayer";
 import SourceVideoPreview from "../components/SourceVideoPreview";
 import { basename } from "./ProjectDetailView";
 import {
+  addFrameOverlay,
   addLessonSegment,
   applyLessonSegmentEdit,
+  deleteFrameOverlay,
   deleteLessonSegment,
   getProject,
   getVideo,
+  listFrameOverlays,
   listLessonSegments,
   listLessons,
   previewLessonSegmentEdit,
   queueExport,
   reorderLessonSegments,
   splitLesson,
+  updateFrameOverlay,
   updateLesson,
   updateLessonSegment,
+  type FrameOverlay,
   type Lesson,
   type LessonSegment,
   type LessonSegmentRange,
@@ -117,6 +122,21 @@ function diffProposedSegments(
       ),
   );
   return { proposedRows, removed };
+}
+
+/** One just-picked, not-yet-saved image overlay in the multi-select "Insert
+ * image" batch — `id` is a client-side-only key (not a DB id) so each row's
+ * start/duration inputs and per-row remove/error state can be tracked
+ * independently before submit. */
+interface PendingOverlayDraft {
+  id: string;
+  imagePath: string;
+  startDraft: string;
+  durationDraft: string;
+  scalePercentDraft: string;
+  xPercentDraft: string;
+  yPercentDraft: string;
+  error: string | null;
 }
 
 /** One entry on this page's undo/redo stack — covers every segment-mutating
@@ -219,6 +239,24 @@ export default function LessonSegmentsView({
   const [segmentsLoading, setSegmentsLoading] = useState(false);
   const [segmentsError, setSegmentsError] = useState<string | null>(null);
 
+  // Still-image overlays for *this lesson* (`frame_overlays` is lesson-
+  // scoped since `0009_frame_overlay_lesson_scoped.sql` — `start`/`end` are
+  // virtual, stitched-lesson seconds, same coordinate space as
+  // `LessonPreviewPlayer`'s own scrubber), for export-time compositing
+  // only. `pendingOverlays` holds zero or more just-picked files (multi-
+  // select), each with its own editable start/duration draft, none yet
+  // written to the DB until "Add" submits the batch (one `addFrameOverlay`
+  // call per row, so a user can drop several images at several different
+  // timestamps in one picker trip). `editingOverlay` is the *saved* overlay
+  // currently open for in-place editing (mutually exclusive with adding new
+  // ones, for simplicity) — see `handleStartEditOverlay`/`handleSaveEditOverlay`.
+  const [overlays, setOverlays] = useState<FrameOverlay[]>([]);
+  const [overlaysLoading, setOverlaysLoading] = useState(false);
+  const [overlaysError, setOverlaysError] = useState<string | null>(null);
+  const [pendingOverlays, setPendingOverlays] = useState<PendingOverlayDraft[]>([]);
+  const [overlayFormBusy, setOverlayFormBusy] = useState(false);
+  const [editingOverlay, setEditingOverlay] = useState<PendingOverlayDraft | null>(null);
+
   // The lesson's summary is only editable here now (not on the grid
   // tile) — same draft-then-commit-on-blur pattern used for the segment
   // start/end fields below, just a single field rather than one per row.
@@ -247,6 +285,13 @@ export default function LessonSegmentsView({
   // (shared with the source player) so scrubbing the *original* recording
   // doesn't imply a segment is "playing" in the final, stitched video.
   const [finalVideoTime, setFinalVideoTime] = useState(0);
+  // The Final video panel's own *virtual* (stitched-lesson) playhead
+  // position — 0 at the very start of this lesson's output, regardless of
+  // where that content originally sat in the source recording. This is the
+  // coordinate space `frame_overlays.start`/`.end` are stored in, so a
+  // freshly-inserted overlay's default Start is anchored to this, not
+  // `finalVideoTime` (which is real/source time).
+  const [finalVirtualTime, setFinalVirtualTime] = useState(0);
 
   // Draft values for the per-segment start/end numeric inputs, keyed by
   // segment id — same draft-then-commit-on-blur pattern as the summary
@@ -337,6 +382,285 @@ export default function LessonSegmentsView({
   useEffect(() => {
     void fetchSegments();
   }, [fetchSegments]);
+
+  const fetchOverlays = useCallback(async () => {
+    setOverlaysLoading(true);
+    setOverlaysError(null);
+    try {
+      setOverlays(await listFrameOverlays(lessonId));
+    } catch (err) {
+      setOverlaysError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setOverlaysLoading(false);
+    }
+  }, [lessonId]);
+
+  useEffect(() => {
+    void fetchOverlays();
+  }, [fetchOverlays]);
+
+  // Opens the OS file picker scoped to still images, multi-select enabled,
+  // then opens one inline start/duration row per picked file below "Insert
+  // image" — nothing is written to the DB until the batch submit
+  // (`handleAddPendingOverlays`). Default starts are anchored to
+  // `finalVirtualTime` — the Final video panel's own *virtual* playhead
+  // position (0 at the start of this lesson's stitched output), matching
+  // the coordinate space overlays are now stored in — then staggered 3s
+  // apart so multiple images don't land on the exact same timestamp by
+  // default; each row remains individually editable before submit.
+  const handlePickOverlayImage = useCallback(async () => {
+    setOverlaysError(null);
+    try {
+      const picked = await open({
+        multiple: true,
+        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }],
+      });
+      if (!picked || picked.length === 0) return;
+      setEditingOverlay(null);
+      const drafts: PendingOverlayDraft[] = picked.map((path, index) => ({
+        id: crypto.randomUUID(),
+        imagePath: path,
+        startDraft: formatTimestampMs(finalVirtualTime + index * 3),
+        durationDraft: "3",
+        scalePercentDraft: "100",
+        xPercentDraft: "50",
+        yPercentDraft: "50",
+        error: null,
+      }));
+      setPendingOverlays((prev) => [...prev, ...drafts]);
+    } catch (err) {
+      setOverlaysError(err instanceof Error ? err.message : String(err));
+    }
+  }, [finalVirtualTime]);
+
+  const handleCancelOverlayForm = useCallback(() => {
+    setPendingOverlays([]);
+  }, []);
+
+  const handleRemovePendingOverlay = useCallback((id: string) => {
+    setPendingOverlays((prev) => prev.filter((draft) => draft.id !== id));
+  }, []);
+
+  const handlePendingOverlayFieldChange = useCallback(
+    (id: string, field: "startDraft" | "durationDraft" | "scalePercentDraft" | "xPercentDraft" | "yPercentDraft", value: string) => {
+      setPendingOverlays((prev) =>
+        prev.map((draft) => (draft.id === id ? { ...draft, [field]: value, error: null } : draft)),
+      );
+    },
+    [],
+  );
+
+  // ▲/▼ nudge for a pending row's Start field, same 10ms step as the
+  // segment Start/End editor's spinner (`BOUND_STEP_SECONDS`, defined below
+  // — inlined here rather than referenced, since this callback is declared
+  // above that `const`). No DB write here (unlike `adjustSegmentBound`),
+  // just updates the local draft, since nothing is persisted until the
+  // whole batch submits.
+  const handleNudgePendingOverlayStart = useCallback((id: string, direction: 1 | -1) => {
+    setPendingOverlays((prev) =>
+      prev.map((draft) => {
+        if (draft.id !== id) return draft;
+        const current = parseTimestampMs(draft.startDraft) ?? 0;
+        const next = Math.max(0, current + direction * 0.01);
+        return { ...draft, startDraft: formatTimestampMs(next), error: null };
+      }),
+    );
+  }, []);
+
+  // Submits every pending row as its own `addFrameOverlay` call (sequential,
+  // not parallel, to avoid hammering the single SQLite connection with a
+  // burst of concurrent writes). A row that fails validation or the IPC call
+  // keeps its place in the batch with its own error message so the user can
+  // fix just that row and resubmit, rather than the whole batch being
+  // silently dropped or retried from scratch.
+  const handleAddPendingOverlays = useCallback(async () => {
+    if (pendingOverlays.length === 0 || overlayFormBusy) return;
+    setOverlayFormBusy(true);
+    const remaining: PendingOverlayDraft[] = [];
+    try {
+      for (const draft of pendingOverlays) {
+        const start = parseTimestampMs(draft.startDraft);
+        if (start === null) {
+          remaining.push({ ...draft, error: "Start must be in hh:mm:ss:fff format." });
+          continue;
+        }
+        const duration = Number(draft.durationDraft);
+        if (!(duration > 0)) {
+          remaining.push({ ...draft, error: "Duration must be greater than 0." });
+          continue;
+        }
+        const scalePercent = Number(draft.scalePercentDraft);
+        if (!(scalePercent > 0 && scalePercent <= 100)) {
+          remaining.push({ ...draft, error: "Scale must be greater than 0 and at most 100%." });
+          continue;
+        }
+        const xPercent = Number(draft.xPercentDraft);
+        const yPercent = Number(draft.yPercentDraft);
+        if (!(xPercent >= 0 && xPercent <= 100 && yPercent >= 0 && yPercent <= 100)) {
+          remaining.push({ ...draft, error: "X and Y must be between 0 and 100." });
+          continue;
+        }
+        try {
+          await addFrameOverlay(lessonId, draft.imagePath, start, start + duration, scalePercent, xPercent, yPercent);
+        } catch (err) {
+          remaining.push({ ...draft, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      setPendingOverlays(remaining);
+      await fetchOverlays();
+    } finally {
+      setOverlayFormBusy(false);
+    }
+  }, [pendingOverlays, overlayFormBusy, fetchOverlays, lessonId]);
+
+  const handleDeleteOverlay = useCallback(async (id: string) => {
+    setOverlaysError(null);
+    try {
+      await deleteFrameOverlay(id);
+      setOverlays((prev) => prev.filter((overlay) => overlay.id !== id));
+      setEditingOverlay((prev) => (prev?.id === id ? null : prev));
+    } catch (err) {
+      setOverlaysError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  // Opens the in-place edit form for a *saved* overlay, pre-filled from its
+  // current values — mutually exclusive with the "Insert image" batch form
+  // (clears any pending new-image drafts), since showing both at once would
+  // be confusing about which "Add"/"Save" applies to what.
+  const handleStartEditOverlay = useCallback((overlay: FrameOverlay) => {
+    setPendingOverlays([]);
+    setOverlaysError(null);
+    setEditingOverlay({
+      id: overlay.id,
+      imagePath: overlay.image_path,
+      startDraft: formatTimestampMs(overlay.start),
+      durationDraft: (overlay.end - overlay.start).toString(),
+      scalePercentDraft: overlay.scale_percent.toString(),
+      xPercentDraft: overlay.x_percent.toString(),
+      yPercentDraft: overlay.y_percent.toString(),
+      error: null,
+    });
+  }, []);
+
+  const handleCancelEditOverlay = useCallback(() => {
+    setEditingOverlay(null);
+  }, []);
+
+  const handleEditOverlayFieldChange = useCallback(
+    (field: "startDraft" | "durationDraft" | "scalePercentDraft" | "xPercentDraft" | "yPercentDraft", value: string) => {
+      setEditingOverlay((prev) => (prev ? { ...prev, [field]: value, error: null } : prev));
+    },
+    [],
+  );
+
+  const handleNudgeEditOverlayStart = useCallback((direction: 1 | -1) => {
+    setEditingOverlay((prev) => {
+      if (!prev) return prev;
+      const current = parseTimestampMs(prev.startDraft) ?? 0;
+      const next = Math.max(0, current + direction * 0.01);
+      return { ...prev, startDraft: formatTimestampMs(next), error: null };
+    });
+  }, []);
+
+  const handleSaveEditOverlay = useCallback(async () => {
+    if (!editingOverlay || overlayFormBusy) return;
+    const start = parseTimestampMs(editingOverlay.startDraft);
+    if (start === null) {
+      setEditingOverlay((prev) => (prev ? { ...prev, error: "Start must be in hh:mm:ss:fff format." } : prev));
+      return;
+    }
+    const duration = Number(editingOverlay.durationDraft);
+    if (!(duration > 0)) {
+      setEditingOverlay((prev) => (prev ? { ...prev, error: "Duration must be greater than 0." } : prev));
+      return;
+    }
+    const scalePercent = Number(editingOverlay.scalePercentDraft);
+    if (!(scalePercent > 0 && scalePercent <= 100)) {
+      setEditingOverlay((prev) =>
+        prev ? { ...prev, error: "Scale must be greater than 0 and at most 100%." } : prev,
+      );
+      return;
+    }
+    const xPercent = Number(editingOverlay.xPercentDraft);
+    const yPercent = Number(editingOverlay.yPercentDraft);
+    if (!(xPercent >= 0 && xPercent <= 100 && yPercent >= 0 && yPercent <= 100)) {
+      setEditingOverlay((prev) => (prev ? { ...prev, error: "X and Y must be between 0 and 100." } : prev));
+      return;
+    }
+    setOverlayFormBusy(true);
+    try {
+      await updateFrameOverlay(editingOverlay.id, start, start + duration, scalePercent, xPercent, yPercent);
+      setEditingOverlay(null);
+      await fetchOverlays();
+    } catch (err) {
+      setEditingOverlay((prev) =>
+        prev ? { ...prev, error: err instanceof Error ? err.message : String(err) } : prev,
+      );
+    } finally {
+      setOverlayFormBusy(false);
+    }
+  }, [editingOverlay, overlayFormBusy, fetchOverlays]);
+
+  // Best-effort parse of one overlay draft's fields into a live-preview
+  // `FrameOverlay` shape — returns `null` for a draft that's currently
+  // mid-edit/invalid (e.g. a half-typed Start), so an in-progress edit
+  // simply doesn't show a preview yet rather than showing a wrong one.
+  // `id`/`created_at` don't matter for preview purposes beyond being a
+  // stable React key.
+  const parseOverlayDraftForPreview = useCallback(
+    (id: string, imagePath: string, draft: {
+      startDraft: string;
+      durationDraft: string;
+      scalePercentDraft: string;
+      xPercentDraft: string;
+      yPercentDraft: string;
+    }): FrameOverlay | null => {
+      const start = parseTimestampMs(draft.startDraft);
+      const duration = Number(draft.durationDraft);
+      const scalePercent = Number(draft.scalePercentDraft);
+      const xPercent = Number(draft.xPercentDraft);
+      const yPercent = Number(draft.yPercentDraft);
+      if (
+        start === null ||
+        !(duration > 0) ||
+        !(scalePercent > 0 && scalePercent <= 100) ||
+        !(xPercent >= 0 && xPercent <= 100) ||
+        !(yPercent >= 0 && yPercent <= 100)
+      ) {
+        return null;
+      }
+      return {
+        id,
+        lesson_id: lessonId,
+        image_path: imagePath,
+        start,
+        end: start + duration,
+        scale_percent: scalePercent,
+        x_percent: xPercent,
+        y_percent: yPercent,
+        created_at: "",
+      };
+    },
+    [lessonId],
+  );
+
+  // What the Final video player actually renders/marks — the saved
+  // `overlays` (minus whichever one is currently being edited, so its
+  // stale saved values don't show alongside the live edit draft), plus a
+  // live preview of the in-progress edit and every pending "Insert image"
+  // draft. This is what makes the live preview show *before* "Add" is
+  // clicked, not just after.
+  const previewOverlays = useMemo(() => {
+    const savedMinusEditing = overlays.filter((overlay) => overlay.id !== editingOverlay?.id);
+    const editingPreview = editingOverlay
+      ? parseOverlayDraftForPreview(editingOverlay.id, editingOverlay.imagePath, editingOverlay)
+      : null;
+    const pendingPreviews = pendingOverlays
+      .map((draft) => parseOverlayDraftForPreview(draft.id, draft.imagePath, draft))
+      .filter((overlay): overlay is FrameOverlay => overlay !== null);
+    return [...savedMinusEditing, ...(editingPreview ? [editingPreview] : []), ...pendingPreviews];
+  }, [overlays, editingOverlay, pendingOverlays, parseOverlayDraftForPreview]);
 
   const pushUndo = useCallback((action: UndoableAction) => {
     setUndoStack((prev) => [...prev, action]);
@@ -1057,10 +1381,12 @@ export default function LessonSegmentsView({
                 videoFilePath={video.file_path}
                 segments={segments}
                 lessonTitle={lesson.title}
+                overlays={previewOverlays}
                 onTimeUpdate={(time) => {
                   setCurrentTime(time);
                   setFinalVideoTime(time);
                 }}
+                onVirtualTimeUpdate={setFinalVirtualTime}
               />
               {segmentsLoading && <p>Loading segments…</p>}
               {segmentsError && <p className="error">{segmentsError}</p>}
@@ -1255,6 +1581,355 @@ export default function LessonSegmentsView({
               );
             })}
           </ul>
+
+          {/* Still-image overlays composited over this lesson's own final
+             video, live in preview and at export time (`0007_frame_overlays.sql`,
+             lesson-scoped since `0009_frame_overlay_lesson_scoped.sql`) —
+             never spliced into the timeline, so video duration/transcript
+             segments/audio are untouched. `start`/`end` are virtual,
+             stitched-lesson seconds (0 = the start of this lesson's own
+             output), matching the Final video player's own scrubber — not
+             shareable across other lessons of the same video. Each overlay
+             has its own scale_percent (100 = fills the frame, lower shrinks
+             toward the center). */}
+          <div className="mt-6 border-t border-border pt-4">
+            <p className="mb-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+              Image overlays
+            </p>
+
+            <div className="flex flex-wrap items-end gap-3">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={overlayFormBusy}
+                onClick={() => void handlePickOverlayImage()}
+              >
+                Insert image{pendingOverlays.length > 0 ? "s" : ""}
+              </Button>
+            </div>
+
+            {pendingOverlays.length > 0 && (
+              <div className="mt-3 flex flex-col gap-2 rounded-md border border-border p-2">
+                {pendingOverlays.map((draft) => (
+                  <div key={draft.id} className="flex flex-wrap items-end gap-3">
+                    <span className="min-w-0 flex-1 truncate text-xs">{basename(draft.imagePath)}</span>
+                    <label className="flex flex-col gap-0.5 text-xs">
+                      Start
+                      <div className="relative">
+                        <Input
+                          type="text"
+                          inputMode="numeric"
+                          pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                          placeholder="hh:mm:ss:fff"
+                          disabled={overlayFormBusy}
+                          value={draft.startDraft}
+                          onChange={(event) =>
+                            handlePendingOverlayFieldChange(draft.id, "startDraft", event.target.value)
+                          }
+                          aria-label={`Start time for ${basename(draft.imagePath)}`}
+                          className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
+                        />
+                        <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-xs"
+                            disabled={overlayFormBusy}
+                            onClick={() => handleNudgePendingOverlayStart(draft.id, 1)}
+                            aria-label={`Increase start time for ${basename(draft.imagePath)}`}
+                            className="h-3 w-4 [&_svg]:size-2.5"
+                          >
+                            <ChevronUp />
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-xs"
+                            disabled={overlayFormBusy}
+                            onClick={() => handleNudgePendingOverlayStart(draft.id, -1)}
+                            aria-label={`Decrease start time for ${basename(draft.imagePath)}`}
+                            className="h-3 w-4 [&_svg]:size-2.5"
+                          >
+                            <ChevronDown />
+                          </Button>
+                        </div>
+                      </div>
+                    </label>
+                    <label className="flex flex-col gap-0.5 text-xs">
+                      Duration (s)
+                      <Input
+                        type="number"
+                        min="0.1"
+                        step="0.1"
+                        disabled={overlayFormBusy}
+                        value={draft.durationDraft}
+                        onChange={(event) =>
+                          handlePendingOverlayFieldChange(draft.id, "durationDraft", event.target.value)
+                        }
+                        aria-label={`Duration in seconds for ${basename(draft.imagePath)}`}
+                        className="h-7 w-20 text-xs tabular-nums"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5 text-xs">
+                      Scale (%)
+                      <Input
+                        type="number"
+                        min="1"
+                        max="100"
+                        step="1"
+                        disabled={overlayFormBusy}
+                        value={draft.scalePercentDraft}
+                        onChange={(event) =>
+                          handlePendingOverlayFieldChange(draft.id, "scalePercentDraft", event.target.value)
+                        }
+                        aria-label={`Scale percent for ${basename(draft.imagePath)}`}
+                        title="100% fills the frame; lower values shrink the image toward the center"
+                        className="h-7 w-16 text-xs tabular-nums"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5 text-xs">
+                      X (%)
+                      <Input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="1"
+                        disabled={overlayFormBusy}
+                        value={draft.xPercentDraft}
+                        onChange={(event) =>
+                          handlePendingOverlayFieldChange(draft.id, "xPercentDraft", event.target.value)
+                        }
+                        aria-label={`Horizontal position for ${basename(draft.imagePath)}`}
+                        title="0 = left edge, 50 = centered, 100 = right edge"
+                        className="h-7 w-16 text-xs tabular-nums"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5 text-xs">
+                      Y (%)
+                      <Input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="1"
+                        disabled={overlayFormBusy}
+                        value={draft.yPercentDraft}
+                        onChange={(event) =>
+                          handlePendingOverlayFieldChange(draft.id, "yPercentDraft", event.target.value)
+                        }
+                        aria-label={`Vertical position for ${basename(draft.imagePath)}`}
+                        title="0 = top edge, 50 = centered, 100 = bottom edge"
+                        className="h-7 w-16 text-xs tabular-nums"
+                      />
+                    </label>
+                    <Button
+                      type="button"
+                      size="icon-sm"
+                      variant="ghost"
+                      disabled={overlayFormBusy}
+                      aria-label={`Remove ${basename(draft.imagePath)} from batch`}
+                      title="Remove from batch"
+                      onClick={() => handleRemovePendingOverlay(draft.id)}
+                    >
+                      <Trash2 />
+                    </Button>
+                    {draft.error && <p className="w-full text-xs text-destructive">{draft.error}</p>}
+                  </div>
+                ))}
+
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={overlayFormBusy}
+                    onClick={() => void handleAddPendingOverlays()}
+                  >
+                    {overlayFormBusy
+                      ? "Adding…"
+                      : `Add ${pendingOverlays.length} overlay${pendingOverlays.length === 1 ? "" : "s"}`}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={overlayFormBusy}
+                    onClick={handleCancelOverlayForm}
+                  >
+                    Cancel all
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {overlaysError && <p className="mt-2 text-sm text-destructive">{overlaysError}</p>}
+            {overlaysLoading && <p className="mt-2 text-sm text-muted-foreground">Loading overlays…</p>}
+
+            <ul className="m-0 mt-3 flex list-none flex-col gap-1 p-0">
+              {overlays.map((overlay) =>
+                editingOverlay?.id === overlay.id ? (
+                  <li key={overlay.id} className="border-b border-border py-1.5 px-2 last:border-b-0">
+                    <div className="flex flex-wrap items-end gap-3">
+                      <span className="min-w-0 flex-1 truncate text-xs">{basename(overlay.image_path)}</span>
+                      <label className="flex flex-col gap-0.5 text-xs">
+                        Start
+                        <div className="relative">
+                          <Input
+                            type="text"
+                            inputMode="numeric"
+                            pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                            placeholder="hh:mm:ss:fff"
+                            disabled={overlayFormBusy}
+                            value={editingOverlay.startDraft}
+                            onChange={(event) => handleEditOverlayFieldChange("startDraft", event.target.value)}
+                            aria-label={`Start time for ${basename(overlay.image_path)}`}
+                            className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
+                          />
+                          <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              disabled={overlayFormBusy}
+                              onClick={() => handleNudgeEditOverlayStart(1)}
+                              aria-label={`Increase start time for ${basename(overlay.image_path)}`}
+                              className="h-3 w-4 [&_svg]:size-2.5"
+                            >
+                              <ChevronUp />
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              disabled={overlayFormBusy}
+                              onClick={() => handleNudgeEditOverlayStart(-1)}
+                              aria-label={`Decrease start time for ${basename(overlay.image_path)}`}
+                              className="h-3 w-4 [&_svg]:size-2.5"
+                            >
+                              <ChevronDown />
+                            </Button>
+                          </div>
+                        </div>
+                      </label>
+                      <label className="flex flex-col gap-0.5 text-xs">
+                        Duration (s)
+                        <Input
+                          type="number"
+                          min="0.1"
+                          step="0.1"
+                          disabled={overlayFormBusy}
+                          value={editingOverlay.durationDraft}
+                          onChange={(event) => handleEditOverlayFieldChange("durationDraft", event.target.value)}
+                          aria-label={`Duration in seconds for ${basename(overlay.image_path)}`}
+                          className="h-7 w-20 text-xs tabular-nums"
+                        />
+                      </label>
+                      <label className="flex flex-col gap-0.5 text-xs">
+                        Scale (%)
+                        <Input
+                          type="number"
+                          min="1"
+                          max="100"
+                          step="1"
+                          disabled={overlayFormBusy}
+                          value={editingOverlay.scalePercentDraft}
+                          onChange={(event) =>
+                            handleEditOverlayFieldChange("scalePercentDraft", event.target.value)
+                          }
+                          aria-label={`Scale percent for ${basename(overlay.image_path)}`}
+                          title="100% fills the frame; lower values shrink the image toward the center"
+                          className="h-7 w-16 text-xs tabular-nums"
+                        />
+                      </label>
+                      <label className="flex flex-col gap-0.5 text-xs">
+                        X (%)
+                        <Input
+                          type="number"
+                          min="0"
+                          max="100"
+                          step="1"
+                          disabled={overlayFormBusy}
+                          value={editingOverlay.xPercentDraft}
+                          onChange={(event) => handleEditOverlayFieldChange("xPercentDraft", event.target.value)}
+                          aria-label={`Horizontal position for ${basename(overlay.image_path)}`}
+                          title="0 = left edge, 50 = centered, 100 = right edge"
+                          className="h-7 w-16 text-xs tabular-nums"
+                        />
+                      </label>
+                      <label className="flex flex-col gap-0.5 text-xs">
+                        Y (%)
+                        <Input
+                          type="number"
+                          min="0"
+                          max="100"
+                          step="1"
+                          disabled={overlayFormBusy}
+                          value={editingOverlay.yPercentDraft}
+                          onChange={(event) => handleEditOverlayFieldChange("yPercentDraft", event.target.value)}
+                          aria-label={`Vertical position for ${basename(overlay.image_path)}`}
+                          title="0 = top edge, 50 = centered, 100 = bottom edge"
+                          className="h-7 w-16 text-xs tabular-nums"
+                        />
+                      </label>
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={overlayFormBusy}
+                        onClick={() => void handleSaveEditOverlay()}
+                      >
+                        {overlayFormBusy ? "Saving…" : "Save"}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        disabled={overlayFormBusy}
+                        onClick={handleCancelEditOverlay}
+                      >
+                        Cancel
+                      </Button>
+                      {editingOverlay.error && (
+                        <p className="w-full text-xs text-destructive">{editingOverlay.error}</p>
+                      )}
+                    </div>
+                  </li>
+                ) : (
+                  <li
+                    key={overlay.id}
+                    className="flex items-center justify-between gap-2 border-b border-border py-1.5 px-2 text-sm last:border-b-0"
+                  >
+                    <span className="truncate">{basename(overlay.image_path)}</span>
+                    <span className="tabular-nums text-muted-foreground">
+                      {formatTimestamp(overlay.start)}–{formatTimestamp(overlay.end)} · {overlay.scale_percent}% ·{" "}
+                      {overlay.x_percent}/{overlay.y_percent}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Edit overlay ${basename(overlay.image_path)}`}
+                      title="Edit overlay"
+                      onClick={() => handleStartEditOverlay(overlay)}
+                    >
+                      <Pencil />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="icon-sm"
+                      aria-label={`Delete overlay ${basename(overlay.image_path)}`}
+                      title="Delete overlay"
+                      onClick={() => void handleDeleteOverlay(overlay.id)}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </li>
+                ),
+              )}
+              {overlays.length === 0 && !overlaysLoading && (
+                <li className="text-sm text-muted-foreground">No image overlays yet.</li>
+              )}
+            </ul>
+          </div>
 
           {proposedSegments !== null && (
             <LessonAiEditReviewModal
