@@ -99,6 +99,27 @@ export async function extractAudioForVideo(videoId: string, attempt: number): Pr
   return invoke<Video>("extract_audio_for_video", { videoId, attempt });
 }
 
+// Cuts `[start, end)` out of `videoId`'s source video into a small local
+// WAV clip for segment playback (`TranscriptStageView`) — some real
+// recordings have a container layout the webview's own media decoder is
+// unreliable with, so this always plays a fresh, plain, single-track clip
+// rather than seeking within the original file directly. Returns the local
+// temp file path; pass it to `convertFileSrc` before using it as a media
+// element's `src`. Caller must eventually pass the same path to
+// `deletePlaybackClip` once done with it.
+export async function prepareSegmentPlaybackClip(
+  videoId: string,
+  start: number,
+  end: number,
+): Promise<string> {
+  return invoke<string>("prepare_segment_playback_clip", { videoId, start, end });
+}
+
+// Deletes a temp clip previously returned by `prepareSegmentPlaybackClip`.
+export async function deletePlaybackClip(path: string): Promise<void> {
+  await invoke("delete_playback_clip", { path });
+}
+
 export interface TranscriptSegment {
   id: string;
   video_id: string;

@@ -102,6 +102,8 @@ pub struct TranscriptSegment {
 struct WhisperResponse {
     #[serde(default)]
     segments: Vec<WhisperSegment>,
+    #[serde(default)]
+    words: Vec<WhisperWord>,
 }
 
 #[derive(serde::Deserialize)]
@@ -109,6 +111,15 @@ struct WhisperSegment {
     start: f64,
     end: f64,
     text: String,
+}
+
+/// One word-level timestamp, requested alongside segments (see
+/// `upload_chunk`'s `timestamp_granularities[]` fields) specifically to
+/// tighten segment boundaries — see `tighten_segment_bounds_to_words`.
+#[derive(serde::Deserialize)]
+struct WhisperWord {
+    start: f64,
+    end: f64,
 }
 
 /// Whisper's documented upload cap is 25MB. This is kept comfortably under
@@ -140,8 +151,10 @@ const CHUNK_DURATION_THRESHOLD_SECS: f64 = 600.0;
 
 /// Uploads the local file at `audio_path` to OpenAI's Whisper API
 /// (`POST /v1/audio/transcriptions`, `model=whisper-1`,
-/// `response_format=verbose_json` for segment-level timestamps) and parses
-/// the response into `TranscriptSegment`s.
+/// `response_format=verbose_json` for segment-level timestamps, plus
+/// word-level ones used to tighten them — see
+/// `tighten_segment_bounds_to_words`) and parses the response into
+/// `TranscriptSegment`s.
 ///
 /// Whisper caps uploads at 25MB (`SAFE_UPLOAD_BYTES` is a safe margin
 /// under that) for every model it offers — no model choice or parameter
@@ -298,6 +311,127 @@ fn mime_for(file_name: &str) -> &'static str {
     }
 }
 
+/// Tightens each segment's `start`/`end` to the actual first/last word
+/// spoken within it, using Whisper's word-level timestamps rather than
+/// trusting its own segment-level boundaries. Whisper's segment boundaries
+/// are known to be loose around silence: a segment following a quiet
+/// stretch routinely absorbs several seconds of that silence into its own
+/// `start` (and, symmetrically, trailing silence into `end`) instead of
+/// starting/ending exactly where speech does — word timestamps, from the
+/// same response, are considerably tighter.
+///
+/// A word is assigned to whichever segment's *original* `[start, end)`
+/// range its own `start` falls in; a segment with no matching words (rare
+/// — only if Whisper's word list disagrees enough with its own segment
+/// list to leave a gap, or the segment's text was empty/zero-width to
+/// begin with) keeps its original bounds rather than collapsing to
+/// something degenerate. A word landing in a real gap *between* two
+/// segments (silence Whisper already represented as a gap, not absorbed
+/// into either segment) is simply left unused — this function only ever
+/// tightens existing segments, never invents new ones from words.
+fn tighten_segment_bounds_to_words(
+    segments: Vec<WhisperSegment>,
+    words: &[WhisperWord],
+) -> Vec<WhisperSegment> {
+    segments
+        .into_iter()
+        .map(|segment| {
+            let matching = words
+                .iter()
+                .filter(|word| word.start >= segment.start && word.start < segment.end);
+            let (mut tight_start, mut tight_end) = (f64::INFINITY, f64::NEG_INFINITY);
+            for word in matching {
+                tight_start = tight_start.min(word.start);
+                tight_end = tight_end.max(word.end);
+            }
+            if !tight_start.is_finite() || !tight_end.is_finite() {
+                return segment;
+            }
+            WhisperSegment {
+                start: tight_start,
+                end: tight_end,
+                text: segment.text,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tighten_segment_bounds_tests {
+    use super::{tighten_segment_bounds_to_words, WhisperSegment, WhisperWord};
+
+    fn segment(start: f64, end: f64) -> WhisperSegment {
+        WhisperSegment {
+            start,
+            end,
+            text: "text".to_string(),
+        }
+    }
+
+    fn word(start: f64, end: f64) -> WhisperWord {
+        WhisperWord { start, end }
+    }
+
+    #[test]
+    fn tightens_leading_silence_absorbed_into_a_segments_start() {
+        // Segment claims to start at 534s (00:08:54), but the first real
+        // word doesn't start until 550s — matches the reported bug.
+        let segments = vec![segment(534.0, 555.0)];
+        let words = vec![word(550.0, 551.0), word(551.5, 553.0), word(553.5, 554.8)];
+
+        let tightened = tighten_segment_bounds_to_words(segments, &words);
+
+        assert_eq!(tightened[0].start, 550.0);
+        assert_eq!(tightened[0].end, 554.8);
+    }
+
+    #[test]
+    fn tightens_trailing_silence_absorbed_into_a_segments_end() {
+        let segments = vec![segment(100.0, 130.0)];
+        let words = vec![word(100.5, 101.0), word(101.5, 108.2)];
+
+        let tightened = tighten_segment_bounds_to_words(segments, &words);
+
+        assert_eq!(tightened[0].start, 100.5);
+        assert_eq!(tightened[0].end, 108.2);
+    }
+
+    #[test]
+    fn segment_with_no_matching_words_keeps_its_original_bounds() {
+        let segments = vec![segment(200.0, 210.0)];
+        let words = vec![word(50.0, 51.0), word(300.0, 301.0)];
+
+        let tightened = tighten_segment_bounds_to_words(segments, &words);
+
+        assert_eq!(tightened[0].start, 200.0);
+        assert_eq!(tightened[0].end, 210.0);
+    }
+
+    #[test]
+    fn each_segment_only_pulls_words_from_its_own_original_range() {
+        let segments = vec![segment(0.0, 10.0), segment(10.0, 20.0)];
+        let words = vec![word(1.0, 2.0), word(11.0, 12.0), word(18.0, 19.5)];
+
+        let tightened = tighten_segment_bounds_to_words(segments, &words);
+
+        assert_eq!((tightened[0].start, tightened[0].end), (1.0, 2.0));
+        assert_eq!((tightened[1].start, tightened[1].end), (11.0, 19.5));
+    }
+
+    #[test]
+    fn a_word_in_a_real_gap_between_segments_is_left_unused() {
+        // Gap [10, 15) between the two segments — a word landing there
+        // shouldn't be absorbed by either.
+        let segments = vec![segment(0.0, 10.0), segment(15.0, 25.0)];
+        let words = vec![word(5.0, 6.0), word(12.0, 12.5), word(20.0, 21.0)];
+
+        let tightened = tighten_segment_bounds_to_words(segments, &words);
+
+        assert_eq!((tightened[0].start, tightened[0].end), (5.0, 6.0));
+        assert_eq!((tightened[1].start, tightened[1].end), (20.0, 21.0));
+    }
+}
+
 /// Uploads a single already-in-memory audio file (a whole recording, or one
 /// WAV chunk of a legacy oversized one) to Whisper and parses the response
 /// into `TranscriptSegment`s, with timestamps relative to the start of
@@ -317,6 +451,13 @@ async fn upload_chunk(
     let form = reqwest::multipart::Form::new()
         .text("model", "whisper-1")
         .text("response_format", "verbose_json")
+        // Requesting word-level timestamps alongside the default segment
+        // ones costs nothing extra (same request, same response) and lets
+        // `tighten_segment_bounds_to_words` correct Whisper's own
+        // segment-level boundaries, which are known to be loose around
+        // silence (see that function's doc comment).
+        .text("timestamp_granularities[]", "word")
+        .text("timestamp_granularities[]", "segment")
         .part("file", file_part);
 
     // Transcription of a full lecture recording (or a ~10-minute chunk of
@@ -349,8 +490,7 @@ async fn upload_chunk(
         .await
         .map_err(|err| format!("could not parse Whisper response: {err}"))?;
 
-    Ok(parsed
-        .segments
+    Ok(tighten_segment_bounds_to_words(parsed.segments, &parsed.words)
         .into_iter()
         .map(|segment| TranscriptSegment {
             start: segment.start,
@@ -424,10 +564,24 @@ fn normalize_for_hallucination_check(text: &str) -> String {
 /// with no narration" — it only ever touches segments whose *text* itself
 /// is a suspicious repeat; a real silent demo simply has no segments here
 /// to flag in the first place.
-fn flag_likely_hallucinations(segments: &mut [TranscriptSegment]) {
+///
+/// `context_texts` is additional text counted toward each phrase's repeat
+/// total but never itself flagged or modified — for `retranscribe_chunk`,
+/// this is the rest of the video's *already-persisted* segment text
+/// outside the chunk being replaced. Without it, a phrase that repeats
+/// dozens of times across a whole recording but only once or twice within
+/// one independently-re-transcribed ~10-minute chunk would fall under the
+/// threshold and slip through, even though it's clearly the same
+/// hallucination pattern. `run_transcription`'s whole-video paths pass an
+/// empty slice — there, `segments` already covers everything being
+/// transcribed in one call, so no outside context is needed.
+fn flag_likely_hallucinations(segments: &mut [TranscriptSegment], context_texts: &[String]) {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for segment in segments.iter() {
-        let normalized = normalize_for_hallucination_check(&segment.text);
+    let normalized_texts = segments.iter().map(|segment| segment.text.as_str()).chain(
+        context_texts.iter().map(|text| text.as_str()),
+    );
+    for text in normalized_texts {
+        let normalized = normalize_for_hallucination_check(text);
         if normalized.is_empty() || normalized.split_whitespace().count() > HALLUCINATION_MAX_WORDS {
             continue;
         }
@@ -465,7 +619,7 @@ mod hallucination_flagging_tests {
             seg(800.0, "thank you for watching the video"),
         ];
 
-        flag_likely_hallucinations(&mut segments);
+        flag_likely_hallucinations(&mut segments, &[]);
 
         assert!(!segments[0].keep, "first repeat should be flagged");
         assert!(segments[1].keep, "unrelated real content should be untouched");
@@ -484,7 +638,7 @@ mod hallucination_flagging_tests {
             seg(200.0, "Let's move on to the next topic."),
         ];
 
-        flag_likely_hallucinations(&mut segments);
+        flag_likely_hallucinations(&mut segments, &[]);
 
         assert!(segments.iter().all(|segment| segment.keep));
     }
@@ -500,7 +654,7 @@ mod hallucination_flagging_tests {
             seg(600.0, long_sentence),
         ];
 
-        flag_likely_hallucinations(&mut segments);
+        flag_likely_hallucinations(&mut segments, &[]);
 
         assert!(
             segments.iter().all(|segment| segment.keep),
@@ -513,9 +667,45 @@ mod hallucination_flagging_tests {
         let mut segments = vec![seg(0.0, "Just one normal segment.")];
         segments[0].keep = false;
 
-        flag_likely_hallucinations(&mut segments);
+        flag_likely_hallucinations(&mut segments, &[]);
 
         assert!(!segments[0].keep);
+    }
+
+    #[test]
+    fn context_texts_count_toward_the_repeat_threshold_but_are_never_flagged_themselves() {
+        // Mirrors `retranscribe_chunk`'s real bug: a phrase repeating
+        // plenty across the rest of the video (passed as read-only
+        // `context_texts`, standing in for already-persisted segments
+        // outside the chunk being replaced) but appearing only once in
+        // this chunk's own freshly-returned batch should still be flagged
+        // in the batch — it clearly isn't a coincidence.
+        let mut segments = vec![
+            seg(650.0, "Thank you for watching the video."),
+            seg(700.0, "Real content unique to this chunk."),
+        ];
+        let context_texts = vec![
+            "Thank you for watching the video.".to_string(),
+            "Thank you for watching the video.".to_string(),
+        ];
+
+        flag_likely_hallucinations(&mut segments, &context_texts);
+
+        assert!(
+            !segments[0].keep,
+            "repeats elsewhere in the video should count toward this chunk's own occurrence"
+        );
+        assert!(segments[1].keep, "unrelated real content should be untouched");
+    }
+
+    #[test]
+    fn does_not_flag_a_phrase_appearing_only_once_total_even_with_unrelated_context() {
+        let mut segments = vec![seg(0.0, "A perfectly normal, unique sentence.")];
+        let context_texts = vec!["Some other unrelated line.".to_string()];
+
+        flag_likely_hallucinations(&mut segments, &context_texts);
+
+        assert!(segments[0].keep);
     }
 }
 
@@ -703,7 +893,7 @@ async fn run_transcription(
         transcribe_audio(app, video_id, attempt, &audio_path, &api_key).await?
     };
 
-    flag_likely_hallucinations(&mut segments);
+    flag_likely_hallucinations(&mut segments, &[]);
 
     let now = chrono::Utc::now().to_rfc3339();
     {
@@ -841,7 +1031,29 @@ pub async fn retranscribe_chunk(
     let _ = tokio::fs::remove_file(&chunk_path).await;
 
     let mut segments = upload_result?;
-    flag_likely_hallucinations(&mut segments);
+
+    // Count repeats against the rest of this video's *already-persisted*
+    // transcript too, not just this one chunk's own freshly-returned batch
+    // — otherwise a phrase hallucinated dozens of times across the full
+    // recording, but only once or twice within this specific ~10-minute
+    // chunk's independent re-transcription, falls under the repeat
+    // threshold and slips through uncaught.
+    let context_texts: Vec<String> = {
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        let mut stmt = guard
+            .prepare(
+                "SELECT text FROM transcript_segments
+                 WHERE video_id = ?1 AND (start < ?2 OR start >= ?3)",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(params![video_id, chunk_start, chunk_end], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| err.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())?
+    };
+    flag_likely_hallucinations(&mut segments, &context_texts);
 
     let now = chrono::Utc::now().to_rfc3339();
     {

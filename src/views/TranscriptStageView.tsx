@@ -5,10 +5,12 @@ import Breadcrumbs from "../components/Breadcrumbs";
 import { basename } from "./ProjectDetailView";
 import {
   analyzeVideo,
+  deletePlaybackClip,
   getProject,
   getVideo,
   listLessons,
   listTranscriptSegments,
+  prepareSegmentPlaybackClip,
   retranscribeChunk,
   updateTranscriptSegment,
   TRANSCRIPT_CHUNK_MIN_TRAILING_SECONDS,
@@ -107,102 +109,124 @@ export default function TranscriptStageView({
   const attemptCountsRef = useRef<Record<number, number>>({});
 
   // Per-segment audio playback — lets a user click a segment's timestamp to
-  // hear just that slice and check it against the transcribed text. One
-  // shared `<audio>` element (not one per row) is enough since only one
-  // segment ever plays at a time. Sourced from the *original source video*
-  // (`video.file_path`), not the extracted Opus/Ogg `audio_path` — Tauri's
-  // macOS webview (WKWebView, Safari's engine) generally can't decode
-  // Ogg/Opus at all, so pointing `<audio>` at `audio_path` played silently
-  // and failed; the source video's own audio track (almost always AAC in
-  // an MP4 container from screen-recording tools) is natively supported.
+  // hear just that slice and check it against the transcribed text.
+  //
+  // Rather than seeking within the source video directly, each click cuts
+  // a fresh local WAV clip of just that segment via
+  // `prepareSegmentPlaybackClip` and plays that. Two things this app's
+  // actual recordings have been observed doing make seeking the original
+  // file directly unreliable in the webview: an audio track ordered before
+  // the video track plus an extra unrecognized data track (confuses
+  // WebKit's track selection in both `<audio>` and `<video>` tags), and
+  // internally inconsistent video color metadata (can make a strict
+  // hardware decoder reject the whole file). A short, uncompressed,
+  // single-track WAV — produced by ffmpeg, which already handles these
+  // files fine everywhere else in this app — has none of that ambiguity
+  // for the webview to trip on. One shared `<audio>` element (not one per
+  // row) is enough since only one segment ever plays at a time.
+  //
   // Local-only either way — this is playback, not an upload, so it's outside
   // `coursecut-privacy-invariants`' scope (which is about what leaves the
   // device).
   const audioRef = useRef<HTMLAudioElement>(null);
-  // The currently-armed clip's absolute [start, end) in the recording —
-  // read by the shared `timeupdate` listener to know when to auto-stop and
-  // to compute the progress-ring fraction, and by `handlePlaySegment` to
-  // know which segment a `playing` event actually corresponds to (native
-  // media events don't carry that themselves).
-  const playingRangeRef = useRef<{ segmentId: string; start: number; end: number } | null>(null);
   const [playingSegmentId, setPlayingSegmentId] = useState<string | null>(null);
   // 0–1 progress through the *currently playing* segment's own clip, for
   // the progress ring around its Play/Pause button — meaningless (and
-  // ignored) for any other row.
+  // ignored) for any other row. Simple `currentTime / duration` now that
+  // the audio element's whole loaded file *is* the segment, rather than an
+  // absolute-timestamp range within a much longer file.
   const [playbackProgress, setPlaybackProgress] = useState(0);
+  // Path of the clip currently loaded into `audioRef` (if any), so the
+  // *previous* one can be deleted once a new one successfully takes over —
+  // temp WAV clips don't clean themselves up.
+  const currentClipPathRef = useRef<string | null>(null);
+  // Guards against overlapping clip-prepare calls if Play is clicked
+  // rapidly across different rows before the first one's ffmpeg cut and
+  // Tauri round-trip finish.
+  const preparingClipRef = useRef(false);
+
+  const deleteClipBestEffort = useCallback((path: string | null) => {
+    if (!path) return;
+    void deletePlaybackClip(path).catch(() => {});
+  }, []);
 
   useEffect(() => {
     const audio = audioRef.current;
+    // The `<audio>` element only exists once `video` has loaded (it's
+    // inside `{video && (...)}` below) — on the very first render `video`
+    // is still null, so this ran with `audio` as `null` and, with an empty
+    // dependency array, never got another chance to actually attach these
+    // listeners once the element showed up. Depending on `video` makes
+    // this re-run right when the element first mounts.
     if (!audio) return;
-    // Only flips `playingSegmentId` once the browser actually confirms
-    // playback started — never set optimistically in the click handler —
-    // so a source the webview can't decode can't leave the button stuck
-    // showing Pause with nothing real to pause.
-    const handlePlaying = () => setPlayingSegmentId(playingRangeRef.current?.segmentId ?? null);
     const handleStopped = () => {
       setPlayingSegmentId(null);
       setPlaybackProgress(0);
     };
     const handleTimeUpdate = () => {
-      const range = playingRangeRef.current;
-      if (!range) return;
-      if (audio.currentTime >= range.end) {
-        audio.pause();
-        return;
-      }
-      const fraction = (audio.currentTime - range.start) / (range.end - range.start);
-      setPlaybackProgress(Math.min(1, Math.max(0, fraction)));
+      if (!audio.duration || Number.isNaN(audio.duration)) return;
+      setPlaybackProgress(Math.min(1, Math.max(0, audio.currentTime / audio.duration)));
     };
-    audio.addEventListener("playing", handlePlaying);
     audio.addEventListener("pause", handleStopped);
     audio.addEventListener("ended", handleStopped);
     audio.addEventListener("error", handleStopped);
     audio.addEventListener("timeupdate", handleTimeUpdate);
     return () => {
-      audio.removeEventListener("playing", handlePlaying);
       audio.removeEventListener("pause", handleStopped);
       audio.removeEventListener("ended", handleStopped);
       audio.removeEventListener("error", handleStopped);
       audio.removeEventListener("timeupdate", handleTimeUpdate);
     };
-  }, [video?.file_path]);
+  }, [video]);
 
   const handlePlaySegment = useCallback(
-    (segment: TranscriptSegment) => {
+    async (segment: TranscriptSegment) => {
       const audio = audioRef.current;
       if (!audio) return;
       if (playingSegmentId === segment.id) {
         audio.pause();
         return;
       }
-      playingRangeRef.current = { segmentId: segment.id, start: segment.start, end: segment.end };
-      const seekAndPlay = () => {
-        audio.currentTime = segment.start;
-        audio.play().catch((err) => {
-          setError(err instanceof Error ? err.message : String(err));
-          playingRangeRef.current = null;
-        });
-      };
-      // `preload="none"` means nothing is loaded yet on the very first
-      // click — setting `currentTime` before metadata exists is unreliable
-      // in WebKit, so wait for it rather than racing.
-      if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
-        seekAndPlay();
-      } else {
-        audio.addEventListener("loadedmetadata", seekAndPlay, { once: true });
-        audio.load();
+      if (preparingClipRef.current) return;
+      preparingClipRef.current = true;
+      // Set immediately, not deferred to a "playback actually started"
+      // event — switching from one segment to another while audio is
+      // already playing doesn't re-fire `playing` in every browser, so
+      // waiting for it can leave the ring on the previously-playing row.
+      // `handleStopped` above is the rollback path if this never pans out.
+      setPlayingSegmentId(segment.id);
+      try {
+        const clipPath = await prepareSegmentPlaybackClip(videoId, segment.start, segment.end);
+        const previousClipPath = currentClipPathRef.current;
+        currentClipPathRef.current = clipPath;
+        audio.src = convertFileSrc(clipPath);
+        await audio.play();
+        deleteClipBestEffort(previousClipPath);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        setPlayingSegmentId(null);
+      } finally {
+        preparingClipRef.current = false;
       }
     },
-    [playingSegmentId],
+    [playingSegmentId, videoId, deleteClipBestEffort],
   );
 
-  // Stop playback if this view unmounts (e.g. navigating away) mid-clip.
+  // Stop playback and clean up the last clip if this view unmounts (e.g.
+  // navigating away) mid-clip, or if `video` itself changes (switching to
+  // a different video's transcript without this component remounting).
+  // Depends on `video`, same reasoning as the listener effect above: the
+  // `<audio>` element doesn't exist until `video` first loads, so capturing
+  // `audioRef.current` before that would freeze on `null` and never see
+  // the real element.
   useEffect(() => {
     const audio = audioRef.current;
     return () => {
       audio?.pause();
+      deleteClipBestEffort(currentClipPathRef.current);
+      currentClipPathRef.current = null;
     };
-  }, []);
+  }, [video, deleteClipBestEffort]);
 
   useEffect(() => {
     let cancelled = false;
@@ -393,13 +417,12 @@ export default function TranscriptStageView({
 
       {video && (
         <>
-          {/* No `controls` — playback is driven entirely by each segment's
-           * own Play button (see `handlePlaySegment`), not a visible
-           * transport. Sourced from the source video's own audio track
-           * (see the playback state comment above for why, not `audio_path`),
-           * same `convertFileSrc` pattern `SourceVideoPreview`/
-           * `LessonPreviewPlayer` already use. */}
-          <audio ref={audioRef} src={convertFileSrc(video.file_path)} preload="none" />
+          {/* No `src` here — each click loads a freshly-cut clip (see the
+           * playback state comment above), rather than this element ever
+           * pointing at the source video directly. No `controls`; playback
+           * is driven entirely by each segment's own Play button
+           * (`handlePlaySegment`). */}
+          <audio ref={audioRef} />
 
           <div className="my-3 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
@@ -572,7 +595,7 @@ export default function TranscriptStageView({
                           size="icon-xs"
                           variant="ghost"
                           className="relative"
-                          onClick={() => handlePlaySegment(segment)}
+                          onClick={() => void handlePlaySegment(segment)}
                           aria-label={isPlaying ? "Pause segment audio" : "Play segment audio"}
                         >
                           {isPlaying ? <Pause /> : <Play />}

@@ -74,6 +74,8 @@ pub fn run() {
             db::delete_lesson_segment,
             db::reorder_lesson_segments,
             ffmpeg::extract_audio_for_video,
+            ffmpeg::prepare_segment_playback_clip,
+            ffmpeg::delete_playback_clip,
             openai::transcribe_video,
             openai::retranscribe_chunk,
             openai::analyze_video,
