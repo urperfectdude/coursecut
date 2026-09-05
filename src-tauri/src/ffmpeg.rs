@@ -90,6 +90,64 @@ pub async fn probe_duration(app: &AppHandle, video_path: &str) -> Result<f64, St
         .map_err(|err| format!("could not parse ffprobe duration output {stdout:?}: {err}"))
 }
 
+/// Runs the bundled `ffprobe` sidecar to read `path`'s pixel width/height —
+/// works on both videos and still images (ffprobe treats a single-frame
+/// image as a one-frame video stream), which is what lets `export_lesson`'s
+/// overlay path use this for both the main video and each overlay image.
+///
+/// This exists because the alternative — letting ffmpeg's own
+/// `scale2ref`/`overlay` filters resolve dimensions dynamically via
+/// expression variables (`main_w`/`main_h`, or the "correct" `rw`/`rh` this
+/// ffmpeg build actually uses for `scale2ref`'s reference dims) — turned
+/// out to be unreliable: `force_original_aspect_ratio` combined with
+/// expression-based `w`/`h` silently produced wrong (non-aspect-preserving)
+/// output dimensions in this ffmpeg build, verified via the CLI on a square
+/// test image scaled into a non-square target box (expected the box's
+/// smaller dimension on both axes; got the box's raw, unaspected
+/// dimensions instead — several reformulations of the expression were
+/// tried and each failed differently). Probing real pixel dimensions once
+/// and building the filter graph with literal numbers sidesteps all of
+/// that: no `scale2ref`, no expression-evaluation-order surprises, and the
+/// arithmetic lives in Rust where it's actually testable.
+pub async fn probe_dimensions(app: &AppHandle, path: &str) -> Result<(u32, u32), String> {
+    let output = app
+        .shell()
+        .sidecar("ffprobe")
+        .map_err(|err| format!("could not resolve ffprobe sidecar: {err}"))?
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            path,
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("ffprobe failed to run: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe exited with an error: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (width, height) = stdout
+        .trim()
+        .split_once('x')
+        .ok_or_else(|| format!("could not parse ffprobe dimensions output {stdout:?}"))?;
+    let width: u32 = width
+        .parse()
+        .map_err(|err| format!("could not parse ffprobe width {width:?}: {err}"))?;
+    let height: u32 = height
+        .parse()
+        .map_err(|err| format!("could not parse ffprobe height {height:?}: {err}"))?;
+    Ok((width, height))
+}
+
 /// SHA-256 hash of `video_path`'s full contents, used as the cache key for
 /// extracted audio (PRD §7.4 — "never retranscribe unchanged videos" starts
 /// here, at the audio-extraction stage). Reads the file in fixed-size
@@ -560,6 +618,150 @@ pub async fn split_audio_by_time(
 /// user's exact trim points — this app already promises frame-accurate
 /// trimming elsewhere, so the exported file must actually reflect them.
 ///
+/// One still-image overlay to composite onto the segment being cut by
+/// `export_lesson`, for `export.rs`'s `overlays_for_segment` to pass in.
+/// `start`/`end` are already **segment-relative** seconds (0 = the start of
+/// *this* cut, matching the ffmpeg output's own timestamp `t` once
+/// `-ss`/`-t` have trimmed it) — not the video-scoped absolute seconds
+/// `frame_overlays.start`/`.end` are stored as; translating between the two
+/// is the caller's job, not this module's (see `overlays_for_segment`).
+/// `scale_percent` is the image's size as a percentage of the main video's
+/// own dimensions (100 = fills the frame, matching the original v1
+/// behavior; below 100 shrinks the image toward the center, leaving the
+/// underlying video visible around it — see `build_overlay_filter_complex`).
+/// `x_percent`/`y_percent` place the (possibly shrunk) image within the
+/// frame: 0 = its left/top edge at the frame's left/top edge, 100 = its
+/// right/bottom edge at the frame's right/bottom edge, 50 = centered on
+/// that axis — same 0-100 slider convention on both axes.
+#[derive(Debug, Clone)]
+pub struct SegmentOverlay {
+    pub image_path: String,
+    pub start: f64,
+    pub end: f64,
+    pub scale_percent: f64,
+    pub x_percent: f64,
+    pub y_percent: f64,
+}
+
+/// One `SegmentOverlay` with its `scale_percent`/`x_percent`/`y_percent`
+/// already resolved into literal pixel values against the main video's and
+/// the overlay image's *actual* probed dimensions (see
+/// `resolve_segment_overlay` and `probe_dimensions`'s doc comment for why
+/// this is done with real probes in Rust rather than ffmpeg filter
+/// expressions). `width`/`height` preserve the image's own aspect ratio —
+/// scaled down as needed so neither exceeds `scale_percent`% of the main
+/// video's corresponding dimension (CSS `object-fit: contain`'s "fit
+/// without stretching" behavior, computed here rather than via ffmpeg's
+/// `force_original_aspect_ratio`) — and are always even (libx264/yuv420p
+/// require even chroma-plane dimensions). `x`/`y` are the overlay's
+/// top-left corner in the main frame's own pixel coordinates.
+struct ResolvedOverlay {
+    width: i64,
+    height: i64,
+    x: i64,
+    y: i64,
+    start: f64,
+    end: f64,
+}
+
+/// Resolves one `SegmentOverlay`'s percentage-based size/position against
+/// `main_w`/`main_h` (the segment being cut) and `image_w`/`image_h` (that
+/// overlay's own probed pixel dimensions) into literal pixel values.
+fn resolve_segment_overlay(
+    overlay: &SegmentOverlay,
+    main_w: u32,
+    main_h: u32,
+    image_w: u32,
+    image_h: u32,
+) -> ResolvedOverlay {
+    let box_w = main_w as f64 * overlay.scale_percent / 100.0;
+    let box_h = main_h as f64 * overlay.scale_percent / 100.0;
+    // "decrease"/"contain": the smaller of the two candidate scale factors,
+    // so the image shrinks to fit within the box on whichever axis is more
+    // constraining, preserving its own aspect ratio on the other.
+    let factor = (box_w / image_w as f64).min(box_h / image_h as f64);
+
+    let round_even = |value: f64| -> i64 {
+        let rounded = value.round() as i64;
+        let rounded = rounded - (rounded % 2);
+        rounded.max(2)
+    };
+    let width = round_even(image_w as f64 * factor);
+    let height = round_even(image_h as f64 * factor);
+
+    let x = ((main_w as f64 - width as f64) * overlay.x_percent / 100.0).round() as i64;
+    let y = ((main_h as f64 - height as f64) * overlay.y_percent / 100.0).round() as i64;
+
+    ResolvedOverlay {
+        width,
+        height,
+        x,
+        y,
+        start: overlay.start,
+        end: overlay.end,
+    }
+}
+
+/// Builds the `-filter_complex` graph for `export_lesson`'s overlay path,
+/// once every overlay's size/position has already been resolved to literal
+/// pixels (see `ResolvedOverlay`). Each overlay image is its own extra
+/// input (`-loop 1 -i <path>`, indices `1..=overlays.len()`, main video is
+/// input `0`), scaled with a plain single-input `scale=W:H` (no reference
+/// input, no `scale2ref`, no expression evaluation — `W`/`H` are the
+/// already-computed literal pixel dimensions) and composited with a plain
+/// `overlay=x=X:y=Y:enable='between(t,START,END)'` (again literal `X`/`Y`).
+///
+/// This is deliberately simpler than an earlier version that used
+/// `scale2ref` + expression-based `main_w`/`main_h`/`force_original_aspect_ratio`
+/// to resolve sizing dynamically inside the filter graph: that approach
+/// turned out to silently produce wrong (non-aspect-preserving) dimensions
+/// in this ffmpeg build once verified more rigorously via the CLI (a square
+/// test image scaled into a non-square target box came out matching the
+/// box's own un-aspected dimensions instead of the expected aspect-
+/// preserved square) — several different expression formulations were
+/// tried and each failed differently, which is itself a sign the approach
+/// was fragile. Resolving everything to literals in Rust first (see
+/// `resolve_segment_overlay`) sidesteps all of that, and also means each
+/// image's `scale` filter has exactly one output — no reference pass-
+/// through to chain or accidentally leave unmapped (the `nullsink`
+/// duration bug from the `scale2ref` version doesn't exist here, since
+/// there's no second output to consume in the first place).
+fn build_overlay_filter_complex(overlays: &[ResolvedOverlay]) -> String {
+    let mut scale_parts: Vec<String> = Vec::with_capacity(overlays.len());
+    let mut overlay_parts: Vec<String> = Vec::with_capacity(overlays.len());
+
+    for (index, overlay) in overlays.iter().enumerate() {
+        let image_input = index + 1;
+        scale_parts.push(format!(
+            "[{image_input}:v]scale={}:{}[scaled{index}]",
+            overlay.width, overlay.height
+        ));
+    }
+
+    for (index, overlay) in overlays.iter().enumerate() {
+        let base = if index == 0 {
+            "0:v".to_string()
+        } else {
+            format!("ov{}", index - 1)
+        };
+        let output_label = if index == overlays.len() - 1 {
+            "outv".to_string()
+        } else {
+            format!("ov{index}")
+        };
+        overlay_parts.push(format!(
+            "[{base}][scaled{index}]overlay=x={}:y={}:enable='between(t,{},{})'[{output_label}]",
+            overlay.x, overlay.y, overlay.start, overlay.end
+        ));
+    }
+
+    scale_parts
+        .into_iter()
+        .chain(overlay_parts)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// Progress is streamed from ffmpeg's own `-progress pipe:1` output
 /// (`out_time_ms=<microseconds>` lines — the key name is a long-standing
 /// ffmpeg misnomer; verified empirically that the value is microseconds,
@@ -580,28 +782,69 @@ pub async fn export_lesson(
     start: f64,
     end: f64,
     output_path: &str,
+    overlays: &[SegmentOverlay],
     mut register_child: impl FnMut(CommandChild) + Send,
     mut on_progress: impl FnMut(f64) + Send,
 ) -> Result<(), String> {
     let duration = (end - start).max(0.0);
 
-    let args: Vec<String> = vec![
-        "-y".to_string(),
-        "-ss".to_string(),
-        start.to_string(),
-        "-i".to_string(),
-        video_path.to_string(),
-        "-t".to_string(),
-        duration.to_string(),
-        "-c:v".to_string(),
-        "libx264".to_string(),
-        "-c:a".to_string(),
-        "aac".to_string(),
-        "-progress".to_string(),
-        "pipe:1".to_string(),
-        "-nostats".to_string(),
-        output_path.to_string(),
-    ];
+    let args: Vec<String> = if overlays.is_empty() {
+        vec![
+            "-y".to_string(),
+            "-ss".to_string(),
+            start.to_string(),
+            "-i".to_string(),
+            video_path.to_string(),
+            "-t".to_string(),
+            duration.to_string(),
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-progress".to_string(),
+            "pipe:1".to_string(),
+            "-nostats".to_string(),
+            output_path.to_string(),
+        ]
+    } else {
+        let (main_w, main_h) = probe_dimensions(app, video_path).await?;
+        let mut resolved: Vec<ResolvedOverlay> = Vec::with_capacity(overlays.len());
+        for overlay in overlays {
+            let (image_w, image_h) = probe_dimensions(app, &overlay.image_path).await?;
+            resolved.push(resolve_segment_overlay(overlay, main_w, main_h, image_w, image_h));
+        }
+
+        let mut args: Vec<String> = vec![
+            "-y".to_string(),
+            "-ss".to_string(),
+            start.to_string(),
+            "-i".to_string(),
+            video_path.to_string(),
+        ];
+        for overlay in overlays {
+            args.push("-loop".to_string());
+            args.push("1".to_string());
+            args.push("-i".to_string());
+            args.push(overlay.image_path.clone());
+        }
+        args.push("-filter_complex".to_string());
+        args.push(build_overlay_filter_complex(&resolved));
+        args.push("-t".to_string());
+        args.push(duration.to_string());
+        args.push("-map".to_string());
+        args.push("[outv]".to_string());
+        args.push("-map".to_string());
+        args.push("0:a".to_string());
+        args.push("-c:v".to_string());
+        args.push("libx264".to_string());
+        args.push("-c:a".to_string());
+        args.push("aac".to_string());
+        args.push("-progress".to_string());
+        args.push("pipe:1".to_string());
+        args.push("-nostats".to_string());
+        args.push(output_path.to_string());
+        args
+    };
 
     let (mut rx, child) = app
         .shell()
@@ -782,5 +1025,135 @@ pub async fn concat_videos(
 
     let _ = std::fs::remove_file(&list_path);
     result
+}
+
+#[cfg(test)]
+mod resolve_segment_overlay_tests {
+    use super::*;
+
+    fn overlay(scale_percent: f64, x_percent: f64, y_percent: f64) -> SegmentOverlay {
+        SegmentOverlay {
+            image_path: "/tmp/one.png".to_string(),
+            start: 1.0,
+            end: 3.0,
+            scale_percent,
+            x_percent,
+            y_percent,
+        }
+    }
+
+    /// At 100% scale with a same-aspect image, the resolved size exactly
+    /// matches the main frame and position is `(0,0)` regardless of
+    /// x/y_percent (there's no room to move within the frame).
+    #[test]
+    fn full_frame_same_aspect_fills_exactly() {
+        let resolved = resolve_segment_overlay(&overlay(100.0, 50.0, 50.0), 1440, 774, 1440, 774);
+        assert_eq!(resolved.width, 1440);
+        assert_eq!(resolved.height, 774);
+        assert_eq!(resolved.x, 0);
+        assert_eq!(resolved.y, 0);
+    }
+
+    /// The bug this whole module exists to avoid: a *square* image scaled
+    /// into a *non-square* percentage box must come out square (aspect
+    /// preserved, height-constrained here since the box is wider than
+    /// tall), not stretched to the box's own un-aspected dimensions — this
+    /// is exactly the case that silently broke under the old
+    /// `scale2ref`+`force_original_aspect_ratio` approach, verified via the
+    /// CLI against real ffmpeg.
+    #[test]
+    fn square_image_into_a_wide_box_stays_square_not_stretched() {
+        // Main frame 1440x774, scale_percent 20 -> box 288x154.8. A square
+        // 100x100 image's constraining dimension is height (154.8 < 288),
+        // so factor = 154.8/100 = 1.548, giving ~155x155 (rounded to even).
+        let resolved = resolve_segment_overlay(&overlay(20.0, 100.0, 0.0), 1440, 774, 100, 100);
+        assert_eq!(resolved.width, resolved.height, "a square source must stay square");
+        assert_eq!(resolved.width, 154);
+        // x_percent 100 (right edge) -> x = (1440 - 154) * 1.0
+        assert_eq!(resolved.x, 1440 - 154);
+        // y_percent 0 (top edge) -> y = 0
+        assert_eq!(resolved.y, 0);
+    }
+
+    /// A tall/narrow image into a box only constrains on the axis where it
+    /// would otherwise overflow — width here, since the image is much
+    /// narrower than the box relative to its own height.
+    #[test]
+    fn tall_image_is_width_constrained_and_centered() {
+        // Half-frame box: 720x387. Image 100x300 (aspect 1:3). Width factor
+        // 720/100=7.2, height factor 387/300=1.29 -> height-constrained
+        // (smaller factor), giving 100*1.29=129 (rounded even), 300*1.29=387.
+        let resolved = resolve_segment_overlay(&overlay(50.0, 50.0, 50.0), 1440, 774, 100, 300);
+        assert_eq!(resolved.height, 386); // 387 rounded down to even
+        assert_eq!(resolved.width, 128); // 129 rounded down to even (100 * 386/300)
+        // Centered (50/50): x = (1440-128)/2, y = (774-386)/2
+        assert_eq!(resolved.x, (1440 - 128) / 2);
+        assert_eq!(resolved.y, (774 - 386) / 2);
+    }
+
+    #[test]
+    fn resolved_dimensions_are_always_even() {
+        // An odd-dimensioned image scaled by an awkward factor shouldn't
+        // produce odd output dims (libx264/yuv420p need even chroma
+        // planes).
+        let resolved = resolve_segment_overlay(&overlay(33.0, 50.0, 50.0), 1441, 775, 101, 101);
+        assert_eq!(resolved.width % 2, 0);
+        assert_eq!(resolved.height % 2, 0);
+    }
+}
+
+#[cfg(test)]
+mod overlay_filter_tests {
+    use super::*;
+
+    fn resolved(width: i64, height: i64, x: i64, y: i64, start: f64, end: f64) -> ResolvedOverlay {
+        ResolvedOverlay { width, height, x, y, start, end }
+    }
+
+    /// Exact string manually validated end-to-end against the system
+    /// ffmpeg — a plain single-input `scale=W:H` per overlay image (no
+    /// reference input, unlike the earlier `scale2ref`-based version), then
+    /// a plain `overlay=x=X:y=Y` with literal pixel values.
+    #[test]
+    fn single_overlay_builds_a_scale_and_overlay_graph() {
+        let overlays = [resolved(1440, 774, 0, 0, 1.0, 3.0)];
+        let graph = build_overlay_filter_complex(&overlays);
+        assert_eq!(
+            graph,
+            "[1:v]scale=1440:774[scaled0];\
+             [0:v][scaled0]overlay=x=0:y=0:enable='between(t,1,3)'[outv]"
+        );
+    }
+
+    /// A shrunk, off-center overlay uses its own resolved width/height/x/y
+    /// — no fractions or expressions left in the filter string at all.
+    #[test]
+    fn shrunk_overlay_uses_its_resolved_pixel_box() {
+        let overlays = [resolved(154, 154, 1286, 0, 1.0, 3.0)];
+        let graph = build_overlay_filter_complex(&overlays);
+        assert_eq!(
+            graph,
+            "[1:v]scale=154:154[scaled0];\
+             [0:v][scaled0]overlay=x=1286:y=0:enable='between(t,1,3)'[outv]"
+        );
+    }
+
+    /// Multi-overlay case: each image gets its own independent `scale`
+    /// filter (no chaining needed, unlike the old `scale2ref` version,
+    /// since a plain `scale` filter has exactly one output — nothing to
+    /// leave unmapped), and `overlay` calls chain in order, the first onto
+    /// the main video (`0:v`), each next onto the previous one's output.
+    #[test]
+    fn two_overlays_each_get_their_own_scale_and_chain_overlay_bases() {
+        let overlays = [resolved(1440, 774, 0, 0, 1.0, 2.0), resolved(200, 100, 50, 50, 3.0, 4.0)];
+        let graph = build_overlay_filter_complex(&overlays);
+        assert_eq!(
+            graph,
+            "[1:v]scale=1440:774[scaled0];\
+             [2:v]scale=200:100[scaled1];\
+             [0:v][scaled0]overlay=x=0:y=0:enable='between(t,1,2)'[ov0];\
+             [ov0][scaled1]overlay=x=50:y=50:enable='between(t,3,4)'[outv]"
+        );
+    }
 }
 

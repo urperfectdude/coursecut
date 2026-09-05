@@ -21,6 +21,12 @@ interface SegmentedScrubberProps {
    * necessarily equal to `max` — for `SourceVideoPreview` they happen to be
    * the same value, but this component makes no assumption about that). */
   segments?: SegmentedScrubberSegment[];
+  /** Image-overlay ranges (`frame_overlays`), drawn as a second amber band
+   * below the segment-highlight one so the two don't visually merge —
+   * "where a lesson segment is" and "where an inserted image plays" are
+   * different concepts that can overlap. Same `duration` denominator as
+   * `segments`. */
+  markers?: SegmentedScrubberSegment[];
   duration?: number;
 }
 
@@ -40,9 +46,11 @@ export default function SegmentedScrubber({
   "aria-label": ariaLabel,
   className,
   segments,
+  markers,
   duration,
 }: SegmentedScrubberProps) {
   const showOverlay = segments !== undefined && duration !== undefined && duration > 0;
+  const showMarkers = markers !== undefined && markers.length > 0 && duration !== undefined && duration > 0;
 
   return (
     <div className="relative box-border">
@@ -77,6 +85,23 @@ export default function SegmentedScrubber({
               style={{
                 left: `${(segment.start / duration) * 100}%`,
                 width: `${((segment.end - segment.start) / duration) * 100}%`,
+              }}
+            />
+          ))}
+        </div>
+      )}
+      {showMarkers && (
+        <div
+          className="pointer-events-none absolute inset-x-0 top-full mt-1 h-1"
+          aria-hidden="true"
+        >
+          {markers.map((marker) => (
+            <span
+              key={marker.id}
+              className="absolute inset-y-0 rounded-full bg-amber-400"
+              style={{
+                left: `${(marker.start / duration) * 100}%`,
+                width: `${((marker.end - marker.start) / duration) * 100}%`,
               }}
             />
           ))}
