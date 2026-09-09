@@ -920,7 +920,7 @@ async fn run_transcription(
             .map_err(|err| err.to_string())?;
         }
         tx.execute(
-            "UPDATE videos SET transcript_status = 'transcribed', updated_at = ?1 WHERE id = ?2",
+            "UPDATE videos SET transcript_status = 'transcribed', transcript_source = 'whisper', updated_at = ?1 WHERE id = ?2",
             params![now, video_id],
         )
         .map_err(|err| err.to_string())?;
@@ -931,7 +931,7 @@ async fn run_transcription(
     let guard = conn.0.lock().map_err(|err| err.to_string())?;
     guard
         .query_row(
-            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path
+            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path, transcript_source
              FROM videos WHERE id = ?1",
             params![video_id],
             db::row_to_video,
@@ -1084,7 +1084,7 @@ pub async fn retranscribe_chunk(
         }
 
         tx.execute(
-            "UPDATE videos SET updated_at = ?1 WHERE id = ?2",
+            "UPDATE videos SET transcript_source = 'whisper', updated_at = ?1 WHERE id = ?2",
             params![now, video_id],
         )
         .map_err(|err| err.to_string())?;
@@ -1095,7 +1095,7 @@ pub async fn retranscribe_chunk(
     let guard = conn.0.lock().map_err(|err| err.to_string())?;
     guard
         .query_row(
-            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path
+            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path, transcript_source
              FROM videos WHERE id = ?1",
             params![video_id],
             db::row_to_video,

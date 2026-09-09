@@ -25,6 +25,11 @@ export interface Video {
   // `src-tauri/src/ffmpeg.rs`). Lets a retry tell whether extraction has
   // already completed and skip straight to transcription.
   audio_path: string | null;
+  // Whether the current transcript_segments came from Whisper ("whisper",
+  // the schema default) or a wholesale VTT import ("vtt", set by
+  // `import_vtt_transcript`). Used by `TranscriptStageView` to hide the
+  // Whisper-chunk re-transcribe sidebar for an imported transcript.
+  transcript_source: string;
 }
 
 // Keep in sync with `SUPPORTED_EXTENSIONS` in `src-tauri/src/db.rs` —
@@ -168,6 +173,17 @@ export async function retranscribeChunk(
 
 export async function listTranscriptSegments(videoId: string): Promise<TranscriptSegment[]> {
   return invoke<TranscriptSegment[]>("list_transcript_segments", { videoId });
+}
+
+// Imports a local .vtt file as videoId's transcript, bypassing Whisper
+// entirely — for videos where the user already has an accurate transcript
+// from the recording platform (e.g. a Zoom/Teams .vtt export with real
+// speaker names per cue). Local file parse + one DB transaction only, no
+// network call — see `src-tauri/src/vtt.rs`/`import_vtt_transcript` in
+// `src-tauri/src/db.rs`. Replaces the video's existing transcript_segments
+// entirely and sets transcript_status to "transcribed".
+export async function importVttTranscript(videoId: string, vttPath: string): Promise<Video> {
+  return invoke<Video>("import_vtt_transcript", { videoId, vttPath });
 }
 
 // Transcript Mode editing (PRD §8.1) — pure local SQLite mutations, no

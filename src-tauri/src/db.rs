@@ -47,6 +47,12 @@ pub struct Video {
     /// frontend so a retry can tell whether extraction has already
     /// completed and skip straight to transcription.
     pub audio_path: Option<String>,
+    /// Whether the current `transcript_segments` rows came from Whisper
+    /// (`'whisper'`, the schema default) or a wholesale VTT import
+    /// (`'vtt'`, set by `import_vtt_transcript`). Lets `TranscriptStageView`
+    /// hide the Whisper-chunk re-transcribe sidebar for an imported
+    /// transcript, since it was never chunked by Whisper.
+    pub transcript_source: String,
 }
 
 /// Resolves the on-disk path for the app's database: `app_config_dir()`
@@ -155,6 +161,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(include_str!("../migrations/0010_frame_overlay_position.sql"))
             .map_err(|err| format!("migration 0010_frame_overlay_position failed: {err}"))?;
         conn.pragma_update(None, "user_version", 10)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
+    if version < 11 {
+        conn.execute_batch(include_str!("../migrations/0011_video_transcript_source.sql"))
+            .map_err(|err| format!("migration 0011_video_transcript_source failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 11)
             .map_err(|err| format!("could not update schema version: {err}"))?;
     }
 
@@ -327,6 +340,7 @@ pub(crate) fn row_to_video(row: &rusqlite::Row<'_>) -> rusqlite::Result<Video> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         audio_path: row.get("audio_path")?,
+        transcript_source: row.get("transcript_source")?,
     })
 }
 
@@ -412,6 +426,7 @@ pub fn import_videos(
             created_at: now.clone(),
             updated_at: now,
             audio_path: None,
+            transcript_source: "whisper".to_string(),
         });
     }
 
@@ -445,7 +460,7 @@ pub fn list_videos(
     let conn = conn.0.lock().map_err(|err| err.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path
+            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path, transcript_source
              FROM videos WHERE project_id = ?1 ORDER BY created_at, id",
         )
         .map_err(|err| err.to_string())?;
@@ -466,7 +481,7 @@ pub fn list_videos(
 pub fn get_video(conn: tauri::State<'_, DbConnection>, id: String) -> Result<Option<Video>, String> {
     let conn = conn.0.lock().map_err(|err| err.to_string())?;
     match conn.query_row(
-        "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path
+        "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path, transcript_source
          FROM videos WHERE id = ?1",
         params![id],
         row_to_video,
@@ -542,6 +557,90 @@ pub fn list_transcript_segments(
         .map_err(|err| err.to_string())?;
 
     rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())
+}
+
+/// Imports a WebVTT transcript file as `video_id`'s transcript, completely
+/// bypassing Whisper — for videos where the user already has an accurate
+/// transcript from the recording platform itself (e.g. a Zoom/Teams `.vtt`
+/// export with real speaker names per cue), sidestepping Whisper's known
+/// hallucination-on-silence failure mode entirely for that video. Local
+/// file read + one DB transaction only — no network call, so this needs no
+/// `coursecut-privacy-invariants` review (strictly reduces this video's
+/// network exposure to zero, compared to the Whisper path).
+///
+/// Replaces this video's `transcript_segments` entirely (same
+/// delete-then-insert-in-one-transaction pattern `openai.rs`'s
+/// `run_transcription` uses for its own segments), all with `keep = 1` — no
+/// hallucination flagging is run here (see `openai::flag_likely_hallucinations`),
+/// since an imported ground-truth transcript has no Whisper-style
+/// hallucination risk to flag. Sets `transcript_status = 'transcribed'`.
+/// Available regardless of the video's current `transcript_status` — this
+/// is always a valid way to (re)supply a transcript, including overriding
+/// an already-completed Whisper transcription with the accurate ground
+/// truth.
+#[tauri::command(async)]
+pub fn import_vtt_transcript(
+    conn: tauri::State<'_, DbConnection>,
+    video_id: String,
+    vtt_path: String,
+) -> Result<Video, String> {
+    let content = std::fs::read_to_string(&vtt_path)
+        .map_err(|err| format!("could not read {vtt_path}: {err}"))?;
+    // `parse_vtt` itself already errors rather than returning an empty
+    // `Vec` for a file with no usable cues (see its own empty-cues check),
+    // so `cues` is guaranteed non-empty here.
+    let cues = crate::vtt::parse_vtt(&content)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let mut guard = conn.0.lock().map_err(|err| err.to_string())?;
+        let tx = guard.transaction().map_err(|err| err.to_string())?;
+
+        match tx.query_row(
+            "SELECT id FROM videos WHERE id = ?1",
+            params![video_id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => {}
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(format!("video {video_id} does not exist"));
+            }
+            Err(other) => return Err(other.to_string()),
+        }
+
+        tx.execute(
+            "DELETE FROM transcript_segments WHERE video_id = ?1",
+            params![video_id],
+        )
+        .map_err(|err| err.to_string())?;
+
+        for cue in &cues {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO transcript_segments (id, video_id, start, end, text, keep)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                params![id, video_id, cue.start, cue.end, cue.text],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        tx.execute(
+            "UPDATE videos SET transcript_status = 'transcribed', transcript_source = 'vtt', updated_at = ?1 WHERE id = ?2",
+            params![now, video_id],
+        )
+        .map_err(|err| err.to_string())?;
+
+        tx.commit().map_err(|err| err.to_string())?;
+    }
+
+    let guard = conn.0.lock().map_err(|err| err.to_string())?;
+    guard
+        .query_row(
+            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path, transcript_source
+             FROM videos WHERE id = ?1",
+            params![video_id],
+            row_to_video,
+        )
         .map_err(|err| err.to_string())
 }
 

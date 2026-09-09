@@ -29,3 +29,18 @@ npm-debug.log*
 
 # Tauri generated schemas
 src-tauri/gen/schemas/
+
+# Local test recordings/transcripts dropped at the repo root for manual
+# testing (e.g. real Zoom/Teams exports) — never project assets, and can
+# contain real, identifiable conversation content that shouldn't be
+# committed. No tracked file currently uses these extensions/paths (see
+# `git ls-files`), so this is safe to exclude at the root without hiding
+# anything real.
+/*.mp4
+/*.mov
+/*.mkv
+/*.avi
+/*.m4v
+/*.vtt
+/*.srt
+/Recordings/

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Loader2, Pause, Play, RotateCw } from "lucide-react";
 import Breadcrumbs from "../components/Breadcrumbs";
 import { basename } from "./ProjectDetailView";
@@ -8,6 +9,7 @@ import {
   deletePlaybackClip,
   getProject,
   getVideo,
+  importVttTranscript,
   listLessons,
   listTranscriptSegments,
   prepareSegmentPlaybackClip,
@@ -91,6 +93,13 @@ export default function TranscriptStageView({
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
   const { progress, clearProgress } = useVideoProgress();
+
+  // Guards `handleImportVttTranscript` against re-entrancy (a fast
+  // double-click before the OS file dialog paints), same idea as
+  // `analyzing` above — also disables the chunk sidebar's Re-transcribe
+  // buttons and Analyze while an import is in flight, since it replaces
+  // this video's whole transcript out from under them.
+  const [importingTranscript, setImportingTranscript] = useState(false);
 
   // Per-segment "in-flight" guard, same pattern as `LessonEditorView`'s
   // `segmentBusyRef`/`segmentBusyIds`.
@@ -284,6 +293,42 @@ export default function TranscriptStageView({
     }
   }, [redoStack]);
 
+  /** Imports a local `.vtt` file (a real transcript exported from Zoom/
+   * Teams, with real speaker names per cue) as this video's transcript,
+   * completely bypassing Whisper for it — see `src-tauri/src/vtt.rs` and
+   * `db::import_vtt_transcript`. Available regardless of `transcript_status`:
+   * it's always a valid way to (re)supply a transcript, including
+   * overriding an already-completed Whisper transcription with the
+   * accurate ground truth. Local file parse only — no network call. Guard
+   * is held for the whole operation, including the file-picker dialog
+   * itself, and also blocks Analyze/chunk re-transcribe (via the button
+   * `disabled` props below) since this replaces the transcript segments
+   * they'd otherwise operate on. */
+  const handleImportVttTranscript = useCallback(async () => {
+    if (importingTranscript || analyzing || busyChunkIndex !== null) return;
+    setImportingTranscript(true);
+    try {
+      const selection = await open({
+        filters: [{ name: "Subtitles", extensions: ["vtt"] }],
+      });
+      if (!selection) return;
+
+      const updated = await importVttTranscript(videoId, selection);
+      setVideo(updated);
+      setSegments(await listTranscriptSegments(videoId));
+      // The chunk sidebar (if it was showing) is now gated off by
+      // `transcript_source`, so a stale chunk selection would otherwise
+      // keep silently filtering the segment list below with no visible
+      // control left to clear it.
+      setSelectedChunkIndex(null);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setImportingTranscript(false);
+    }
+  }, [importingTranscript, analyzing, busyChunkIndex, videoId]);
+
   async function applySegmentKeep(segmentId: string, keep: boolean) {
     const updated = await updateTranscriptSegment(segmentId, keep);
     setSegments((prev) => prev.map((segment) => (segment.id === segmentId ? updated : segment)));
@@ -444,6 +489,18 @@ export default function TranscriptStageView({
               >
                 Redo
               </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleImportVttTranscript()}
+                disabled={importingTranscript || analyzing || busyChunkIndex !== null}
+              >
+                {importingTranscript && (
+                  <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden="true" />
+                )}
+                Import transcript
+              </Button>
             </div>
             <div className="flex items-center gap-2">
               {analyzing && (
@@ -466,7 +523,7 @@ export default function TranscriptStageView({
                 type="button"
                 variant={hasLessons ? "outline" : "default"}
                 onClick={() => void handleAnalyze()}
-                disabled={analyzing || busyChunkIndex !== null}
+                disabled={analyzing || busyChunkIndex !== null || importingTranscript}
               >
                 {hasLessons && <RotateCw />}
                 {hasLessons ? "Analyze again" : "Analyze"}
@@ -500,7 +557,7 @@ export default function TranscriptStageView({
            * (chunk sidebar included) rather than fighting an inner scrollbar
            * sized independently of the window. */}
           <div className="flex gap-4">
-            {chunkCount > 0 && (
+            {chunkCount > 0 && video.transcript_source !== "vtt" && (
               <ul className="m-0 flex w-40 shrink-0 list-none flex-col gap-1.5 p-0">
                 {Array.from({ length: chunkCount }, (_, chunkIndex) => {
                   const [chunkStart, chunkEnd] = chunkRange(chunkIndex);
@@ -524,7 +581,7 @@ export default function TranscriptStageView({
                         variant="outline"
                         size="sm"
                         className="w-full justify-start gap-1.5"
-                        disabled={busyChunkIndex !== null || analyzing}
+                        disabled={busyChunkIndex !== null || analyzing || importingTranscript}
                         onClick={() => void handleRetranscribeChunk(chunkIndex)}
                       >
                         {isBusy && <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden="true" />}
