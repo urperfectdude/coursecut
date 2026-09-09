@@ -345,7 +345,7 @@ async fn run_extraction(
 
     guard
         .query_row(
-            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path
+            "SELECT id, project_id, file_path, duration, transcript_status, created_at, updated_at, audio_path, transcript_source
              FROM videos WHERE id = ?1",
             params![video_id],
             db::row_to_video,

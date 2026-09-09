@@ -5,6 +5,7 @@ mod ffmpeg;
 mod openai;
 mod progress;
 mod settings;
+mod vtt;
 mod wav;
 
 use tauri::Manager;
@@ -60,6 +61,7 @@ pub fn run() {
             db::get_video,
             db::mark_video_error,
             db::list_transcript_segments,
+            db::import_vtt_transcript,
             db::list_lessons,
             db::update_transcript_segment,
             db::update_lesson,
