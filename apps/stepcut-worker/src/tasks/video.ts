@@ -17,23 +17,35 @@
 
 import { withOrg, type Tx } from "../../../stepcut-api/src/db/client.js";
 import { and, eq, isNotNull, ne } from "../../../stepcut-api/src/db/ops.js";
-import { jobs, steps, transcriptSegments, videos } from "../../../stepcut-api/src/db/schema.js";
+import { jobs, steps, transcriptSegments, videos, zoomRegions } from "../../../stepcut-api/src/db/schema.js";
+import { replaceZoomSuggestions } from "../../../stepcut-api/src/domain/effects.js";
 import * as storage from "../../../stepcut-api/src/storage.js";
 import {
   analyzeSteps,
+  dropLikelyHallucinations,
   transcribeAudio,
   type StepSuggestion,
   type TranscriptSegment,
 } from "../../../stepcut-api/src/openai.js";
 import { enqueueVideoJob } from "../../../stepcut-api/src/jobs/queue.js";
-import { extractAudio, probeDuration } from "../ffmpeg.js";
+import { decodeGrayFrames, extractAudio, peakLevelDb, probeDuration } from "../ffmpeg.js";
+import { ANALYSIS_FPS, ANALYSIS_HEIGHT, ANALYSIS_WIDTH, suggestZooms } from "../zoom-suggest.js";
 import { makeReporter } from "../progress.js";
 import { withScratchDir } from "../scratch.js";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export interface VideoJobPayload {
   job_id: string;
   org_id: string;
+  /**
+   * Set by a user-initiated re-transcribe. Bypasses the content-hash
+   * transcript cache in `runTranscribe` — without it a re-transcribe of a
+   * video whose bytes another row already carries would copy that row's
+   * transcript straight back, which for the case the button exists to fix (a
+   * transcript that came out wrong) means re-fixing nothing.
+   */
+  force?: boolean;
 }
 
 const newId = () => crypto.randomUUID();
@@ -50,7 +62,7 @@ const newId = () => crypto.randomUUID();
  * and that is what the queue's three attempts are for.
  */
 export async function runVideoJob(payload: VideoJobPayload): Promise<void> {
-  const { job_id: jobId, org_id: orgId } = payload;
+  const { job_id: jobId, org_id: orgId, force = false } = payload;
 
   const job = await withOrg(orgId, async (tx) => {
     const [row] = await tx.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
@@ -73,9 +85,11 @@ export async function runVideoJob(payload: VideoJobPayload): Promise<void> {
     if (job.kind === "extract") {
       await runExtract(orgId, videoId, jobId, job.attempt, report);
     } else if (job.kind === "transcribe") {
-      await runTranscribe(orgId, videoId, report);
+      await runTranscribe(orgId, videoId, jobId, force, report);
     } else if (job.kind === "analyze") {
       await runAnalyze(orgId, videoId, report);
+    } else if (job.kind === "zooms") {
+      await runSuggestZooms(orgId, videoId, jobId, report);
     } else {
       throw new Error(`unknown video job kind ${job.kind}`);
     }
@@ -94,12 +108,12 @@ export async function runVideoJob(payload: VideoJobPayload): Promise<void> {
         .update(jobs)
         .set({ state: "failed", error: message, updatedAt: new Date() })
         .where(eq(jobs.id, jobId));
-      // Only extract/transcribe own `transcriptStatus` — an `analyze`
-      // failure has no transcript-side effect and must not stomp a video
+      // Only extract/transcribe own `transcriptStatus` — an `analyze` or
+      // `zooms` failure has no transcript-side effect and must not stomp a video
       // that is genuinely `transcribed`, which is exactly what unconditionally
       // setting `error` here would do. The `jobs` row above is where an
       // `analyze` failure actually surfaces (`GET /videos/:id/jobs`).
-      if (job.kind !== "analyze") {
+      if (job.kind === "extract" || job.kind === "transcribe") {
         await tx
           .update(videos)
           .set({ transcriptStatus: "error", updatedAt: new Date() })
@@ -204,12 +218,42 @@ async function findCachedAudio(
 // ---------------------------------------------------------------------------
 
 /**
+ * Peak level, in dBFS, below which the extracted audio is treated as holding
+ * no speech at all.
+ *
+ * Generous on purpose. Quiet narration — a distant laptop microphone, a
+ * soft-spoken narrator — still peaks far above this; a track that never once
+ * crosses it captured nothing. The case this exists for is a screen
+ * recording made with the microphone muted or the wrong input device
+ * selected, which produces audio at around -91 dBFS (ffmpeg's floor for
+ * digital silence) and is otherwise indistinguishable to the pipeline from a
+ * recording with narration.
+ */
+const SILENCE_PEAK_DBFS = -60;
+
+/**
  * Transcribes the extracted audio, or copies a sibling's transcript. Only
  * the audio ever leaves this process — never the source video.
+ *
+ * Two guards stand between Whisper's output and the `transcript_segments`
+ * rows every later stage trusts, both for the same reason: Whisper does not
+ * report silence as silence, it fills it with generic stock phrases and
+ * returns them as an ordinary transcript, so "it came back with segments" is
+ * not evidence that anything was said.
+ *
+ *  1. Silent audio never reaches Whisper at all (`SILENCE_PEAK_DBFS`) — the
+ *     failure is reported as what it is, which is also one fewer API call
+ *     billed for a recording that cannot produce a transcript.
+ *  2. What does come back is filtered for repeated stock phrases
+ *     (`dropLikelyHallucinations`), which catches the partial case the first
+ *     guard cannot see: a recording that is genuinely narrated but has long
+ *     wordless stretches inside it.
  */
 async function runTranscribe(
   orgId: string,
   videoId: string,
+  jobId: string,
+  force: boolean,
   report: ReturnType<typeof makeReporter>,
 ): Promise<void> {
   const video = await withOrg(orgId, async (tx) => {
@@ -219,7 +263,10 @@ async function runTranscribe(
   });
   if (!video.audioKey) throw new Error("audio not extracted yet for this video");
 
-  const cached = video.contentHash ? await findCachedTranscript(orgId, video.contentHash, videoId) : [];
+  const cached =
+    !force && video.contentHash
+      ? await findCachedTranscript(orgId, video.contentHash, videoId)
+      : [];
 
   let segments: TranscriptSegment[];
   if (cached.length > 0) {
@@ -227,11 +274,40 @@ async function runTranscribe(
   } else {
     report(null, "Transcribing audio");
     const audio = await storage.getObjectBytes(video.audioKey);
-    segments = await transcribeAudio(
-      audio,
-      `audio.${storage.audioKeyExt(video.audioKey)}`,
-      (fraction, detail) => report(fraction, detail),
+    const ext = storage.audioKeyExt(video.audioKey);
+
+    // Guard 1. The audio is already in memory, but `volumedetect` needs a
+    // file, and this one is small — 24 kbps Opus, a few MB for a long
+    // recording — so the write costs far less than the Whisper call it can
+    // save.
+    await withScratchDir(jobId, async (dir) => {
+      const audioPath = join(dir, `audio.${ext}`);
+      await writeFile(audioPath, audio);
+      const peak = await peakLevelDb(audioPath);
+      if (peak < SILENCE_PEAK_DBFS) {
+        throw new Error(
+          "this recording's audio is silent — there is no narration to transcribe. " +
+            "Check that the right microphone was selected, and that it was not muted, " +
+            "when the screen was recorded.",
+        );
+      }
+    });
+
+    segments = await transcribeAudio(audio, `audio.${ext}`, (fraction, detail) =>
+      report(fraction, detail),
     );
+
+    // Guard 2. Only ever applied to a fresh transcription — a cached sibling
+    // transcript was already filtered when it was first written, and running
+    // it again would re-count phrases that survived that pass on purpose.
+    const kept = dropLikelyHallucinations(segments);
+    if (kept.length === 0 && segments.length > 0) {
+      throw new Error(
+        "this recording produced no usable transcript — every segment Whisper returned was " +
+          "a repeated stock phrase, which is what it returns for audio with no speech in it.",
+      );
+    }
+    segments = kept;
   }
 
   // One transaction, so a re-run replaces cleanly instead of accumulating
@@ -389,4 +465,66 @@ async function replaceAiSteps(
       source: "ai",
     })),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Zoom suggestions
+// ---------------------------------------------------------------------------
+
+/**
+ * Scans the recording for localized on-screen change and replaces the video's
+ * pending zoom suggestions (`zoom-suggest.ts`). Frames are decoded on this
+ * worker and never leave it — no OpenAI call is involved.
+ *
+ * Writes through `domain/effects.ts`'s `replaceZoomSuggestions` rather than
+ * inserting directly, unlike this file's other stages: it re-checks accepted
+ * regions inside the write transaction, so a zoom someone placed by hand
+ * while this scan ran still wins.
+ */
+async function runSuggestZooms(
+  orgId: string,
+  videoId: string,
+  jobId: string,
+  report: ReturnType<typeof makeReporter>,
+): Promise<void> {
+  const video = await withOrg(orgId, async (tx) => {
+    const [row] = await tx.select().from(videos).where(eq(videos.id, videoId)).limit(1);
+    if (!row) throw new Error(`video ${videoId} does not exist`);
+    if (row.uploadStatus !== "uploaded") throw new Error("this video has not finished uploading yet");
+    return row;
+  });
+
+  await withScratchDir(jobId, async (dir) => {
+    report(null, "Downloading recording");
+    const sourcePath = join(dir, "source");
+    await storage.downloadToFile(video.storageKey, sourcePath);
+    const duration = video.duration ?? (await probeDuration(sourcePath));
+
+    const occupied = await withOrg(orgId, (tx) =>
+      tx
+        .select({ start: zoomRegions.start, end: zoomRegions.end })
+        .from(zoomRegions)
+        .where(and(eq(zoomRegions.videoId, videoId), eq(zoomRegions.source, "manual"))),
+    );
+
+    const expectedFrames = Math.max(1, Math.ceil(duration * ANALYSIS_FPS));
+    let seen = 0;
+    async function* counted(): AsyncGenerator<Uint8Array> {
+      for await (const frame of decodeGrayFrames(sourcePath, ANALYSIS_WIDTH, ANALYSIS_HEIGHT, ANALYSIS_FPS)) {
+        seen++;
+        report(Math.min(1, seen / expectedFrames), "Finding zoom moments");
+        yield frame;
+      }
+    }
+
+    const suggestions = await suggestZooms(counted(), {
+      width: ANALYSIS_WIDTH,
+      height: ANALYSIS_HEIGHT,
+      fps: ANALYSIS_FPS,
+      duration,
+      occupied,
+    });
+
+    await withOrg(orgId, (tx) => replaceZoomSuggestions(tx, orgId, videoId, suggestions));
+  });
 }

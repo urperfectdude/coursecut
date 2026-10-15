@@ -213,6 +213,74 @@ export function mergeChunkSegments(
 }
 
 // ---------------------------------------------------------------------------
+// Hallucination filtering
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimum near-identical occurrences of a short phrase in one transcript
+ * before every instance of it is treated as Whisper hallucination rather
+ * than real repeated speech.
+ */
+const HALLUCINATION_REPEAT_THRESHOLD = 3;
+
+/**
+ * A repeated phrase is only a hallucination candidate if it is at most this
+ * many words. Whisper's silence hallucinations are short generic filler
+ * ("you", "Thank you for watching.", "Please subscribe.") — a bias from its
+ * YouTube-heavy training data. A long sentence repeating this often is far
+ * more likely a narrator restating a point, so it is left alone.
+ */
+const HALLUCINATION_MAX_WORDS = 12;
+
+/** Case- and punctuation-insensitive form, used only to compare two segments'
+ * text: "Thank you for watching." and "thank you for watching" are the same
+ * phrase for this check. */
+function normalizeForHallucinationCheck(text: string): string {
+  return text
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .join(" ");
+}
+
+/**
+ * Drops every segment whose text is a short phrase repeating
+ * `HALLUCINATION_REPEAT_THRESHOLD`+ times across `segments`.
+ *
+ * Whisper has a documented failure mode where silence in the source audio is
+ * filled with a generic stock phrase instead of transcribed as nothing, once
+ * per silent stretch rather than erroring. A narrated screen recording has
+ * plenty of legitimate silence — a pause, a slow page load, a wordless
+ * demonstration — so this is the ordinary case here, not an exotic one.
+ *
+ * **Dropped, not flagged**, unlike the desktop app's equivalent: that schema
+ * carries a `keep` column and a transcript editor to restore a wrong call
+ * with, and StepCut's `transcript_segments` deliberately has neither (see
+ * `schema.ts`). With nowhere to put a soft flag, the choice is between
+ * dropping these rows and feeding them to step analysis as if they were
+ * narration — and a step proposed from a hallucinated "you" is worse than a
+ * missing one. The thresholds above are what keep that safe: a phrase has to
+ * be both short and thrice-repeated before anything is removed, so a real
+ * transcript loses nothing.
+ *
+ * Pure, and exported for direct testing against plain arrays.
+ */
+export function dropLikelyHallucinations(segments: TranscriptSegment[]): TranscriptSegment[] {
+  const counts = new Map<string, number>();
+  for (const segment of segments) {
+    const normalized = normalizeForHallucinationCheck(segment.text);
+    if (!normalized || normalized.split(" ").length > HALLUCINATION_MAX_WORDS) continue;
+    counts.set(normalized, (counts.get(normalized) ?? 0) + 1);
+  }
+
+  return segments.filter(
+    (segment) =>
+      (counts.get(normalizeForHallucinationCheck(segment.text)) ?? 0) < HALLUCINATION_REPEAT_THRESHOLD,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // GPT-5.5 step analysis (Phase 3 — docs/stepcut-plan.md §5.3)
 // ---------------------------------------------------------------------------
 

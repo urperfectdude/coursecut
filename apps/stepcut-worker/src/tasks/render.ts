@@ -33,9 +33,26 @@ import { withOrg } from "../../../stepcut-api/src/db/client.js";
 import { and, eq } from "../../../stepcut-api/src/db/ops.js";
 import { env } from "../../../stepcut-api/src/env.js";
 import { enqueueWebhookJob } from "../../../stepcut-api/src/jobs/queue.js";
-import { jobs, renders, renderSteps, templates, videos } from "../../../stepcut-api/src/db/schema.js";
+import {
+  jobs,
+  renders,
+  renderSteps,
+  templates,
+  videos,
+  type RenderEffects,
+} from "../../../stepcut-api/src/db/schema.js";
 import * as storage from "../../../stepcut-api/src/storage.js";
-import { concatVideos, cutSegment, probeDuration, renderTitleCard, type FfmpegRun } from "../ffmpeg.js";
+import {
+  concatVideos,
+  cutSegment,
+  prepareFrameAssets,
+  probeDuration,
+  probeVideoSize,
+  renderTitleCard,
+  type CutEffects,
+  type FfmpegRun,
+} from "../ffmpeg.js";
+import { isStyled, layoutFor, type FrameStyle } from "../effects.js";
 import { renderHtmlDoc, renderMarkdownDoc, type RenderDocStep } from "./render-docs.js";
 import { withScratchDir } from "../scratch.js";
 import { stat, writeFile } from "node:fs/promises";
@@ -64,6 +81,13 @@ interface TemplatePlan {
   targetWidth: number;
   targetHeight: number;
   targetFps: number;
+  backgroundKind: string;
+  backgroundColor: string;
+  backgroundColor2: string | null;
+  backgroundKey: string | null;
+  framePaddingPx: number;
+  frameRadiusPx: number;
+  frameShadow: number;
 }
 
 interface PendingRender {
@@ -81,6 +105,9 @@ interface PendingRender {
    * layer (this file's header), so the branch below just compares strings. */
   format: string;
   template: TemplatePlan;
+  /** The zoom/speed snapshot taken at creation — null for a render created
+   * before effects existed. */
+  effects: RenderEffects | null;
   steps: Array<{ id: string; start: number; end: number; title: string; summary: string | null }>;
 }
 
@@ -132,6 +159,7 @@ async function claimRender(orgId: string, renderId: string): Promise<PendingRend
         videoId: renders.videoId,
         templateId: renders.templateId,
         format: renders.format,
+        effects: renders.effects,
       })
       .from(renders)
       .where(eq(renders.id, renderId))
@@ -154,6 +182,13 @@ async function claimRender(orgId: string, renderId: string): Promise<PendingRend
         targetWidth: templates.targetWidth,
         targetHeight: templates.targetHeight,
         targetFps: templates.targetFps,
+        backgroundKind: templates.backgroundKind,
+        backgroundColor: templates.backgroundColor,
+        backgroundColor2: templates.backgroundColor2,
+        backgroundKey: templates.backgroundKey,
+        framePaddingPx: templates.framePaddingPx,
+        frameRadiusPx: templates.frameRadiusPx,
+        frameShadow: templates.frameShadow,
       })
       .from(templates)
       .where(eq(templates.id, row.templateId))
@@ -189,6 +224,7 @@ async function claimRender(orgId: string, renderId: string): Promise<PendingRend
       sourceStorageKey: video.storageKey,
       format: row.format,
       template,
+      effects: row.effects ?? null,
       steps: stepRows,
     };
   });
@@ -221,6 +257,7 @@ async function encodeAndUpload(job: PendingRender): Promise<{ sizeBytes: number;
   return withScratchDir(job.id, async (dir) => {
     const sourcePath = join(dir, "source");
     await storage.downloadToFile(job.sourceStorageKey, sourcePath);
+    const effects = await prepareEffects(job, sourcePath, dir);
 
     let logoPath: string | undefined;
     if (job.template.logoKey) {
@@ -254,6 +291,9 @@ async function encodeAndUpload(job: PendingRender): Promise<{ sizeBytes: number;
           targetFps,
           TITLE_CARD_SECONDS,
           cardPath,
+          // An explicit brand color still wins; otherwise a styled frame's
+          // background carries over to the cards.
+          job.template.brandPrimaryHex ? undefined : effects?.frame?.plainBackgroundPath,
         ),
       );
       parts.push(cardPath);
@@ -268,10 +308,20 @@ async function encodeAndUpload(job: PendingRender): Promise<{ sizeBytes: number;
       // cheap next to a real cut and are left out of the weighting entirely.
       const base = elapsed;
       await watchForCancel(job, () =>
-        cutSegment(sourcePath, step.start, step.end, cutPath, targetWidth, targetHeight, targetFps, (fraction) => {
-          const overall = total > 0 ? (base + fraction * stepDuration) / total : fraction;
-          void setProgress(job, overall);
-        }),
+        cutSegment(
+          sourcePath,
+          step.start,
+          step.end,
+          cutPath,
+          targetWidth,
+          targetHeight,
+          targetFps,
+          (fraction) => {
+            const overall = total > 0 ? (base + fraction * stepDuration) / total : fraction;
+            void setProgress(job, overall);
+          },
+          effects,
+        ),
       );
       parts.push(cutPath);
       elapsed += stepDuration;
@@ -325,6 +375,7 @@ async function encodeAndUploadSteps(job: PendingRender): Promise<{ sizeBytes: nu
   return withScratchDir(job.id, async (dir) => {
     const sourcePath = join(dir, "source");
     await storage.downloadToFile(job.sourceStorageKey, sourcePath);
+    const effects = await prepareEffects(job, sourcePath, dir);
 
     let elapsed = 0;
     const docSteps: RenderDocStep[] = [];
@@ -337,10 +388,20 @@ async function encodeAndUploadSteps(job: PendingRender): Promise<{ sizeBytes: nu
       const stepDuration = Math.max(0, step.end - step.start);
       const base = elapsed;
       await watchForCancel(job, () =>
-        cutSegment(sourcePath, step.start, step.end, cutPath, targetWidth, targetHeight, targetFps, (fraction) => {
-          const overall = total > 0 ? (base + fraction * stepDuration) / total : fraction;
-          void setProgress(job, overall);
-        }),
+        cutSegment(
+          sourcePath,
+          step.start,
+          step.end,
+          cutPath,
+          targetWidth,
+          targetHeight,
+          targetFps,
+          (fraction) => {
+            const overall = total > 0 ? (base + fraction * stepDuration) / total : fraction;
+            void setProgress(job, overall);
+          },
+          effects,
+        ),
       );
       elapsed += stepDuration;
 
@@ -380,6 +441,54 @@ async function encodeAndUploadSteps(job: PendingRender): Promise<{ sizeBytes: nu
     await storage.uploadFile(outputKey, docPath, isHtml ? "text/html" : "text/markdown");
     return { sizeBytes: (await stat(docPath)).size, outputKey };
   });
+}
+
+/**
+ * Resolves a render's effects once, before any step is cut: the zoom/speed
+ * snapshot, the layout the recording sits in, and — for a styled template —
+ * the background/mask stills every cut composites onto. Returns `undefined`
+ * when there is nothing to apply, so `cutSegment` keeps its plain path.
+ *
+ * Intro/outro never get effects (`downloadAndNormalizeAsset` doesn't pass
+ * any): a template's own bumper is already the finished look.
+ */
+async function prepareEffects(job: PendingRender, sourcePath: string, dir: string): Promise<CutEffects | undefined> {
+  const { template } = job;
+  const zooms = (job.effects?.zooms ?? []).map((z) => ({
+    start: z.start,
+    end: z.end,
+    scale: z.scale,
+    focusX: z.focus_x,
+    focusY: z.focus_y,
+  }));
+  const speeds = job.effects?.speeds ?? [];
+
+  let style: FrameStyle | undefined = {
+    backgroundKind: (["none", "color", "gradient", "image"] as const).find((k) => k === template.backgroundKind) ?? "none",
+    backgroundColor: template.backgroundColor,
+    backgroundColor2: template.backgroundColor2,
+    paddingPx: template.framePaddingPx,
+    radiusPx: template.frameRadiusPx,
+    shadow: template.frameShadow,
+  };
+  if (style.backgroundKind === "image") {
+    if (template.backgroundKey) {
+      style.backgroundImagePath = join(dir, "background");
+      await storage.downloadToFile(template.backgroundKey, style.backgroundImagePath);
+    } else {
+      // Picked "image" but never uploaded one — fall back to the solid color
+      // rather than failing the whole render over a missing backdrop.
+      style.backgroundKind = "color";
+    }
+  }
+  if (!isStyled(style)) style = undefined;
+
+  if (!style && zooms.length === 0 && speeds.length === 0) return undefined;
+
+  const size = await probeVideoSize(sourcePath);
+  const layout = layoutFor(template.targetWidth, template.targetHeight, size.width, size.height, style?.paddingPx ?? 0);
+  const frame = style ? await prepareFrameAssets(style, layout, dir) : undefined;
+  return { zooms, speeds, layout, frame };
 }
 
 /** Downloads a template asset and re-encodes it to the render's target

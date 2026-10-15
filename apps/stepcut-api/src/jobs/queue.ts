@@ -32,7 +32,7 @@ import { and, eq, sql } from "drizzle-orm";
 import type { Tx } from "../db/client.js";
 import { jobs } from "../db/schema.js";
 
-export type JobKind = "extract" | "transcribe" | "analyze" | "render";
+export type JobKind = "extract" | "transcribe" | "analyze" | "render" | "zooms";
 
 export type JobRow = typeof jobs.$inferSelect;
 
@@ -57,6 +57,7 @@ const OPENING_DETAIL: Record<JobKind, string> = {
   transcribe: "Transcribing audio",
   analyze: "Finding steps",
   render: "Rendering",
+  zooms: "Finding zoom moments",
 };
 
 /**
@@ -108,6 +109,11 @@ function addQueueJob(
  *
  * `attempt` is stamped onto the row — 1 for a fresh import, higher for a
  * retry of the same stage, same convention as apps/api's copy.
+ *
+ * `force` travels in the queue payload rather than on the `jobs` row: it
+ * says how this one run should behave (skip the transcript cache — see
+ * `VideoJobPayload`), not anything about the job worth showing a tenant or
+ * reading back later, and the row is the tenant-visible projection.
  */
 export async function enqueueVideoJob(
   tx: Tx,
@@ -115,6 +121,7 @@ export async function enqueueVideoJob(
   kind: JobKind,
   videoId: string,
   attempt: number,
+  force = false,
 ): Promise<JobRow> {
   const [job] = await tx
     .insert(jobs)
@@ -135,7 +142,12 @@ export async function enqueueVideoJob(
   // the same row. The newer job row wins, and the older one is left
   // `queued` — visible, and harmless, because the worker only ever acts on
   // the id the queue handed it.
-  await addQueueJob(tx, VIDEO_TASK, { job_id: job!.id, org_id: orgId }, `${kind}:${videoId}`);
+  await addQueueJob(
+    tx,
+    VIDEO_TASK,
+    force ? { job_id: job!.id, org_id: orgId, force: true } : { job_id: job!.id, org_id: orgId },
+    `${kind}:${videoId}`,
+  );
 
   return job!;
 }

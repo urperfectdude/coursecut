@@ -40,6 +40,7 @@ import {
   foreignKey,
   index,
   integer,
+  jsonb,
   pgTable,
   text,
   timestamp,
@@ -366,7 +367,7 @@ export const jobs = pgTable(
   {
     id: id(),
     orgId: text("org_id").notNull(),
-    // 'extract' | 'transcribe' | 'analyze' | 'render'.
+    // 'extract' | 'transcribe' | 'analyze' | 'render' | 'zooms'.
     kind: text("kind").notNull(),
     // 'queued' | 'running' | 'done' | 'failed' | 'cancelled'.
     state: text("state").notNull().default("queued"),
@@ -475,6 +476,22 @@ export const templates = pgTable(
     targetWidth: integer("target_width").notNull().default(1920),
     targetHeight: integer("target_height").notNull().default(1080),
     targetFps: integer("target_fps").notNull().default(30),
+    // Styled frame — the recording placed on a background with padding,
+    // rounded corners, and a drop shadow (`apps/stepcut-worker/src/
+    // effects.ts`). All defaults reproduce the plain letterboxed render a
+    // template had before these columns existed.
+    // 'none' | 'color' | 'gradient' | 'image'.
+    backgroundKind: text("background_kind").notNull().default("none"),
+    // `color`'s fill, and `gradient`'s first stop. `#rrggbb`.
+    backgroundColor: text("background_color").notNull().default("#111827"),
+    // `gradient`'s second stop.
+    backgroundColor2: text("background_color2"),
+    // `image`'s uploaded asset — same presigned flow as intro/outro/logo.
+    backgroundKey: text("background_key"),
+    framePaddingPx: integer("frame_padding_px").notNull().default(0),
+    frameRadiusPx: integer("frame_radius_px").notNull().default(0),
+    // Drop-shadow opacity, 0..1; 0 is no shadow.
+    frameShadow: doublePrecision("frame_shadow").notNull().default(0),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -546,6 +563,12 @@ export const renders = pgTable(
     webhookStatus: text("webhook_status"),
     webhookAttempts: integer("webhook_attempts").notNull().default(0),
     webhookLastError: text("webhook_last_error"),
+    // A snapshot of the video's accepted zoom/speed regions at creation time
+    // (`domain/renders.ts`'s `createRender`) — same immutability rule as
+    // `render_steps`: editing a region afterward must not change this
+    // render. `RenderEffects` below; null on renders from before effects
+    // existed, which the worker reads as "no effects".
+    effects: jsonb("effects").$type<RenderEffects>(),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -619,6 +642,80 @@ export const renderSteps = pgTable(
     index("idx_render_steps_render_id").on(t.renderId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// Effects — zoom and speed regions
+// ---------------------------------------------------------------------------
+//
+// Timed effects on a video's *source* timeline, not on a step: a step's
+// boundaries get dragged, split and re-proposed by `analyze`, and a zoom on
+// "the moment the dialog opens" should stay on that moment whichever step it
+// ends up in. The render cuts each step and applies whatever regions overlap
+// it (`apps/stepcut-worker/src/effects.ts`).
+
+/**
+ * `source` is `'manual'` for a region a person made or accepted, or
+ * `'suggested'` for one the `zooms` job proposed that nobody has accepted
+ * yet. Only `'manual'` rows reach a render; re-running suggestions replaces
+ * only the `'suggested'` rows — the same "AI proposes, a human's edit sticks"
+ * rule `steps.source` follows.
+ */
+export const zoomRegions = pgTable(
+  "zoom_regions",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    videoId: text("video_id").notNull(),
+    start: doublePrecision("start").notNull(),
+    end: doublePrecision("end").notNull(),
+    scale: doublePrecision("scale").notNull(),
+    // Normalized 0..1 point in the frame to keep centered.
+    focusX: doublePrecision("focus_x").notNull(),
+    focusY: doublePrecision("focus_y").notNull(),
+    // 'manual' | 'suggested'.
+    source: text("source").notNull().default("manual"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    foreignKey({
+      name: "fk_zoom_regions_video",
+      columns: [t.videoId, t.orgId],
+      foreignColumns: [videos.id, videos.orgId],
+    }).onDelete("cascade"),
+    index("idx_zoom_regions_video_id").on(t.videoId),
+  ],
+);
+
+export const speedRegions = pgTable(
+  "speed_regions",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    videoId: text("video_id").notNull(),
+    start: doublePrecision("start").notNull(),
+    end: doublePrecision("end").notNull(),
+    // Playback rate: 2 is twice as fast, 0.5 half speed.
+    rate: doublePrecision("rate").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    foreignKey({
+      name: "fk_speed_regions_video",
+      columns: [t.videoId, t.orgId],
+      foreignColumns: [videos.id, videos.orgId],
+    }).onDelete("cascade"),
+    index("idx_speed_regions_video_id").on(t.videoId),
+  ],
+);
+
+/** `renders.effects`'s shape — snake_case, like every other JSON this API
+ * stores or serves. */
+export interface RenderEffects {
+  zooms: Array<{ start: number; end: number; scale: number; focus_x: number; focus_y: number }>;
+  speeds: Array<{ start: number; end: number; rate: number }>;
+}
 
 // ---------------------------------------------------------------------------
 // Relations — for Drizzle's query API; no effect on the generated DDL.
@@ -715,4 +812,6 @@ export const TENANT_TABLES = [
   "templates",
   "renders",
   "render_steps",
+  "zoom_regions",
+  "speed_regions",
 ] as const;

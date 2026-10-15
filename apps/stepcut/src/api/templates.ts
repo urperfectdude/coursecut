@@ -20,11 +20,34 @@ export interface Template {
   target_width: number;
   target_height: number;
   target_fps: number;
+  background_kind: BackgroundKind;
+  background_color: string;
+  background_color2: string | null;
+  background_key: string | null;
+  frame_padding_px: number;
+  frame_radius_px: number;
+  /** Drop-shadow opacity, 0..1. */
+  frame_shadow: number;
   created_at: string;
   updated_at: string;
 }
 
-export type TemplateAssetKind = "intro" | "outro" | "logo";
+export type TemplateAssetKind = "intro" | "outro" | "logo" | "background";
+
+export type BackgroundKind = "none" | "color" | "gradient" | "image";
+
+/** The styled-frame fields `updateTemplate` accepts. */
+export type FrameStylePatch = Partial<
+  Pick<
+    Template,
+    | "background_kind"
+    | "background_color"
+    | "background_color2"
+    | "frame_padding_px"
+    | "frame_radius_px"
+    | "frame_shadow"
+  >
+>;
 
 interface TemplateInput {
   project_id: string;
@@ -36,7 +59,7 @@ interface TemplateInput {
   target_fps?: number;
 }
 
-type TemplatePatch = Partial<Omit<TemplateInput, "project_id">>;
+type TemplatePatch = Partial<Omit<TemplateInput, "project_id">> & FrameStylePatch;
 
 interface AssetUploadTicket {
   url: string;

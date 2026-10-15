@@ -26,7 +26,7 @@ import * as storage from "../storage.js";
 
 export const templateRoutes = new Hono<AppEnv>();
 
-const ASSET_KINDS = ["intro", "outro", "logo"] as const;
+const ASSET_KINDS = ["intro", "outro", "logo", "background"] as const;
 
 function isAssetKind(value: string): value is domain.AssetKind {
   return (ASSET_KINDS as readonly string[]).includes(value);
@@ -47,6 +47,12 @@ interface TemplateBody {
   target_width?: number;
   target_height?: number;
   target_fps?: number;
+  background_kind?: string;
+  background_color?: string;
+  background_color2?: string | null;
+  frame_padding_px?: number;
+  frame_radius_px?: number;
+  frame_shadow?: number;
 }
 
 templateRoutes.post("/templates", async (c) => {
@@ -94,6 +100,12 @@ templateRoutes.patch("/templates/:id", async (c) => {
       targetWidth: optionalNumber(body.target_width, "target_width"),
       targetHeight: optionalNumber(body.target_height, "target_height"),
       targetFps: optionalNumber(body.target_fps, "target_fps"),
+      backgroundKind: body.background_kind,
+      backgroundColor: body.background_color,
+      backgroundColor2: body.background_color2,
+      framePaddingPx: optionalNumber(body.frame_padding_px, "frame_padding_px"),
+      frameRadiusPx: optionalNumber(body.frame_radius_px, "frame_radius_px"),
+      frameShadow: optionalNumber(body.frame_shadow, "frame_shadow"),
     }),
   );
   return c.json(serialize.template(row));

@@ -115,6 +115,17 @@ export default function DashboardView({ projectId, onEditSteps }: DashboardViewP
   const [expanded, setExpanded] = useState<Record<string, TranscriptSegment[] | undefined>>({});
   const [stepsExpanded, setStepsExpanded] = useState<Record<string, boolean>>({});
   const [stepsPanels, setStepsPanels] = useState<Record<string, StepsPanel | undefined>>({});
+  // Why a video's pipeline failed, keyed by video id. The status pill can
+  // only say "Error"; the reason lives on the `jobs` row, and for the most
+  // common real failure — a recording whose audio turned out to be silent —
+  // the reason is the entire useful content of the error.
+  const [pipelineErrors, setPipelineErrors] = useState<Record<string, string | undefined>>({});
+  // The `updated_at` each open transcript panel's segments were fetched
+  // against, so a transcript replaced on the server (a re-transcribe) can be
+  // told from the one already on screen. Without it an open panel keeps
+  // showing the segments it loaded when it was opened, however many times
+  // the transcript is regenerated underneath it.
+  const [transcriptStamp, setTranscriptStamp] = useState<Record<string, string | undefined>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -135,6 +146,56 @@ export default function DashboardView({ projectId, onEditSteps }: DashboardViewP
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Fetch the failure reason for any video showing `error` that doesn't have
+  // one yet — one request per newly-failed video, not per poll. A video that
+  // leaves the error state (a retry was queued) drops its cached message so a
+  // second failure re-fetches rather than showing the first one's text.
+  useEffect(() => {
+    for (const video of videos) {
+      if (video.transcript_status !== "error") {
+        if (pipelineErrors[video.id]) {
+          setPipelineErrors((current) => {
+            const rest = { ...current };
+            delete rest[video.id];
+            return rest;
+          });
+        }
+        continue;
+      }
+      if (pipelineErrors[video.id] !== undefined) continue;
+      void getJobs(video.id).then((jobs) => {
+        // Newest first, so the first match is the failure being shown.
+        const failed = jobs.find(
+          (job) => job.state === "failed" && (job.kind === "extract" || job.kind === "transcribe"),
+        );
+        setPipelineErrors((current) => ({
+          ...current,
+          [video.id]: failed?.error ?? "",
+        }));
+      });
+    }
+  }, [videos, pipelineErrors]);
+
+  // Re-fetch an open transcript panel once the video behind it changes —
+  // what makes a finished re-transcribe actually appear, rather than leaving
+  // the panel showing the transcript it was opened with.
+  useEffect(() => {
+    for (const video of videos) {
+      if (!expanded[video.id] || video.transcript_status !== "transcribed") continue;
+      if (transcriptStamp[video.id] === video.updated_at) continue;
+      void getTranscript(video.id)
+        .then((segments) => {
+          // Only if the panel is still open — the user may have closed it
+          // while this was in flight.
+          setExpanded((current) =>
+            current[video.id] ? { ...current, [video.id]: segments } : current,
+          );
+          setTranscriptStamp((current) => ({ ...current, [video.id]: video.updated_at }));
+        })
+        .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
+    }
+  }, [videos, expanded, transcriptStamp]);
 
   // Poll only while something is still moving through the pipeline; stop
   // once everything is settled so an idle dashboard isn't quietly hitting
@@ -185,9 +246,21 @@ export default function DashboardView({ projectId, onEditSteps }: DashboardViewP
     }
   };
 
-  const handleRetryTranscribe = async (id: string) => {
+  /**
+   * Queues transcription again. `force` is what the Re-transcribe button
+   * passes: it runs Whisper afresh instead of accepting a transcript already
+   * cached for these exact bytes, which is the whole point when the
+   * transcript that exists is the thing being complained about.
+   *
+   * Existing steps are deliberately left alone. They were proposed from the
+   * old transcript and a new one can move under them, but they are the
+   * user's edited work — re-running analysis, or discarding them, is their
+   * call to make from the steps panel, not a side effect of asking for a
+   * better transcript.
+   */
+  const handleRetryTranscribe = async (id: string, force = false) => {
     try {
-      const updated = await transcribeVideo(id);
+      const updated = await transcribeVideo(id, force);
       setVideos((current) => current.map((video) => (video.id === id ? updated : video)));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -251,6 +324,12 @@ export default function DashboardView({ projectId, onEditSteps }: DashboardViewP
     try {
       const segments = await getTranscript(id);
       setExpanded((current) => ({ ...current, [id]: segments }));
+      // Stamped here as well as in the refresh effect, so opening a panel
+      // doesn't immediately look stale to that effect and fetch twice.
+      setTranscriptStamp((current) => ({
+        ...current,
+        [id]: videos.find((video) => video.id === id)?.updated_at,
+      }));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -327,6 +406,15 @@ export default function DashboardView({ projectId, onEditSteps }: DashboardViewP
                       {stepsExpanded[video.id] ? "Hide steps" : "Steps"}
                     </Button>
                   )}
+                  {video.transcript_status === "transcribed" && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void handleRetryTranscribe(video.id, true)}
+                    >
+                      Re-transcribe
+                    </Button>
+                  )}
                   {video.transcript_status === "error" && (
                     <Button variant="outline" size="sm" onClick={() => void handleRetryTranscribe(video.id)}>
                       Retry transcription
@@ -336,6 +424,12 @@ export default function DashboardView({ projectId, onEditSteps }: DashboardViewP
                     Delete
                   </Button>
                 </div>
+
+                {video.transcript_status === "error" && pipelineErrors[video.id] && (
+                  <p className="rounded-md bg-destructive/10 p-2 text-sm text-destructive">
+                    {pipelineErrors[video.id]}
+                  </p>
+                )}
 
                 {expanded[video.id] && (
                   <div className="flex max-h-64 flex-col gap-2 overflow-y-auto rounded-md bg-muted/50 p-2">

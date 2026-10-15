@@ -95,13 +95,15 @@ async function reconcileInterrupted(): Promise<void> {
           updatedAt: new Date(),
         })
         .where(eq(jobs.state, "running"))
-        .returning({ videoId: jobs.videoId, renderId: jobs.renderId });
+        .returning({ kind: jobs.kind, videoId: jobs.videoId, renderId: jobs.renderId });
 
       // A video whose extract or transcribe died mid-run has to end up in
       // `error`, or there is no visible way to tell it apart from one still
-      // in progress.
+      // in progress. Only those two stages own `transcriptStatus` — an
+      // interrupted `analyze` or `zooms` job must not mark a perfectly good
+      // transcript as failed (same rule as `tasks/video.ts`'s catch).
       for (const job of stuckJobs) {
-        if (!job.videoId) continue;
+        if (!job.videoId || (job.kind !== "extract" && job.kind !== "transcribe")) continue;
         await tx
           .update(videos)
           .set({ transcriptStatus: "error", updatedAt: new Date() })

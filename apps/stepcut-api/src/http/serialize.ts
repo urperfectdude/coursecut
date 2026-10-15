@@ -11,10 +11,12 @@ import type {
   jobs as jobsTable,
   projects as projectsTable,
   renders as rendersTable,
+  speedRegions as speedRegionsTable,
   steps as stepsTable,
   templates as templatesTable,
   transcriptSegments as transcriptSegmentsTable,
   videos as videosTable,
+  zoomRegions as zoomRegionsTable,
 } from "../db/schema.js";
 
 type ProjectRow = InferSelectModel<typeof projectsTable>;
@@ -24,6 +26,8 @@ type JobRow = InferSelectModel<typeof jobsTable>;
 type StepRow = InferSelectModel<typeof stepsTable>;
 type TemplateRow = InferSelectModel<typeof templatesTable>;
 type RenderRow = InferSelectModel<typeof rendersTable>;
+type ZoomRegionRow = InferSelectModel<typeof zoomRegionsTable>;
+type SpeedRegionRow = InferSelectModel<typeof speedRegionsTable>;
 
 const iso = (value: Date) => value.toISOString();
 
@@ -117,6 +121,31 @@ export function render(row: RenderRow) {
   };
 }
 
+export function zoomRegion(row: ZoomRegionRow) {
+  return {
+    id: row.id,
+    video_id: row.videoId,
+    start: row.start,
+    end: row.end,
+    scale: row.scale,
+    focus_x: row.focusX,
+    focus_y: row.focusY,
+    source: row.source,
+    updated_at: iso(row.updatedAt),
+  };
+}
+
+export function speedRegion(row: SpeedRegionRow) {
+  return {
+    id: row.id,
+    video_id: row.videoId,
+    start: row.start,
+    end: row.end,
+    rate: row.rate,
+    updated_at: iso(row.updatedAt),
+  };
+}
+
 export function template(row: TemplateRow) {
   return {
     id: row.id,
@@ -130,6 +159,13 @@ export function template(row: TemplateRow) {
     target_width: row.targetWidth,
     target_height: row.targetHeight,
     target_fps: row.targetFps,
+    background_kind: row.backgroundKind,
+    background_color: row.backgroundColor,
+    background_color2: row.backgroundColor2,
+    background_key: row.backgroundKey,
+    frame_padding_px: row.framePaddingPx,
+    frame_radius_px: row.frameRadiusPx,
+    frame_shadow: row.frameShadow,
     created_at: iso(row.createdAt),
     updated_at: iso(row.updatedAt),
   };

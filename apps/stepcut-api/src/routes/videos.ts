@@ -320,18 +320,49 @@ videoRoutes.post("/videos/:id/extract", async (c) => {
 });
 
 /**
- * Queues transcription directly — a manual retry without re-extracting. As
- * on extract, only the **extracted audio** ever reaches OpenAI, never the
- * source video.
+ * Queues transcription directly — a manual retry without re-extracting, and
+ * the route behind the dashboard's Re-transcribe button. As on extract, only
+ * the **extracted audio** ever reaches OpenAI, never the source video.
+ *
+ * `force` skips the content-hash transcript cache for this run. A plain retry
+ * wants that cache (a sibling row holding a good transcript of these exact
+ * bytes is the cheapest correct answer there is), but a re-transcribe is
+ * asked for precisely when the transcript that exists is wrong, and copying a
+ * sibling's copy of the same wrong transcript would answer the request by
+ * doing nothing.
+ *
+ * Requires the audio to exist: transcription has nothing to run against
+ * before `extract` has produced it, the same "validate before enqueueing"
+ * choice `/analyze` makes below rather than burning a job row on a request
+ * that cannot succeed.
  */
 videoRoutes.post("/videos/:id/transcribe", async (c) => {
   const id = param(c, "id");
-  const attempt = attemptOf(await c.req.json<{ attempt?: number }>().catch(() => ({})));
+  const body: { attempt?: number; force?: boolean } = await c.req
+    .json<{ attempt?: number; force?: boolean }>()
+    .catch(() => ({}));
+  const attempt = attemptOf(body);
+  const force = body.force === true;
 
   const row = await tx(c, async (t) => {
     const video = await requireVideoRow(t, id);
-    await enqueueVideoJob(t, c.get("orgId"), "transcribe", id, attempt);
-    return video;
+    if (!video.audioKey) {
+      throw badRequest("this video's audio has not been extracted yet");
+    }
+    await enqueueVideoJob(t, c.get("orgId"), "transcribe", id, attempt, force);
+    // Back to `audio_ready` — the audio still exists, the transcript is being
+    // made again. Unlike `/extract`, this is worth writing here rather than
+    // leaving to the worker: the dashboard polls only while a video is
+    // unsettled, so a re-transcribe of an already-`transcribed` video would
+    // otherwise queue silently behind a row that still says it is finished,
+    // and nothing would poll for the result. It also clears an `error` badge
+    // the moment the retry is accepted instead of one worker pickup later.
+    const [updated] = await t
+      .update(videos)
+      .set({ transcriptStatus: "audio_ready", updatedAt: new Date() })
+      .where(eq(videos.id, id))
+      .returning();
+    return updated ?? video;
   });
   return c.json(serialize.video(row));
 });

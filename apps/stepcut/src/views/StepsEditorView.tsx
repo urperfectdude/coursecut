@@ -10,11 +10,9 @@
 // (`apps/stepcut-api/src/domain/steps.ts`), which is what keeps it out of
 // `analyze`'s replace-only-`'ai'`-rows pass on a re-run.
 //
-// Still deliberately smaller than apps/web's `SourceVideoPreview`/
-// `LessonPreviewPlayer` pair for the *whole-recording* player: a plain
-// `<video controls>` (native scrubbing) stands in for a custom timeline —
-// precise enough to prove the interaction, without porting a custom
-// scrubber this phase doesn't need. `StepClipPlayer` (per-row) is its own,
+// The *whole-recording* player is `VideoEffectsEditor`, which also carries
+// the zoom/speed effects timeline and their live preview (effects belong to
+// the video's source timeline, not to any one step). `StepClipPlayer` (per-row) is its own,
 // smaller bespoke transport, for a different reason: a step's few-second
 // clip needs a scrubber scaled to *it*, not to the full recording, which
 // native controls can't do (see that component's header).
@@ -46,6 +44,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import RenderPanel from "@/components/RenderPanel";
 import StepClipPlayer from "@/components/StepClipPlayer";
+import VideoEffectsEditor from "@/components/VideoEffectsEditor";
 import { useVideoSrc } from "@/hooks/useVideoSrc";
 import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "@/lib/timestamp";
 import {
@@ -112,7 +111,6 @@ export default function StepsEditorView({ projectId, videoId, onBack }: StepsEdi
   const [startDrafts, setStartDrafts] = useState<Record<string, string>>({});
   const [endDrafts, setEndDrafts] = useState<Record<string, string>>({});
 
-  const videoRef = useRef<HTMLVideoElement>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const src = useVideoSrc(video?.storage_key ?? "");
 
@@ -420,12 +418,14 @@ export default function StepsEditorView({ projectId, videoId, onBack }: StepsEdi
 
       {!loading && video && (
         <>
-          <video
-            ref={videoRef}
+          <VideoEffectsEditor
+            videoId={videoId}
             src={src}
-            controls
-            className="mb-6 w-full rounded-lg bg-black"
-            onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+            duration={video.duration}
+            steps={sortedSteps}
+            currentTime={currentTime}
+            onTimeUpdate={setCurrentTime}
+            onError={setError}
           />
 
           {sortedSteps.length === 0 ? (

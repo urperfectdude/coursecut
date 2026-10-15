@@ -125,8 +125,14 @@ function extractVideo(videoId: string): Promise<Video> {
   return request<Video>("POST", `/videos/${videoId}/extract`);
 }
 
-export function transcribeVideo(videoId: string): Promise<Video> {
-  return request<Video>("POST", `/videos/${videoId}/transcribe`);
+/**
+ * Queues transcription. `force` re-runs Whisper from scratch rather than
+ * accepting a transcript already cached for these exact bytes — what the
+ * dashboard's Re-transcribe button needs, and what a plain retry of a failed
+ * job does not.
+ */
+export function transcribeVideo(videoId: string, force = false): Promise<Video> {
+  return request<Video>("POST", `/videos/${videoId}/transcribe`, force ? { force: true } : undefined);
 }
 
 export function deleteVideo(id: string): Promise<void> {

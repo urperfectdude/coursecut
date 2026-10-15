@@ -122,7 +122,7 @@ export function videoPrefix(orgId: string, videoId: string): string {
 export function templateAssetKey(
   orgId: string,
   templateId: string,
-  kind: "intro" | "outro" | "logo",
+  kind: "intro" | "outro" | "logo" | "background",
   filename: string,
 ): string {
   return `${PREFIX}/${orgId}/templates/${templateId}/${kind}/${sanitizeFilename(filename)}`;

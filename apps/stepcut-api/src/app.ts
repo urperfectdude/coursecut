@@ -22,6 +22,7 @@ import { orgRoutes } from "./routes/orgs.js";
 import { projectRoutes } from "./routes/projects.js";
 import { videoRoutes } from "./routes/videos.js";
 import { stepRoutes } from "./routes/steps.js";
+import { effectRoutes } from "./routes/effects.js";
 import { templateRoutes } from "./routes/templates.js";
 import { renderRoutes } from "./routes/renders.js";
 import { publicExportRoutes } from "./routes/exports-public.js";
@@ -56,6 +57,7 @@ export function createApp() {
   api.route("/", projectRoutes);
   api.route("/", videoRoutes);
   api.route("/", stepRoutes);
+  api.route("/", effectRoutes);
   api.route("/", templateRoutes);
   api.route("/", renderRoutes);
 

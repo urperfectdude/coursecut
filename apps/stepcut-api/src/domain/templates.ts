@@ -92,6 +92,23 @@ export async function createTemplate(
   return row;
 }
 
+/** `templates.background_kind` — see schema.ts's styled-frame columns. */
+export type BackgroundKind = "none" | "color" | "gradient" | "image";
+const BACKGROUND_KINDS: readonly BackgroundKind[] = ["none", "color", "gradient", "image"];
+
+/** Upper bounds that keep a styled frame recognizably a frame: padding past a
+ * third of the short side would leave the recording a postage stamp, and a
+ * radius is capped again against the actual box at render time. */
+const MAX_FRAME_PADDING_PX = 400;
+const MAX_FRAME_RADIUS_PX = 200;
+
+function validateIntInRange(field: string, value: number, min: number, max: number): number {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw badRequest(`${field} must be a whole number from ${min} to ${max}`);
+  }
+  return value;
+}
+
 export interface TemplatePatch {
   name?: string;
   brandPrimaryHex?: string | null;
@@ -99,6 +116,12 @@ export interface TemplatePatch {
   targetWidth?: number;
   targetHeight?: number;
   targetFps?: number;
+  backgroundKind?: string;
+  backgroundColor?: string;
+  backgroundColor2?: string | null;
+  framePaddingPx?: number;
+  frameRadiusPx?: number;
+  frameShadow?: number;
 }
 
 export async function updateTemplate(tx: Tx, id: string, patch: TemplatePatch): Promise<TemplateRow> {
@@ -116,6 +139,27 @@ export async function updateTemplate(tx: Tx, id: string, patch: TemplatePatch): 
   if (patch.targetWidth !== undefined) set.targetWidth = validatePositiveInt("target_width", patch.targetWidth);
   if (patch.targetHeight !== undefined) set.targetHeight = validatePositiveInt("target_height", patch.targetHeight);
   if (patch.targetFps !== undefined) set.targetFps = validatePositiveInt("target_fps", patch.targetFps);
+  if (patch.backgroundKind !== undefined) {
+    if (!(BACKGROUND_KINDS as readonly string[]).includes(patch.backgroundKind)) {
+      throw badRequest(`background_kind must be one of: ${BACKGROUND_KINDS.join(", ")}`);
+    }
+    set.backgroundKind = patch.backgroundKind;
+  }
+  if (patch.backgroundColor !== undefined) set.backgroundColor = validateHex("background_color", patch.backgroundColor);
+  if (patch.backgroundColor2 !== undefined) {
+    set.backgroundColor2 =
+      patch.backgroundColor2 === null ? null : validateHex("background_color2", patch.backgroundColor2);
+  }
+  if (patch.framePaddingPx !== undefined) {
+    set.framePaddingPx = validateIntInRange("frame_padding_px", patch.framePaddingPx, 0, MAX_FRAME_PADDING_PX);
+  }
+  if (patch.frameRadiusPx !== undefined) {
+    set.frameRadiusPx = validateIntInRange("frame_radius_px", patch.frameRadiusPx, 0, MAX_FRAME_RADIUS_PX);
+  }
+  if (patch.frameShadow !== undefined) {
+    if (!(patch.frameShadow >= 0 && patch.frameShadow <= 1)) throw badRequest("frame_shadow must be from 0 to 1");
+    set.frameShadow = patch.frameShadow;
+  }
 
   const [row] = await tx.update(templates).set(set).where(eq(templates.id, id)).returning();
   return row;
@@ -130,7 +174,7 @@ export async function deleteTemplate(tx: Tx, id: string): Promise<TemplateRow> {
   return existing;
 }
 
-export type AssetKind = "intro" | "outro" | "logo";
+export type AssetKind = "intro" | "outro" | "logo" | "background";
 
 /** Writes the storage key for one of a template's assets, once `headObject`
  * has confirmed it actually landed (routes/templates.ts's job). */
@@ -144,7 +188,8 @@ export async function setTemplateAssetKey(
   const set: Partial<TemplateRow> = { updatedAt: new Date() };
   if (kind === "intro") set.introKey = key;
   else if (kind === "outro") set.outroKey = key;
-  else set.logoKey = key;
+  else if (kind === "logo") set.logoKey = key;
+  else set.backgroundKey = key;
 
   const [row] = await tx.update(templates).set(set).where(eq(templates.id, id)).returning();
   return row;

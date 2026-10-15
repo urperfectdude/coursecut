@@ -92,6 +92,20 @@
       "when": 1788175449236,
       "tag": "0012_rls_export_public_read",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1789641998168,
+      "tag": "0013_effects",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1789641998849,
+      "tag": "0014_rls_effects",
+      "breakpoints": true
     }
   ]
 }

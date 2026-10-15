@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import FrameStyleEditor from "@/components/FrameStyleEditor";
 import { getProject, type Project } from "@/api/projects";
 import {
   createTemplate,
@@ -117,8 +118,8 @@ export default function TemplatesView({ projectId }: TemplatesViewProps) {
         <CardHeader>
           <CardTitle>{project?.name ?? "Project"} — templates</CardTitle>
           <CardDescription>
-            A template holds an intro, outro, logo, and brand colors a render can reuse. Triggering a
-            render from a template comes in a later phase.
+            A template holds an intro, outro, logo, brand colors, and a frame style (background,
+            padding, rounded corners, shadow) a render can reuse.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
@@ -192,6 +193,14 @@ export default function TemplatesView({ projectId }: TemplatesViewProps) {
                       );
                     })}
                   </div>
+
+                  <FrameStyleEditor
+                    template={template}
+                    onSaved={(updated) =>
+                      setTemplates((current) => current.map((row) => (row.id === updated.id ? updated : row)))
+                    }
+                    onError={setError}
+                  />
 
                   <div className="mt-2">
                     <Button variant="ghost" size="sm" onClick={() => void handleDelete(template.id)}>

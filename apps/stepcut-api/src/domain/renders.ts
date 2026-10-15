@@ -17,6 +17,7 @@ import { isIP } from "node:net";
 import type { Tx } from "../db/client.js";
 import { badRequest, notFound } from "../http/errors.js";
 import { renders, renderSteps, steps, videos } from "../db/schema.js";
+import { snapshotEffects } from "./effects.js";
 import { queryTemplate } from "./templates.js";
 
 export const newId = () => crypto.randomUUID();
@@ -173,6 +174,7 @@ export async function createRender(
   }
 
   if (callbackUrl !== undefined) validateCallbackUrl(callbackUrl);
+  const effects = await snapshotEffects(tx, videoId);
 
   const [render] = await tx
     .insert(renders)
@@ -186,6 +188,7 @@ export async function createRender(
       status: "queued",
       progress: null,
       callbackUrl: callbackUrl ?? null,
+      effects,
     })
     .returning();
 
