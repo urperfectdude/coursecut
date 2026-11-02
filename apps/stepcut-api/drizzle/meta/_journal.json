@@ -106,6 +106,20 @@
       "when": 1789641998849,
       "tag": "0014_rls_effects",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1793601147362,
+      "tag": "0015_transcript_words",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1793601148094,
+      "tag": "0016_rls_transcript_words",
+      "breakpoints": true
     }
   ]
 }

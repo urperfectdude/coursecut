@@ -45,6 +45,7 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 
 // Shorthands for the column shapes that repeat on nearly every table.
@@ -325,8 +326,8 @@ export const videos = pgTable(
 /**
  * `id, org_id, video_id, start, end, text` — exactly the plan's §3 listing,
  * nothing more. No `keep` column: dead-air trimming is a lesson-analysis
- * feature StepCut's transcript→steps pipeline doesn't need, so there is no
- * transcript-editing route either.
+ * feature StepCut's transcript→steps pipeline doesn't need. Transcript
+ * editing works on `transcript_words` instead, never on these rows.
  */
 export const transcriptSegments = pgTable(
   "transcript_segments",
@@ -347,6 +348,45 @@ export const transcriptSegments = pgTable(
       foreignColumns: [videos.id, videos.orgId],
     }).onDelete("cascade"),
     index("idx_transcript_segments_video_id").on(t.videoId),
+  ],
+);
+
+/**
+ * Word-level transcript, for text-based editing (docs/rescript-integration-
+ * plan.md): delete words in the transcript, and the video is cut there.
+ *
+ * Written alongside `transcript_segments` by the same transcription, never
+ * instead of it — segments stay what step analysis and every existing view
+ * read. Cuts are derived from `deleted`, never stored, so the only edit
+ * state is that flag and a correction's `text` (with the Whisper original
+ * kept in `original_text`). Times are on the source timeline, the same as
+ * `zoom_regions`/`speed_regions`, so all three compose in one render.
+ *
+ * `idx` is the word's order within the video. Whisper's word times can tie
+ * or overlap by a few ms, so `start` alone is not a stable order.
+ */
+export const transcriptWords = pgTable(
+  "transcript_words",
+  {
+    id: id(),
+    orgId: text("org_id").notNull(),
+    videoId: text("video_id").notNull(),
+    idx: integer("idx").notNull(),
+    text: text("text").notNull(),
+    start: doublePrecision("start").notNull(),
+    end: doublePrecision("end").notNull(),
+    deleted: boolean("deleted").notNull().default(false),
+    originalText: text("original_text"),
+  },
+  (t) => [
+    foreignKey({
+      name: "fk_transcript_words_video",
+      columns: [t.videoId, t.orgId],
+      foreignColumns: [videos.id, videos.orgId],
+    }).onDelete("cascade"),
+    // Unique, not just an index: `idx` is the order the editor relies on,
+    // so a duplicate should fail loudly rather than make the order ambiguous.
+    uniqueIndex("uq_transcript_words_video_idx").on(t.videoId, t.idx),
   ],
 );
 
@@ -748,6 +788,7 @@ export const projectsRelations = relations(projects, ({ many }) => ({
 export const videosRelations = relations(videos, ({ one, many }) => ({
   project: one(projects, { fields: [videos.projectId], references: [projects.id] }),
   transcriptSegments: many(transcriptSegments),
+  transcriptWords: many(transcriptWords),
   jobs: many(jobs),
   steps: many(steps),
   renders: many(renders),
@@ -755,6 +796,10 @@ export const videosRelations = relations(videos, ({ one, many }) => ({
 
 export const transcriptSegmentsRelations = relations(transcriptSegments, ({ one }) => ({
   video: one(videos, { fields: [transcriptSegments.videoId], references: [videos.id] }),
+}));
+
+export const transcriptWordsRelations = relations(transcriptWords, ({ one }) => ({
+  video: one(videos, { fields: [transcriptWords.videoId], references: [videos.id] }),
 }));
 
 export const jobsRelations = relations(jobs, ({ one }) => ({
@@ -814,4 +859,5 @@ export const TENANT_TABLES = [
   "render_steps",
   "zoom_regions",
   "speed_regions",
+  "transcript_words",
 ] as const;

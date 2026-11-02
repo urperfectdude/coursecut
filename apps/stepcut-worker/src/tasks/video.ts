@@ -16,16 +16,24 @@
 // transcription itself, here, once its own job has committed.
 
 import { withOrg, type Tx } from "../../../stepcut-api/src/db/client.js";
-import { and, eq, isNotNull, ne } from "../../../stepcut-api/src/db/ops.js";
-import { jobs, steps, transcriptSegments, videos, zoomRegions } from "../../../stepcut-api/src/db/schema.js";
+import { and, eq, isNotNull, ne, sql } from "../../../stepcut-api/src/db/ops.js";
+import {
+  jobs,
+  steps,
+  transcriptSegments,
+  transcriptWords,
+  videos,
+  zoomRegions,
+} from "../../../stepcut-api/src/db/schema.js";
 import { replaceZoomSuggestions } from "../../../stepcut-api/src/domain/effects.js";
 import * as storage from "../../../stepcut-api/src/storage.js";
 import {
   analyzeSteps,
   dropLikelyHallucinations,
   transcribeAudio,
+  wordsInKeptSegments,
   type StepSuggestion,
-  type TranscriptSegment,
+  type Transcript,
 } from "../../../stepcut-api/src/openai.js";
 import { enqueueVideoJob } from "../../../stepcut-api/src/jobs/queue.js";
 import { decodeGrayFrames, extractAudio, peakLevelDb, probeDuration } from "../ffmpeg.js";
@@ -266,11 +274,11 @@ async function runTranscribe(
   const cached =
     !force && video.contentHash
       ? await findCachedTranscript(orgId, video.contentHash, videoId)
-      : [];
+      : null;
 
-  let segments: TranscriptSegment[];
-  if (cached.length > 0) {
-    segments = cached;
+  let transcript: Transcript;
+  if (cached && cached.segments.length > 0) {
+    transcript = cached;
   } else {
     report(null, "Transcribing audio");
     const audio = await storage.getObjectBytes(video.audioKey);
@@ -293,27 +301,34 @@ async function runTranscribe(
       }
     });
 
-    segments = await transcribeAudio(audio, `audio.${ext}`, (fraction, detail) =>
+    const fresh = await transcribeAudio(audio, `audio.${ext}`, (fraction, detail) =>
       report(fraction, detail),
     );
 
     // Guard 2. Only ever applied to a fresh transcription — a cached sibling
     // transcript was already filtered when it was first written, and running
     // it again would re-count phrases that survived that pass on purpose.
-    const kept = dropLikelyHallucinations(segments);
-    if (kept.length === 0 && segments.length > 0) {
+    // Words go with the segments they sit in, so a dropped "you" is gone from
+    // both.
+    const kept = dropLikelyHallucinations(fresh.segments);
+    if (kept.length === 0 && fresh.segments.length > 0) {
       throw new Error(
         "this recording produced no usable transcript — every segment Whisper returned was " +
           "a repeated stock phrase, which is what it returns for audio with no speech in it.",
       );
     }
-    segments = kept;
+    transcript = {
+      segments: kept,
+      words: wordsInKeptSegments(fresh.words, fresh.segments, kept),
+    };
   }
+  const { segments, words } = transcript;
 
   // One transaction, so a re-run replaces cleanly instead of accumulating
   // alongside whatever the previous attempt left.
   await withOrg(orgId, async (tx) => {
     await tx.delete(transcriptSegments).where(eq(transcriptSegments.videoId, videoId));
+    await tx.delete(transcriptWords).where(eq(transcriptWords.videoId, videoId));
     if (segments.length > 0) {
       await tx.insert(transcriptSegments).values(
         segments.map((segment) => ({
@@ -326,6 +341,21 @@ async function runTranscribe(
         })),
       );
     }
+    // Chunked so an hour-long recording (~9k words) stays well under
+    // Postgres's 65,535 bind-parameter limit per statement.
+    for (let i = 0; i < words.length; i += WORD_INSERT_BATCH) {
+      await tx.insert(transcriptWords).values(
+        words.slice(i, i + WORD_INSERT_BATCH).map((word, offset) => ({
+          id: newId(),
+          orgId,
+          videoId,
+          idx: i + offset,
+          text: word.text,
+          start: word.start,
+          end: word.end,
+        })),
+      );
+    }
     await tx
       .update(videos)
       .set({ transcriptStatus: "transcribed", updatedAt: new Date() })
@@ -333,12 +363,27 @@ async function runTranscribe(
   });
 }
 
-/** A finished transcript for the same bytes, in this org. */
+/** Rows per `transcript_words` insert: 7 columns × 1,000 = 7,000 bind
+ * parameters, far under Postgres's 65,535 cap. */
+const WORD_INSERT_BATCH = 1_000;
+
+/**
+ * A finished transcript for the same bytes, in this org, or null.
+ *
+ * Words come along with segments. Their edit state (`deleted`, corrections)
+ * does not: those are edits to the sibling video, not part of the
+ * transcript, so the copy starts clean.
+ *
+ * Only a sibling that has words counts. One transcribed before word
+ * timestamps existed is a miss, not a source: copying from it would make
+ * another word-less video, and the gap would keep spreading through the
+ * cache. The cost is one Whisper call per pre-words content hash.
+ */
 function findCachedTranscript(
   orgId: string,
   contentHash: string,
   excludeVideoId: string,
-): Promise<TranscriptSegment[]> {
+): Promise<Transcript | null> {
   return withOrg(orgId, async (tx) => {
     const [source] = await tx
       .select({ id: videos.id })
@@ -348,12 +393,13 @@ function findCachedTranscript(
           eq(videos.contentHash, contentHash),
           ne(videos.id, excludeVideoId),
           eq(videos.transcriptStatus, "transcribed"),
+          sql`exists (select 1 from ${transcriptWords} where ${transcriptWords.videoId} = ${videos.id})`,
         ),
       )
       .limit(1);
-    if (!source) return [];
+    if (!source) return null;
 
-    return tx
+    const segments = await tx
       .select({
         start: transcriptSegments.start,
         end: transcriptSegments.end,
@@ -362,6 +408,17 @@ function findCachedTranscript(
       .from(transcriptSegments)
       .where(eq(transcriptSegments.videoId, source.id))
       .orderBy(transcriptSegments.start, transcriptSegments.id);
+    const words = await tx
+      .select({
+        start: transcriptWords.start,
+        end: transcriptWords.end,
+        // The Whisper text, not a correction made on the sibling.
+        text: sql<string>`coalesce(${transcriptWords.originalText}, ${transcriptWords.text})`,
+      })
+      .from(transcriptWords)
+      .where(eq(transcriptWords.videoId, source.id))
+      .orderBy(transcriptWords.idx);
+    return { segments, words };
   });
 }
 

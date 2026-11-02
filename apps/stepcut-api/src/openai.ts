@@ -32,6 +32,20 @@ export interface TranscriptSegment {
 }
 
 /**
+ * One word with its own timing — the unit text-based editing (deleting words
+ * to cut the video) works in. Same shape as a segment; Whisper's word text
+ * carries no punctuation, unlike segment text.
+ */
+export type TranscriptWord = TranscriptSegment;
+
+/** Everything one transcription returns: segments (what step analysis and
+ * every existing view read) and words (what text-based editing reads). */
+export interface Transcript {
+  segments: TranscriptSegment[];
+  words: TranscriptWord[];
+}
+
+/**
  * Whisper's documented upload cap is 25 MB. Kept comfortably under it (a ~1 MB
  * margin) so multipart header overhead never pushes a "just under" file over.
  */
@@ -114,7 +128,7 @@ export async function transcribeAudio(
   audioBytes: Uint8Array<ArrayBuffer>,
   fileName: string,
   onProgress: (fraction: number | null, detail: string | null) => void,
-): Promise<TranscriptSegment[]> {
+): Promise<Transcript> {
   if (audioBytes.byteLength <= SAFE_UPLOAD_BYTES) {
     onProgress(null, null);
     return uploadChunk(audioBytes, fileName, mimeFor(fileName));
@@ -130,24 +144,28 @@ export async function transcribeAudio(
   const total = chunks.length;
   onProgress(null, null);
 
-  const results: Array<[TranscriptSegment[], number]> = [];
+  const results: Array<[Transcript, number]> = [];
   for (const [index, chunk] of chunks.entries()) {
     onProgress((index + 1) / total, `chunk ${index + 1} of ${total}`);
     // A chunk failing fails the whole transcription, so no partial or
     // ambiguous transcript is ever written.
-    const segments = await uploadChunk(
+    const transcript = await uploadChunk(
       chunk.bytes,
       `chunk-${String(index).padStart(3, "0")}-${fileName}`,
       "audio/wav",
     );
-    results.push([segments, chunk.startOffsetSecs]);
+    results.push([transcript, chunk.startOffsetSecs]);
   }
 
-  return mergeChunkSegments(results);
+  return {
+    segments: mergeChunkSegments(results.map(([t, offset]) => [t.segments, offset])),
+    words: mergeChunkSegments(results.map(([t, offset]) => [t.words, offset])),
+  };
 }
 
 interface WhisperResponse {
   segments?: Array<{ start: number; end: number; text: string }>;
+  words?: Array<{ start: number; end: number; word: string }>;
 }
 
 /** A RIFF/WAVE header — i.e. audio extracted before the move to Opus. */
@@ -172,12 +190,17 @@ async function uploadChunk(
   audioBytes: Uint8Array<ArrayBuffer>,
   fileName: string,
   mime: string,
-): Promise<TranscriptSegment[]> {
+): Promise<Transcript> {
   const form = new FormData();
   form.set("model", TRANSCRIPTION_MODEL);
   // Segment-level timestamps; the plain response format has none, and the
   // whole editing model downstream is built on them.
   form.set("response_format", "verbose_json");
+  // Word timestamps too, for text-based editing. Asking for `word` alone
+  // drops segments from the response, so both granularities are named. Same
+  // request, same audio, no extra cost.
+  form.append("timestamp_granularities[]", "segment");
+  form.append("timestamp_granularities[]", "word");
   form.set("file", new Blob([audioBytes], { type: mime }), fileName);
 
   const response = await callOpenAi(
@@ -188,11 +211,16 @@ async function uploadChunk(
   );
 
   const parsed = (await response.json()) as WhisperResponse;
-  return (parsed.segments ?? []).map((segment) => ({
-    start: segment.start,
-    end: segment.end,
-    text: segment.text,
-  }));
+  return {
+    segments: (parsed.segments ?? []).map((segment) => ({
+      start: segment.start,
+      end: segment.end,
+      text: segment.text,
+    })),
+    words: (parsed.words ?? [])
+      .map((word) => ({ start: word.start, end: word.end, text: word.word.trim() }))
+      .filter((word) => word.text.length > 0),
+  };
 }
 
 /**
@@ -278,6 +306,35 @@ export function dropLikelyHallucinations(segments: TranscriptSegment[]): Transcr
     (segment) =>
       (counts.get(normalizeForHallucinationCheck(segment.text)) ?? 0) < HALLUCINATION_REPEAT_THRESHOLD,
   );
+}
+
+/**
+ * The words that survive `dropLikelyHallucinations`: a word is dropped when
+ * its midpoint sits inside a dropped segment and inside no kept one.
+ *
+ * Whisper returns words and segments as two flat lists with no link between
+ * them, so time is the only join. "Inside no kept one" is the tie-break for
+ * the edges, where adjacent segments touch or overlap by a few ms: a word
+ * there stays, because losing real narration is worse than keeping a stray
+ * filler word, and anything kept can still be deleted in the editor. A word
+ * outside every segment (timestamps drift) also stays, for the same reason.
+ *
+ * Pure, and exported for direct testing against plain arrays.
+ */
+export function wordsInKeptSegments(
+  words: TranscriptWord[],
+  allSegments: TranscriptSegment[],
+  keptSegments: TranscriptSegment[],
+): TranscriptWord[] {
+  const kept = new Set(keptSegments);
+  const dropped = allSegments.filter((segment) => !kept.has(segment));
+  if (dropped.length === 0) return words;
+
+  const covers = (segment: TranscriptSegment, t: number) => t >= segment.start && t <= segment.end;
+  return words.filter((word) => {
+    const mid = (word.start + word.end) / 2;
+    return !dropped.some((s) => covers(s, mid)) || keptSegments.some((s) => covers(s, mid));
+  });
 }
 
 // ---------------------------------------------------------------------------

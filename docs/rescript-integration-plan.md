@@ -192,6 +192,13 @@ CREATE INDEX ON transcript_words (video_id, idx);
 * Backfill: existing videos have no words. The Re-transcribe button (already built, `force: true`) fills them. No automatic re-billing.
 * **Privacy:** no change. Same audio goes to the same endpoint. Confirm against `coursecut-privacy-invariants` anyway.
 
+**Status: done (2026-11-02).** Migrations `0015_transcript_words` (with a unique `(video_id, idx)` index) and `0016_rls_transcript_words`. Notes from building it:
+
+* The transcript cache only copies from a sibling that has words. A sibling transcribed before this change counts as a miss, so word-less transcripts don't spread. That costs one Whisper call per pre-change content hash. Edit state is never copied.
+* Whisper's word text has no punctuation, unlike segment text. Phase 2 must decide how to display words (probably join punctuation back from segment text).
+* Whisper word timings are rough: some words come back with zero length, and some absorb the pause after them. A small lead pad in Phase 3 covers it for now; Phase 4 alignment is the real fix.
+* **For Phase 2:** a retry or re-transcribe deletes and rewrites `transcript_words`, which will wipe `deleted` flags and corrections once those exist. Phase 2 must either warn before re-transcribing an edited video or carry edits across.
+
 ### Phase 2 — Text editing in the Steps editor (3–5 days)
 
 * Copy the pure core (§6 architecture) into `apps/stepcut/src/lib/`.
