@@ -1451,8 +1451,14 @@ pub(crate) fn lesson_cut_args(
         }
     }
     args.extend(["-c:v", "libx264", "-c:a", "aac"].into_iter().map(str::to_string));
-    if let Some(stream) = &extras.stream {
-        args.extend(stream_param_args(stream));
+    match &extras.stream {
+        Some(stream) => args.extend(stream_param_args(stream)),
+        // Always 4:2:0. The pieces of one export are joined by stream copy,
+        // and a piece that went through a filter (shape, overlay) comes out
+        // yuv420p while an unfiltered one would keep a 4:4:4 or 4:2:2
+        // source's format: a mixed file that players trusting its header
+        // misdecode. 4:2:0 is also what every player supports.
+        None => args.extend(["-pix_fmt", "yuv420p"].into_iter().map(str::to_string)),
     }
     args.extend(["-progress", "pipe:1", "-nostats", output_path].into_iter().map(str::to_string));
     args
@@ -1982,7 +1988,7 @@ mod region_filter_tests {
         assert_eq!(
             args,
             [
-                "-y", "-ss", "5", "-i", "/in.mp4", "-t", "7.5", "-c:v", "libx264", "-c:a", "aac", "-progress",
+                "-y", "-ss", "5", "-i", "/in.mp4", "-t", "7.5", "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p", "-progress",
                 "pipe:1", "-nostats", "/out.mp4"
             ]
         );
@@ -2142,6 +2148,7 @@ mod slide_tests {
                 "libx264",
                 "-c:a",
                 "aac",
+                "-pix_fmt", "yuv420p",
                 "-progress",
                 "pipe:1",
                 "-nostats",
@@ -2308,7 +2315,7 @@ mod slide_tests {
             plain,
             [
                 "-y", "-ss", "5", "-i", "/in.mp4", "-t", "7.5", "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264",
-                "-c:a", "aac", "-progress", "pipe:1", "-nostats", "/out.mp4"
+                "-c:a", "aac", "-pix_fmt", "yuv420p", "-progress", "pipe:1", "-nostats", "/out.mp4"
             ]
         );
 

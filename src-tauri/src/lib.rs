@@ -101,6 +101,7 @@ pub fn run() {
             openai::fetch_word_timestamps,
             words::list_transcript_words,
             words::update_transcript_words,
+            words::list_transcript_pauses,
             openai::analyze_video,
             openai::preview_lesson_segment_edit,
             openai::apply_lesson_segment_edit,

@@ -10,7 +10,8 @@ starts with a header naming its source file and commit.
   Code from later commits is licensed PolyForm Noncommercial 1.0.0 and is
   **not** used in CourseCut. See `docs/text-editing-plan.md` §2.
 * Adapted files: `src/lib/text-edit.ts`, `src/lib/text-edit.test.ts`,
-  `src/hooks/useWordSelection.ts`, `src/lib/transcript-words.ts` (`findActiveWordIndex` only)
+  `src/hooks/useWordSelection.ts`, `src/lib/transcript-words.ts` (`findActiveWordIndex` only),
+  `src/lib/fillers.ts`
 
 ```
 MIT License

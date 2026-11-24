@@ -7,7 +7,7 @@
  * the 0.15 s "still speaking" tail is a named constant. The rest is ours.
  */
 
-import type { TranscriptSegment, TranscriptWord } from "../db";
+import type { PauseAction, TranscriptSegment, TranscriptWord } from "../db";
 import { getCutRanges, getEditedDuration, type TimeRange, type Word } from "./text-edit.ts";
 
 /** How long after a word's end it still counts as the active word. */
@@ -31,9 +31,19 @@ export interface EditSummary {
   editedDuration: number;
 }
 
-export function summarizeEdits(words: readonly TranscriptWord[], duration: number): EditSummary {
+/** All cuts: removed words plus decided pauses, merged. */
+export function summarizeEdits(
+  words: readonly TranscriptWord[],
+  duration: number,
+  pauses: readonly Pause[] = [],
+  pauseActions: ReadonlyMap<string, PauseAction> = new Map(),
+): EditSummary {
   if (duration <= 0) return { cuts: [], editedDuration: 0 };
-  const cuts = getCutRanges(toEditWords(words), duration);
+  const pauseCuts = pauses.flatMap((pause) => {
+    const cut = pauseCut(pause, pauseActions.get(pause.afterWordId));
+    return cut ? [cut] : [];
+  });
+  const cuts = getCutRanges(toEditWords(words), duration, pauseCuts);
   return { cuts, editedDuration: getEditedDuration(cuts, duration) };
 }
 
@@ -119,7 +129,11 @@ export function punctuateWords(segmentText: string, words: readonly { text: stri
   const tokens = segmentText.split(/\s+/).filter(Boolean);
   const tokenKeys = tokens.map(normalizeToken);
   const out = words.map((word) => word.text);
-  let t = 0;
+  // Words may start part-way into the segment (a lesson segment cut
+  // there): begin at the first token matching the first word.
+  const firstKey = words.length > 0 ? normalizeToken(words[0].text) : "";
+  const startAt = firstKey ? tokenKeys.indexOf(firstKey) : -1;
+  let t = startAt > 0 ? startAt : 0;
   let w = 0;
   while (t < tokens.length && w < words.length) {
     const wordKey = normalizeToken(words[w].text);
@@ -161,4 +175,147 @@ export function punctuateWords(segmentText: string, words: readonly { text: stri
     w++;
   }
   return out;
+}
+
+// --- Pauses (docs/text-editing-plan.md §6.1, §6.5) -------------------------
+
+/** A gap between words at least this long is a "long pause". */
+export const LONG_PAUSE_S = 1.0;
+/** "Shorten" leaves this much of the pause. */
+export const SHORTENED_PAUSE_S = 0.3;
+/** "Remove" still leaves this much beside the speech on each side, so word
+ * edges aren't clipped. */
+export const PAUSE_EDGE_PAD_S = 0.05;
+
+export interface Pause {
+  /** The word before the pause; decisions are keyed by its id. */
+  afterWordId: string;
+  afterIdx: number;
+  start: number;
+  end: number;
+}
+
+/** Gaps of at least `minGap` seconds between consecutive words. Depends on
+ * word timing only, not on which words are removed. */
+export function findPauses(words: readonly TranscriptWord[], minGap = LONG_PAUSE_S): Pause[] {
+  const pauses: Pause[] = [];
+  for (let i = 0; i + 1 < words.length; i++) {
+    const start = words[i].end;
+    const end = words[i + 1].start;
+    if (end - start >= minGap) {
+      pauses.push({ afterWordId: words[i].id, afterIdx: words[i].idx, start, end });
+    }
+  }
+  return pauses;
+}
+
+/** The part of a pause that the decision cuts, or null to keep it whole. */
+export function pauseCut(pause: Pause, action: PauseAction | null | undefined): TimeRange | null {
+  const gap = pause.end - pause.start;
+  if (action === "shorten") {
+    if (gap <= SHORTENED_PAUSE_S) return null;
+    const keepEachSide = SHORTENED_PAUSE_S / 2;
+    return { start: pause.start + keepEachSide, end: pause.end - keepEachSide };
+  }
+  if (action === "remove") {
+    if (gap <= 2 * PAUSE_EDGE_PAD_S) return null;
+    return { start: pause.start + PAUSE_EDGE_PAD_S, end: pause.end - PAUSE_EDGE_PAD_S };
+  }
+  return null;
+}
+
+// --- Lesson script (docs/text-editing-plan.md §6.3) -----------------------
+
+export interface ScriptParagraph {
+  /** Unique within the script: one transcript segment can appear in two
+   * lesson segments. */
+  key: string;
+  /** Source of the paragraph's timestamp and punctuation. */
+  segment: TranscriptSegment;
+  /** In time order, contiguous in `idx`. */
+  words: TranscriptWord[];
+  /** Shown above the first paragraph of each lesson segment. */
+  header?: string;
+}
+
+/**
+ * A lesson's words as paragraphs, in the lesson's own segment order (which
+ * need not be time order). Each lesson segment contributes the words whose
+ * start falls inside it, grouped by transcript segment as on the
+ * Transcript page. `words` must be the whole video's list sorted by start.
+ *
+ * `previous` (keyed like `key`) lets untouched paragraphs keep their word
+ * arrays, so memoised paragraphs skip re-rendering after an edit.
+ */
+export function groupLessonParagraphs(
+  lessonSegments: readonly { id: string; start: number; end: number }[],
+  transcriptSegments: readonly TranscriptSegment[],
+  words: readonly TranscriptWord[],
+  previous?: ReadonlyMap<string, TranscriptWord[]>,
+  headerFor: (index: number, segment: { start: number; end: number }) => string = (index) =>
+    `Segment ${index + 1}`,
+): ScriptParagraph[] {
+  const out: ScriptParagraph[] = [];
+  lessonSegments.forEach((lessonSegment, index) => {
+    const inRange = wordsInRange(words, lessonSegment.start, lessonSegment.end);
+    if (inRange.length === 0) return;
+    const overlapping = transcriptSegments.filter(
+      (segment) => segment.end > lessonSegment.start && segment.start < lessonSegment.end,
+    );
+    const groups =
+      overlapping.length > 0
+        ? groupIntoParagraphs(overlapping, inRange)
+        : [{ segment: syntheticSegment(lessonSegment), words: inRange }];
+    let first = true;
+    for (const group of groups) {
+      if (group.words.length === 0) continue;
+      const key = `${lessonSegment.id}:${group.segment.id}`;
+      const old = previous?.get(key);
+      const same =
+        old !== undefined && old.length === group.words.length && old.every((w, j) => w === group.words[j]);
+      out.push({
+        key,
+        segment: group.segment,
+        words: same ? old : group.words,
+        header: first ? headerFor(index, lessonSegment) : undefined,
+      });
+      first = false;
+    }
+  });
+  return out;
+}
+
+/** Words whose start is in [start, end), by binary search. */
+export function wordsInRange(words: readonly TranscriptWord[], start: number, end: number): TranscriptWord[] {
+  let lo = 0;
+  let hi = words.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (words[mid].start < start) lo = mid + 1;
+    else hi = mid;
+  }
+  const out: TranscriptWord[] = [];
+  for (let i = lo; i < words.length && words[i].start < end; i++) out.push(words[i]);
+  return out;
+}
+
+function syntheticSegment(range: { id: string; start: number; end: number }): TranscriptSegment {
+  return { id: range.id, video_id: "", start: range.start, end: range.end, text: "", keep: true };
+}
+
+/** Total length of `ranges` minus the parts covered by `cuts`. */
+export function lengthAfterCuts(
+  ranges: readonly { start: number; end: number }[],
+  cuts: readonly TimeRange[],
+): number {
+  let total = 0;
+  for (const range of ranges) {
+    let length = Math.max(0, range.end - range.start);
+    for (const cut of cuts) {
+      const overlap = Math.min(range.end, cut.end) - Math.max(range.start, cut.start);
+      if (overlap > 0) length -= overlap;
+    }
+    total += Math.max(0, length);
+  }
+  return total;
 }

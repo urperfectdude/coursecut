@@ -466,7 +466,7 @@ Turning every word cut into its own piece would mean hundreds of ffmpeg runs and
 * **Phase 2 must:** label `fetch_word_timestamps` progress as "Getting word timings", not as re-transcribing (it reuses the Transcribing progress events).
 * **Still to check by hand:** transcribe one real recording and confirm `transcript_words` fills with sensible timings.
 
-**Phase 2 status: built and reviewed (2026-11-24), pending a hands-on check.**
+**Phase 2 status: built and reviewed (2026-11-24); its Transcript-page UI was then removed, see "Change of direction" below.**
 
 * **Transcript page, word mode** (when the video has word timings):
   * Paragraphs of words, one per segment, with punctuation and casing copied from the segment text (`punctuateWords`, display only).
@@ -506,6 +506,36 @@ Turning every word cut into its own piece would mean hundreds of ffmpeg runs and
   * whether seeking stutters on a real screen recording
   * scroll and select speed on a 2-hour transcript
   * whether the original video file plays on the Transcript page for the recordings that once needed the per-segment WAV workaround. The Lesson editor already plays them directly.
+
+**Change of direction (2026-11-24): word editing lives only on the lesson edit screen.** After trying Phase 2, the user decided the Transcript page (where lessons are created) should not edit by word. The Transcript page is back to its sentence list with keep/drop toggles; those toggles still update the words underneath (`db::update_transcript_segment`). Word editing moved to the lesson screen as Phase 5's layout, built ahead of Phase 3b:
+
+* **Lesson screen layout (§6.3):**
+  * Tabs on the left: **Script** (default), Segments, Overlays, Blur & cover, Intro/Outro. Panels stay mounted and are hidden, so drafts survive switching.
+  * One sticky video on the right with a **Final video / Original recording** toggle. Overlays, Blur & cover and Intro/Outro switch it to Final.
+  * The lesson's length before → after cuts sits under the title.
+  * One undo stack for word and segment edits; ⌘Z / ⇧⌘Z.
+* **Script tab** (`LessonScript`):
+  * This lesson's words in lesson order under "Segment N" headers, clipped to each segment's range.
+  * Quick cleanup card for the lesson: fillers plus undecided long pauses, one undo step.
+  * Pause chips; amber-underlined fillers; show/hide removed.
+  * "Get word timings" when the video has none.
+  * An amber note that exports don't apply cuts yet.
+* **The Final video** skips removed words and pauses (`LessonPreviewPlayer` `skipRanges`). Clicking a word seeks there (`seekToSource`).
+* **Phase 3a** (filler and pause detection, pause decisions, Quick cleanup) is built into this.
+* **Not done from Phase 5:**
+  * keeping the playback position when switching Final/Original
+  * Fix spelling
+  * first/last words per segment in the Segments tab
+  * word-snapped trims
+* **Review (independent-reviewer): nothing blocking.** Fixed:
+  * **Undo:** one step at a time, and ⌘Z ignores key repeat and open dialogs. Holding ⌘Z could interleave segment snapshot restores.
+  * **Hidden Script tab:** it can't remove words (its selection is dropped when you leave the tab).
+  * **The Final player stays mounted** while Original shows, so clicking a word always seeks and toggling no longer resets playback.
+  * **The cleanup message's Undo** disappears once any other edit lands on the undo stack.
+  * **The word highlight and follow mode** are refreshed when returning to the Script tab.
+  * **"Back to playhead"** no longer covers the AI prompt. Under 1000 px the video no longer sticks over the tab bar.
+  * **Segment keep flags:** a word save now re-derives them only for segments containing a changed word, so Transcript-page keep/drop choices elsewhere aren't overwritten.
+* **Next: Phase 3b + 4 together.** Export with cuts, and overlays/shapes/slide windows moved onto the edited timeline. The Final video's scrubber still shows the uncut lesson length until then.
 
 About **15–20 working days** for Phases 0–5.
 

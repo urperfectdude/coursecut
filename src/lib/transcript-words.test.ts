@@ -4,11 +4,16 @@
 
 import {
   findActiveWordIndex,
+  findPauses,
   formatLength,
   groupIntoParagraphs,
+  groupLessonParagraphs,
+  lengthAfterCuts,
+  pauseCut,
   punctuateWords,
   summarizeEdits,
 } from "./transcript-words.ts";
+import { findFillerWordIdxs, isFillerWord } from "./fillers.ts";
 import type { TranscriptSegment, TranscriptWord } from "../db.ts";
 
 function assert(cond: boolean, msg: string) {
@@ -73,6 +78,12 @@ eq(
   "no match keeps word text",
 );
 
+eq(
+  punctuateWords("Well, first we open the admin panel, then we check in.", [w("then"), w("we"), w("check"), w("in")]),
+  ["then", "we", "check", "in."],
+  "words starting mid-segment still pick up punctuation",
+);
+
 // --- groupIntoParagraphs ---
 {
   const segments = [segment("a", 1, 5), segment("b", 6, 9)];
@@ -109,5 +120,54 @@ eq(
 // --- formatLength ---
 eq(formatLength(65), "1:05", "minutes");
 eq(formatLength(3723), "1:02:03", "hours");
+
+// --- pauses ---
+{
+  const words = [word(0, "a", 0, 1), word(1, "b", 1.2, 2), word(2, "c", 4, 5), word(3, "d", 5.5, 6)];
+  const pauses = findPauses(words);
+  eq(pauses.map((p) => [p.afterIdx, p.start, p.end]), [[1, 2, 4]], "only the 2 s gap is long");
+  eq(pauseCut(pauses[0], "shorten"), { start: 2.15, end: 3.85 }, "shorten keeps 0.3 s");
+  eq(pauseCut(pauses[0], "remove"), { start: 2.05, end: 3.95 }, "remove keeps edge pads");
+  eq(pauseCut(pauses[0], "keep"), null, "keep cuts nothing");
+  eq(pauseCut(pauses[0], undefined), null, "undecided cuts nothing");
+
+  const actions = new Map([[pauses[0].afterWordId, "shorten" as const]]);
+  const { cuts, editedDuration } = summarizeEdits(words, 6, pauses, actions);
+  eq(cuts, [{ start: 2.15, end: 3.85 }], "pause cut included");
+  assert(Math.abs(editedDuration - 4.3) < 1e-9, "edited duration with pause cut");
+}
+
+// --- fillers ---
+assert(isFillerWord("Um,") && isFillerWord("uh-huh") && isFillerWord("hmm."), "fillers detected");
+assert(!isFillerWord("like") && !isFillerWord("so") && !isFillerWord("umbrella"), "real words kept");
+eq(
+  findFillerWordIdxs([word(0, "um", 0, 1), word(1, "ok", 1, 2), word(2, "uh", 2, 3, true)]),
+  [0],
+  "only unremoved fillers",
+);
+
+// --- lesson script ---
+{
+  const tsegs = [segment("t1", 0, 5, "One two."), segment("t2", 5, 10, "Three four.")];
+  const words = [word(0, "one", 1, 1.5), word(1, "two", 2, 2.5), word(2, "three", 6, 6.5), word(3, "four", 8, 8.5)];
+  // Lesson plays 5–10 first, then 0–3 (reordered), and skips "two".
+  const lesson = [
+    { id: "L1", start: 5, end: 10 },
+    { id: "L2", start: 0, end: 2 },
+  ];
+  const paras = groupLessonParagraphs(lesson, tsegs, words);
+  eq(paras.map((p) => [p.key, p.header ?? "", p.words.map((w) => w.text)]), [
+    ["L1:t2", "Segment 1", ["three", "four"]],
+    ["L2:t1", "Segment 2", ["one"]],
+  ], "lesson order, clipped to lesson ranges");
+
+  const previous = new Map(paras.map((p) => [p.key, p.words]));
+  const edited = [words[0], words[1], { ...words[2], removed: true }, words[3]];
+  const again = groupLessonParagraphs(lesson, tsegs, edited, previous);
+  assert(again[1].words === paras[1].words, "untouched lesson paragraph reused");
+  assert(again[0].words !== paras[0].words, "edited lesson paragraph replaced");
+
+  eq(lengthAfterCuts([{ start: 0, end: 10 }, { start: 20, end: 25 }], [{ start: 2, end: 4 }, { start: 24, end: 30 }]), 12, "length after cuts");
+}
 
 console.log("transcript-words-test: all passed");

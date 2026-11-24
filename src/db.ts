@@ -199,13 +199,28 @@ export async function listTranscriptWords(videoId: string): Promise<TranscriptWo
   return invoke<TranscriptWord[]>("list_transcript_words", { videoId });
 }
 
-/** Saves a batch of word removals/restores and returns the video's
- * segments, whose `keep` flags are re-derived from their words. Local only. */
+export type PauseAction = "shorten" | "remove" | "keep";
+
+/** The user's decision on the pause after word `after_word_id`. */
+export interface PauseDecision {
+  after_word_id: string;
+  action: PauseAction | null;
+}
+
+export async function listTranscriptPauses(videoId: string): Promise<PauseDecision[]> {
+  return invoke<PauseDecision[]>("list_transcript_pauses", { videoId });
+}
+
+/** Saves a batch of word removals/restores and pause decisions (entries
+ * with `action: null` clear that decision). Returns the video's segments;
+ * the `keep` flag of each segment containing a changed word is re-derived
+ * from its words. Local only. */
 export async function updateTranscriptWords(
   videoId: string,
   changes: { id: string; removed: boolean }[],
+  pauses: PauseDecision[] = [],
 ): Promise<TranscriptSegment[]> {
-  return invoke<TranscriptSegment[]>("update_transcript_words", { videoId, changes });
+  return invoke<TranscriptSegment[]>("update_transcript_words", { videoId, changes, pauses });
 }
 
 // "Listen again for word-level editing": sends the video's already-extracted

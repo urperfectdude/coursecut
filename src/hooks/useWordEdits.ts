@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { updateTranscriptWords, type TranscriptSegment, type TranscriptWord } from "../db";
+import {
+  updateTranscriptWords,
+  type PauseAction,
+  type PauseDecision,
+  type TranscriptSegment,
+  type TranscriptWord,
+} from "../db";
 
 /** Saves land this long after the last edit (docs/text-editing-plan.md §8.0). */
 const SAVE_DEBOUNCE_MS = 500;
@@ -10,11 +16,13 @@ const SAVE_RETRY_MS = 3000;
  * Word edit state for one video: applied in memory at once, undoable
  * instantly, and saved in the background.
  *
- * - Undo/redo are snapshot stacks of the whole word array (the approach of
- *   Rescript v1.0.9's `lib/store.ts`, reimplemented here without zustand).
- *   An edit replaces only the changed word objects, so snapshots share the
- *   rest and cost one array of references each.
- * - Saving: every change marks its word id dirty. One batched
+ * - The state is the word array plus the pause decisions (keyed by the id
+ *   of the word before the pause).
+ * - Undo/redo are snapshot stacks of that state (the approach of Rescript
+ *   v1.0.9's `lib/store.ts`, reimplemented here without zustand). An edit
+ *   replaces only the changed word objects, so snapshots share the rest
+ *   and cost one array of references each.
+ * - Saving: every change marks its word or pause id dirty. One batched
  *   `update_transcript_words` call goes out `SAVE_DEBOUNCE_MS` after the
  *   last edit. Only one save is in flight at a time; edits made meanwhile
  *   go out in the next one. `flush()` saves everything now and resolves
@@ -27,6 +35,45 @@ const SAVE_RETRY_MS = 3000;
  * - Known gap: quitting the app within ~0.5 s of an edit can lose that
  *   edit; the IPC call may not finish before the webview is torn down.
  */
+interface EditState {
+  words: TranscriptWord[];
+  /** The list as loaded; carried unchanged through every edit. */
+  loadedWords: TranscriptWord[];
+  /** Pause decisions, by the id of the word before the pause. */
+  pauses: ReadonlyMap<string, PauseAction>;
+}
+
+const EMPTY_STATE: EditState = { words: [], loadedWords: [], pauses: new Map() };
+
+/** `words` with these idxs set to `removed`; the same array if nothing changed. */
+function withRemoved(words: TranscriptWord[], idxs: readonly number[], removed: boolean): TranscriptWord[] {
+  const wanted = new Set(idxs);
+  let changed = false;
+  const next = words.map((word) => {
+    if (!wanted.has(word.idx) || word.removed === removed) return word;
+    changed = true;
+    return { ...word, removed, suggested: null };
+  });
+  return changed ? next : words;
+}
+
+/** `pauses` with these decisions set (or cleared); the same map if unchanged. */
+function withPauseAction(
+  pauses: ReadonlyMap<string, PauseAction>,
+  afterWordIds: readonly string[],
+  action: PauseAction | null,
+): ReadonlyMap<string, PauseAction> {
+  const next = new Map(pauses);
+  let changed = false;
+  for (const id of afterWordIds) {
+    if ((pauses.get(id) ?? null) === action) continue;
+    changed = true;
+    if (action) next.set(id, action);
+    else next.delete(id);
+  }
+  return changed ? next : pauses;
+}
+
 export function useWordEdits({
   videoId,
   onSegmentsSaved,
@@ -38,18 +85,19 @@ export function useWordEdits({
   onSegmentsSaved: (segments: TranscriptSegment[]) => void;
   onError: (message: string) => void;
 }) {
-  const [words, setWords] = useState<TranscriptWord[]>([]);
+  const [state, setState] = useState<EditState>(EMPTY_STATE);
   // History lives in refs (updated outside React's updaters, which may run
   // twice); `historyVersion` re-renders for canUndo/canRedo.
-  const pastRef = useRef<TranscriptWord[][]>([]);
-  const futureRef = useRef<TranscriptWord[][]>([]);
+  const pastRef = useRef<EditState[]>([]);
+  const futureRef = useRef<EditState[]>([]);
   const [, setHistoryVersion] = useState(0);
   const bumpHistory = useCallback(() => setHistoryVersion((v) => v + 1), []);
 
   // Mirrors of state for the save path, which runs outside render.
-  const wordsRef = useRef(words);
-  wordsRef.current = words;
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const dirtyRef = useRef<Set<string>>(new Set());
+  const dirtyPausesRef = useRef<Set<string>>(new Set());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inflightRef = useRef<Promise<void> | null>(null);
   const callbacksRef = useRef({ onSegmentsSaved, onError });
@@ -64,26 +112,34 @@ export function useWordEdits({
     while (inflightRef.current) {
       await inflightRef.current;
     }
-    if (dirtyRef.current.size === 0) return true;
+    if (dirtyRef.current.size === 0 && dirtyPausesRef.current.size === 0) return true;
     if (retryTimerRef.current) {
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
     }
-    const byId = new Map(wordsRef.current.map((word) => [word.id, word]));
+    const current = stateRef.current;
+    const byId = new Map(current.words.map((word) => [word.id, word]));
     const ids = [...dirtyRef.current];
+    const pauseIds = [...dirtyPausesRef.current];
     dirtyRef.current = new Set();
+    dirtyPausesRef.current = new Set();
     const changes = ids.flatMap((id) => {
       const word = byId.get(id);
       return word ? [{ id, removed: word.removed }] : [];
     });
+    const pauses: PauseDecision[] = pauseIds.map((id) => ({
+      after_word_id: id,
+      action: current.pauses.get(id) ?? null,
+    }));
     let ok = true;
     const run = (async () => {
       try {
-        const segments = await updateTranscriptWords(videoId, changes);
+        const segments = await updateTranscriptWords(videoId, changes, pauses);
         callbacksRef.current.onSegmentsSaved(segments);
       } catch (err) {
         ok = false;
         for (const id of ids) dirtyRef.current.add(id);
+        for (const id of pauseIds) dirtyPausesRef.current.add(id);
         callbacksRef.current.onError(
           `Couldn't save your edits (will keep retrying): ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -99,7 +155,7 @@ export function useWordEdits({
     } finally {
       inflightRef.current = null;
     }
-    return ok && dirtyRef.current.size === 0;
+    return ok && dirtyRef.current.size === 0 && dirtyPausesRef.current.size === 0;
   }, [videoId]);
   const saveRef = useRef(save);
   saveRef.current = save;
@@ -142,7 +198,7 @@ export function useWordEdits({
    * flush first and keep the editor read-only (`WordTranscript`'s
    * `readOnly`) while the operation that changes words runs, so nothing is
    * pending here. */
-  const load = useCallback((next: TranscriptWord[]) => {
+  const load = useCallback((words: TranscriptWord[], pauses: readonly PauseDecision[] = []) => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
@@ -152,69 +208,123 @@ export function useWordEdits({
       retryTimerRef.current = null;
     }
     dirtyRef.current = new Set();
-    wordsRef.current = next;
-    setWords(next);
+    dirtyPausesRef.current = new Set();
+    const next: EditState = {
+      words,
+      loadedWords: words,
+      pauses: new Map(
+        pauses.flatMap((p) => (p.action ? [[p.after_word_id, p.action] as const] : [])),
+      ),
+    };
+    stateRef.current = next;
+    setState(next);
     pastRef.current = [];
     futureRef.current = [];
     bumpHistory();
   }, [bumpHistory]);
 
-  /** Swap in `next`, marking every word whose object changed as dirty. */
+  /** Swap in `next`, marking every word whose object changed, and every
+   * pause whose decision changed, as dirty. */
   const commit = useCallback(
-    (next: TranscriptWord[]) => {
-      const prev = wordsRef.current;
-      for (let i = 0; i < next.length; i++) {
-        if (next[i] !== prev[i]) dirtyRef.current.add(next[i].id);
+    (next: EditState) => {
+      const prev = stateRef.current;
+      if (next.words !== prev.words) {
+        for (let i = 0; i < next.words.length; i++) {
+          if (next.words[i] !== prev.words[i]) dirtyRef.current.add(next.words[i].id);
+        }
       }
-      wordsRef.current = next;
-      setWords(next);
+      if (next.pauses !== prev.pauses) {
+        for (const id of new Set([...prev.pauses.keys(), ...next.pauses.keys()])) {
+          if (prev.pauses.get(id) !== next.pauses.get(id)) dirtyPausesRef.current.add(id);
+        }
+      }
+      stateRef.current = next;
+      setState(next);
       scheduleSave();
     },
     [scheduleSave],
   );
 
-  const setRemoved = useCallback(
-    (idxs: readonly number[], removed: boolean) => {
-      const prev = wordsRef.current;
-      const wanted = new Set(idxs);
-      let changed = false;
-      const next = prev.map((word) => {
-        if (!wanted.has(word.idx) || word.removed === removed) return word;
-        changed = true;
-        return { ...word, removed, suggested: null };
-      });
-      if (!changed) return;
+  /** One undoable step from the current state to `next`. Returns false
+   * (and records nothing) when `next` is the same state. */
+  const apply = useCallback(
+    (next: EditState): boolean => {
+      const prev = stateRef.current;
+      if (next.words === prev.words && next.pauses === prev.pauses) return false;
       pastRef.current = [...pastRef.current, prev];
       futureRef.current = [];
       commit(next);
       bumpHistory();
+      return true;
     },
     [commit, bumpHistory],
   );
 
-  const undo = useCallback(() => {
+  const setRemoved = useCallback(
+    (idxs: readonly number[], removed: boolean) => {
+      const prev = stateRef.current;
+      return apply({ ...prev, words: withRemoved(prev.words, idxs, removed) });
+    },
+    [apply],
+  );
+
+  /** Sets (or with `null` clears) the decision on the pauses after these
+   * words. */
+  const setPauseAction = useCallback(
+    (afterWordIds: readonly string[], action: PauseAction | null) => {
+      const prev = stateRef.current;
+      return apply({ ...prev, pauses: withPauseAction(prev.pauses, afterWordIds, action) });
+    },
+    [apply],
+  );
+
+  /** Quick cleanup as one undo step: remove these words and shorten these
+   * pauses. */
+  const cleanUp = useCallback(
+    (removeIdxs: readonly number[], shortenAfterWordIds: readonly string[]) => {
+      const prev = stateRef.current;
+      return apply({
+        ...prev,
+        words: withRemoved(prev.words, removeIdxs, true),
+        pauses: withPauseAction(prev.pauses, shortenAfterWordIds, "shorten"),
+      });
+    },
+    [apply],
+  );
+
+  const undo = useCallback((): boolean => {
     const stack = pastRef.current;
-    if (stack.length === 0) return;
+    if (stack.length === 0) return false;
     pastRef.current = stack.slice(0, -1);
-    futureRef.current = [...futureRef.current, wordsRef.current];
+    futureRef.current = [...futureRef.current, stateRef.current];
     commit(stack[stack.length - 1]);
     bumpHistory();
+    return true;
   }, [commit, bumpHistory]);
 
-  const redo = useCallback(() => {
+  const redo = useCallback((): boolean => {
     const stack = futureRef.current;
-    if (stack.length === 0) return;
+    if (stack.length === 0) return false;
     futureRef.current = stack.slice(0, -1);
-    pastRef.current = [...pastRef.current, wordsRef.current];
+    pastRef.current = [...pastRef.current, stateRef.current];
     commit(stack[stack.length - 1]);
     bumpHistory();
+    return true;
   }, [commit, bumpHistory]);
 
   return {
-    words,
+    words: state.words,
+    /** The word list as last loaded: same timings as `words`, but its
+     * identity only changes on load, for memos that depend on timing only. */
+    timingWords: state.loadedWords,
+    pauseActions: state.pauses,
     load,
+    /** Edits return true when they changed something (and so added an
+     * undo step). */
     remove: useCallback((idxs: readonly number[]) => setRemoved(idxs, true), [setRemoved]),
     restore: useCallback((idxs: readonly number[]) => setRemoved(idxs, false), [setRemoved]),
+    setPauseAction,
+    cleanUp,
     undo,
     redo,
     canUndo: pastRef.current.length > 0,

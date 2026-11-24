@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Maximize, Minimize2, Pause, Play } from "lucide-react";
 import type { LessonSegment, LessonSlide } from "../db";
@@ -65,7 +65,24 @@ interface LessonPreviewPlayerProps {
   slides?: Pick<LessonSlide, "id" | "position" | "mode" | "duration" | "image_path" | "mute_audio">[];
   /** Reports the video's pixel size once its metadata has loaded. */
   onVideoSize?: (size: { width: number; height: number }) => void;
+  /** Source-time ranges to jump over while playing (removed words and
+   * pauses, docs/text-editing-plan.md §6.2), checked every animation frame.
+   * A cut reaching a segment's end moves on to the next segment. */
+  skipRanges?: readonly { start: number; end: number }[];
+  /** Called every animation frame with the source-time playhead, for the
+   * word highlight (no React render per frame). */
+  onFrameTime?: (time: number, playing: boolean) => void;
 }
+
+export interface LessonPreviewPlayerHandle {
+  /** Seeks to a source time inside the lesson: the first segment (in lesson
+   * order) containing it. Ignored if no segment does. */
+  seekToSource: (time: number) => void;
+  pause: () => void;
+}
+
+/** Lands the playhead just past a skipped range. */
+const SKIP_PAST_S = 0.001;
 
 type PreviewSlide = NonNullable<LessonPreviewPlayerProps["slides"]>[number];
 
@@ -73,9 +90,10 @@ type PreviewSlide = NonNullable<LessonPreviewPlayerProps["slides"]>[number];
  * `LessonCard` so the same "virtually stitch this lesson's segments
  * together" preview (see that component's module doc, and the
  * conversation that led to it) can be reused standalone on a lesson's own
- * detail page, not just inside the grid tile. Always mounted by the
- * caller; owns no segment-editing state itself, only playback. */
-export default function LessonPreviewPlayer({
+ * detail page, not just inside the grid tile. On the lesson page it stays
+ * mounted (hidden while the Original recording shows); owns no
+ * segment-editing state itself, only playback. */
+const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewPlayerProps>(function LessonPreviewPlayer({
   videoFilePath,
   segments,
   lessonTitle,
@@ -87,7 +105,9 @@ export default function LessonPreviewPlayer({
   outlineRect = null,
   slides = [],
   onVideoSize,
-}: LessonPreviewPlayerProps) {
+  skipRanges,
+  onFrameTime,
+}: LessonPreviewPlayerProps, ref) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayContainerRef = useRef<HTMLDivElement | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -290,6 +310,18 @@ export default function LessonPreviewPlayer({
     };
   }
 
+  /** Moves playback to the start of the next segment (wrapping). */
+  function advanceToNextSegment(video: HTMLVideoElement) {
+    const nextIndex = (activeIndexRef.current + 1) % segments.length;
+    setActiveIndex(nextIndex);
+    video.currentTime = segments[nextIndex].start;
+    // Wrapping back to the start: play the inserted outro first, then the
+    // intro, as the exported file would end and (on replay) begin.
+    if (nextIndex === 0 && insertedOutro && !video.paused) {
+      startHold(insertedOutro, () => (insertedIntro ? startHold(insertedIntro, playVideo) : playVideo()));
+    }
+  }
+
   function handleTimeUpdate(event: React.SyntheticEvent<HTMLVideoElement>) {
     const time = event.currentTarget.currentTime;
     setCurrentTime(time);
@@ -297,17 +329,64 @@ export default function LessonPreviewPlayer({
     if (segments.length === 0) return;
     const segment = segments[activeIndexRef.current];
     if (!segment) return;
-    if (time >= segment.end) {
-      const nextIndex = (activeIndexRef.current + 1) % segments.length;
-      setActiveIndex(nextIndex);
-      event.currentTarget.currentTime = segments[nextIndex].start;
-      // Wrapping back to the start: play the inserted outro first, then the
-      // intro, as the exported file would end and (on replay) begin.
-      if (nextIndex === 0 && insertedOutro && !event.currentTarget.paused) {
-        startHold(insertedOutro, () => (insertedIntro ? startHold(insertedIntro, playVideo) : playVideo()));
-      }
-    }
+    if (time >= segment.end) advanceToNextSegment(event.currentTarget);
   }
+
+  // Per-frame loop for `skipRanges` / `onFrameTime` (the approach of
+  // Rescript v1.0.9's MediaPreview playback loop). Latest props and the
+  // advance step go through refs, so the loop starts once.
+  const frameRef = useRef({ skipRanges, onFrameTime, segments, advance: advanceToNextSegment });
+  frameRef.current = { skipRanges, onFrameTime, segments, advance: advanceToNextSegment };
+  const frameLoopWanted = skipRanges !== undefined || onFrameTime !== undefined;
+  useEffect(() => {
+    if (!frameLoopWanted) return;
+    let raf = 0;
+    let lastTime = -1;
+    let lastPlaying = false;
+    const tick = () => {
+      const video = videoRef.current;
+      const { skipRanges: ranges, onFrameTime: report, segments: segs, advance } = frameRef.current;
+      if (video) {
+        const playing = !video.paused;
+        const segment = segs[activeIndexRef.current];
+        if (playing && ranges && segment) {
+          const time = video.currentTime;
+          const cut = ranges.find((range) => time >= range.start && time < range.end);
+          if (cut) {
+            const target = cut.end + SKIP_PAST_S;
+            if (target >= segment.end) advance(video);
+            else video.currentTime = target;
+          }
+        }
+        const time = video.currentTime;
+        if (time !== lastTime || playing !== lastPlaying) {
+          lastTime = time;
+          lastPlaying = playing;
+          report?.(time, playing);
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [frameLoopWanted]);
+
+  useImperativeHandle(ref, () => ({
+    seekToSource(time: number) {
+      const index = segments.findIndex((segment) => time >= segment.start && time < segment.end);
+      const video = videoRef.current;
+      if (index < 0 || !video) return;
+      clearHold();
+      setActiveIndex(index);
+      video.currentTime = time;
+      setCurrentTime(time);
+      onTimeUpdate?.(time);
+    },
+    pause() {
+      clearHold();
+      videoRef.current?.pause();
+    },
+  }));
 
   function togglePlayPause() {
     const video = videoRef.current;
@@ -517,4 +596,6 @@ export default function LessonPreviewPlayer({
       />
     </div>
   );
-}
+});
+
+export default LessonPreviewPlayer;

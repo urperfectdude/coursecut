@@ -209,10 +209,51 @@ pub struct WordRemovedChange {
     pub removed: bool,
 }
 
-/// Re-derives each segment's `keep` from its words: kept if at least one of
-/// its words is not removed. Segments with no words (none in range, or a
-/// video without word timestamps) keep whatever flag they have.
-pub(crate) fn sync_segment_keep(conn: &Connection, video_id: &str) -> Result<(), String> {
+/// The user's decision on the pause after a word (`transcript_pauses`).
+/// `action` is `"shorten"`, `"remove"` or `"keep"`; `None` in a change
+/// clears the decision (back to untouched).
+#[derive(Debug, Serialize, serde::Deserialize)]
+pub struct PauseDecision {
+    pub after_word_id: String,
+    pub action: Option<String>,
+}
+
+const PAUSE_ACTIONS: [&str; 3] = ["shorten", "remove", "keep"];
+
+#[tauri::command]
+pub fn list_transcript_pauses(
+    conn: tauri::State<'_, DbConnection>,
+    video_id: String,
+) -> Result<Vec<PauseDecision>, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    query_pauses(&conn, &video_id)
+}
+
+pub(crate) fn query_pauses(conn: &Connection, video_id: &str) -> Result<Vec<PauseDecision>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.after_word_id, p.action FROM transcript_pauses p
+             JOIN transcript_words w ON w.id = p.after_word_id
+             WHERE w.video_id = ?1 ORDER BY w.idx",
+        )
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map(params![video_id], |row| {
+            Ok(PauseDecision {
+                after_word_id: row.get(0)?,
+                action: row.get(1)?,
+            })
+        })
+        .map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
+}
+
+/// Re-derives `keep` for the segments containing word `word_id`: kept if
+/// at least one of the segment's words is not removed. Only segments
+/// touched by an edit are re-derived, so a keep/drop choice made on the
+/// Transcript page for other segments isn't overwritten by unrelated word
+/// or pause edits.
+pub(crate) fn sync_segment_keep_for_word(conn: &Connection, video_id: &str, word_id: &str) -> Result<(), String> {
     conn.execute(
         "UPDATE transcript_segments SET keep = EXISTS (
              SELECT 1 FROM transcript_words w
@@ -220,29 +261,30 @@ pub(crate) fn sync_segment_keep(conn: &Connection, video_id: &str) -> Result<(),
              AND w.start >= transcript_segments.start AND w.start < transcript_segments.end
          )
          WHERE video_id = ?1 AND EXISTS (
-             SELECT 1 FROM transcript_words w
-             WHERE w.video_id = ?1
-             AND w.start >= transcript_segments.start AND w.start < transcript_segments.end
+             SELECT 1 FROM transcript_words changed
+             WHERE changed.id = ?2 AND changed.video_id = ?1
+             AND changed.start >= transcript_segments.start AND changed.start < transcript_segments.end
          )",
-        params![video_id],
+        params![video_id, word_id],
     )
     .map_err(|err| err.to_string())?;
     Ok(())
 }
 
-/// Saves a batch of word removals/restores (debounced from the frontend,
-/// so one drag-select is one call), clears `suggested` on each changed word
-/// (the user has decided), and re-derives segment `keep` flags in the same
-/// transaction. Returns the video's segments so the caller sees the new
-/// flags. Pure DB, no network.
+/// Saves a batch of word removals/restores and pause decisions (debounced
+/// from the frontend, so one drag-select or one Clean up is one call),
+/// clears `suggested` on each changed word (the user has decided), and
+/// re-derives segment `keep` flags in the same transaction. Returns the
+/// video's segments so the caller sees the new flags. Pure DB, no network.
 #[tauri::command]
 pub fn update_transcript_words(
     conn: tauri::State<'_, DbConnection>,
     video_id: String,
     changes: Vec<WordRemovedChange>,
+    pauses: Option<Vec<PauseDecision>>,
 ) -> Result<Vec<crate::db::TranscriptSegmentRow>, String> {
     let conn = conn.0.lock().map_err(|err| err.to_string())?;
-    apply_word_changes(&conn, &video_id, &changes)?;
+    apply_word_changes(&conn, &video_id, &changes, pauses.as_deref().unwrap_or(&[]))?;
     let mut stmt = conn
         .prepare(
             "SELECT id, video_id, start, end, text, keep FROM transcript_segments
@@ -255,8 +297,38 @@ pub fn update_transcript_words(
     rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
 }
 
-fn apply_word_changes(conn: &Connection, video_id: &str, changes: &[WordRemovedChange]) -> Result<(), String> {
+fn apply_word_changes(
+    conn: &Connection,
+    video_id: &str,
+    changes: &[WordRemovedChange],
+    pauses: &[PauseDecision],
+) -> Result<(), String> {
+    for pause in pauses {
+        if let Some(action) = &pause.action {
+            if !PAUSE_ACTIONS.contains(&action.as_str()) {
+                return Err(format!("unknown pause action {action:?}"));
+            }
+        }
+    }
     let tx = conn.unchecked_transaction().map_err(|err| err.to_string())?;
+    for pause in pauses {
+        match &pause.action {
+            // Only for a word of this video: the subquery yields no row
+            // otherwise, so nothing is inserted.
+            Some(action) => tx.execute(
+                "INSERT INTO transcript_pauses (after_word_id, action)
+                 SELECT id, ?2 FROM transcript_words WHERE id = ?1 AND video_id = ?3
+                 ON CONFLICT(after_word_id) DO UPDATE SET action = excluded.action",
+                params![pause.after_word_id, action, video_id],
+            ),
+            None => tx.execute(
+                "DELETE FROM transcript_pauses WHERE after_word_id = ?1
+                 AND after_word_id IN (SELECT id FROM transcript_words WHERE video_id = ?2)",
+                params![pause.after_word_id, video_id],
+            ),
+        }
+        .map_err(|err| err.to_string())?;
+    }
     {
         let mut update = tx
             .prepare(
@@ -270,7 +342,9 @@ fn apply_word_changes(conn: &Connection, video_id: &str, changes: &[WordRemovedC
                 .map_err(|err| err.to_string())?;
         }
     }
-    sync_segment_keep(&tx, video_id)?;
+    for change in changes {
+        sync_segment_keep_for_word(&tx, video_id, &change.id)?;
+    }
     tx.commit().map_err(|err| err.to_string())
 }
 
@@ -397,7 +471,7 @@ mod tests {
         let ids: Vec<String> = query_words(&conn, "v").unwrap().into_iter().map(|row| row.id).collect();
         let change = |i: usize, removed| WordRemovedChange { id: ids[i].clone(), removed };
 
-        apply_word_changes(&conn, "v", &[change(0, true), change(2, true)]).unwrap();
+        apply_word_changes(&conn, "v", &[change(0, true), change(2, true)], &[]).unwrap();
         let keep = |id: &str| -> bool {
             conn.query_row("SELECT keep FROM transcript_segments WHERE id = ?1", params![id], |row| row.get(0))
                 .unwrap()
@@ -406,8 +480,27 @@ mod tests {
         assert!(!keep("s2"), "all of s2's words removed");
         assert!(keep("s3"));
 
-        apply_word_changes(&conn, "v", &[change(2, false)]).unwrap();
+        apply_word_changes(&conn, "v", &[change(2, false)], &[]).unwrap();
         assert!(keep("s2"));
+    }
+
+    #[test]
+    fn word_changes_leave_other_segments_keep_alone() {
+        let conn = setup();
+        segment(&conn, "s1", 0.0, 5.0, true);
+        segment(&conn, "s2", 5.0, 10.0, false); // dropped on the Transcript page
+        replace_words(&conn, "v", None, &[w(1.0, "a"), w(6.0, "b")], None).unwrap();
+        // The dropped segment's word is still marked kept (say, toggled
+        // before words existed); an edit in s1 must not flip s2 back.
+        conn.execute("UPDATE transcript_words SET removed = 0", []).unwrap();
+        let ids: Vec<String> = query_words(&conn, "v").unwrap().into_iter().map(|row| row.id).collect();
+        apply_word_changes(&conn, "v", &[WordRemovedChange { id: ids[0].clone(), removed: true }], &[]).unwrap();
+        let keep = |id: &str| -> bool {
+            conn.query_row("SELECT keep FROM transcript_segments WHERE id = ?1", params![id], |row| row.get(0))
+                .unwrap()
+        };
+        assert!(!keep("s1"), "s1's only word removed");
+        assert!(!keep("s2"), "s2 untouched by an edit elsewhere");
     }
 
     #[test]
@@ -415,8 +508,51 @@ mod tests {
         let conn = setup();
         replace_words(&conn, "v", None, &[w(1.0, "a")], None).unwrap();
         let id = query_words(&conn, "v").unwrap()[0].id.clone();
-        apply_word_changes(&conn, "other", &[WordRemovedChange { id, removed: true }]).unwrap();
+        apply_word_changes(&conn, "other", &[WordRemovedChange { id, removed: true }], &[]).unwrap();
         assert!(!query_words(&conn, "v").unwrap()[0].removed);
+    }
+
+    #[test]
+    fn pause_decisions_upsert_clear_and_stay_in_their_video() {
+        let conn = setup();
+        replace_words(&conn, "v", None, &[w(1.0, "a"), w(4.0, "b")], None).unwrap();
+        let id = query_words(&conn, "v").unwrap()[0].id.clone();
+        let decide = |action: Option<&str>| PauseDecision {
+            after_word_id: id.clone(),
+            action: action.map(str::to_string),
+        };
+        apply_word_changes(&conn, "v", &[], &[decide(Some("shorten"))]).unwrap();
+        apply_word_changes(&conn, "v", &[], &[decide(Some("remove"))]).unwrap();
+        let pauses = query_pauses(&conn, "v").unwrap();
+        assert_eq!(pauses.len(), 1);
+        assert_eq!(pauses[0].action.as_deref(), Some("remove"));
+
+        apply_word_changes(&conn, "other", &[], &[decide(None)]).unwrap();
+        assert_eq!(query_pauses(&conn, "v").unwrap().len(), 1, "other video can't clear it");
+        apply_word_changes(&conn, "v", &[], &[decide(None)]).unwrap();
+        assert!(query_pauses(&conn, "v").unwrap().is_empty());
+
+        assert!(apply_word_changes(&conn, "v", &[], &[decide(Some("explode"))]).is_err());
+    }
+
+    #[test]
+    fn pause_decisions_go_when_words_are_replaced() {
+        let conn = setup();
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        replace_words(&conn, "v", None, &[w(1.0, "a"), w(4.0, "b")], None).unwrap();
+        let id = query_words(&conn, "v").unwrap()[0].id.clone();
+        apply_word_changes(
+            &conn,
+            "v",
+            &[],
+            &[PauseDecision {
+                after_word_id: id,
+                action: Some("shorten".into()),
+            }],
+        )
+        .unwrap();
+        replace_words(&conn, "v", None, &[w(1.0, "a"), w(4.0, "b")], None).unwrap();
+        assert!(query_pauses(&conn, "v").unwrap().is_empty());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import {
   forwardRef,
+  Fragment,
   memo,
   useCallback,
   useEffect,
@@ -8,10 +9,18 @@ import {
   useRef,
   useState,
 } from "react";
-import { ArrowDown, RotateCcw, Trash2 } from "lucide-react";
-import type { TranscriptSegment, TranscriptWord } from "../db";
+import { ArrowDown, Pause as PauseIcon, RotateCcw, Trash2 } from "lucide-react";
+import type { PauseAction, TranscriptSegment, TranscriptWord } from "../db";
+import { isFillerWord } from "../lib/fillers";
 import { useWordSelection } from "../hooks/useWordSelection";
-import { findActiveWordIndex, groupIntoParagraphs, punctuateWords } from "../lib/transcript-words";
+import {
+  findActiveWordIndex,
+  pauseCut,
+  punctuateWords,
+  SHORTENED_PAUSE_S,
+  type Pause,
+  type ScriptParagraph,
+} from "../lib/transcript-words";
 import { formatTimestamp } from "../lib/timestamp";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -24,17 +33,25 @@ export interface WordTranscriptHandle {
 }
 
 interface WordTranscriptProps {
-  segments: readonly TranscriptSegment[];
-  /** Sorted by `idx` (which is time order). */
+  /** What to show, in order (see `groupLessonParagraphs`). */
+  paragraphs: readonly ScriptParagraph[];
+  /** The whole video's words, sorted by start, with `words[i].idx === i`:
+   * used to look words up by idx and to find the word under the playhead.
+   * Words not in `paragraphs` are simply never highlighted. */
   words: readonly TranscriptWord[];
-  /** Only these segments' paragraphs are shown (search / chunk filter);
-   * `null` shows all. */
-  visibleSegmentIds: ReadonlySet<string> | null;
   showRemoved: boolean;
   /** While an operation that replaces the words runs (re-transcribe, VTT
    * import, word fetch, Analyze): no Remove/Restore, so no edit can be
    * lost when the list reloads afterwards. Playback still works. */
   readOnly?: boolean;
+  /** False while hidden (another tab shows): the selection is dropped and
+   * Delete/Backspace do nothing. */
+  active?: boolean;
+  /** Long pauses, by the id of the word before each. Timing only, so this
+   * map only changes when the words are reloaded. */
+  pausesByWordId: ReadonlyMap<string, Pause>;
+  pauseActions: ReadonlyMap<string, PauseAction>;
+  onPauseAction: (afterWordId: string, action: PauseAction | null) => void;
   onRemove: (idxs: number[]) => void;
   onRestore: (idxs: number[]) => void;
   onSeek: (time: number) => void;
@@ -64,13 +81,21 @@ const WordSpan = memo(function WordSpan({
     <span
       data-wid={word.idx}
       data-removed={word.removed ? "" : undefined}
-      title={word.suggested ? reasonLabel[word.suggested] : undefined}
+      title={
+        word.suggested
+          ? reasonLabel[word.suggested]
+          : !word.removed && isFillerWord(word.text)
+            ? "Filler word: Clean up can remove it"
+            : undefined
+      }
       onClick={(event) => onClick(word.idx, event.currentTarget)}
       className={cn(
         "cursor-pointer rounded-[3px] py-0.5 transition-colors duration-75",
         word.removed
           ? "bg-red-950/40 text-red-400 line-through decoration-red-400/70"
-          : "hover:bg-muted",
+          : isFillerWord(word.text)
+            ? "underline decoration-amber-400 decoration-2 underline-offset-4 hover:bg-muted"
+            : "hover:bg-muted",
       )}
     >
       {text}{" "}
@@ -78,16 +103,117 @@ const WordSpan = memo(function WordSpan({
   );
 });
 
+const pauseActionLabels: { action: PauseAction | null; label: string }[] = [
+  { action: "shorten", label: `Shorten to ${SHORTENED_PAUSE_S}s` },
+  { action: "remove", label: "Remove completely" },
+  { action: "keep", label: "Keep as is" },
+];
+
+/** Inline chip for a long pause, with a small menu to shorten, remove or
+ * keep it (docs/text-editing-plan.md §6.1). Not selectable text, so it
+ * never ends up inside a word selection. */
+function PauseChip({
+  pause,
+  action,
+  readOnly,
+  onAction,
+}: {
+  pause: Pause;
+  action: PauseAction | undefined;
+  readOnly: boolean;
+  onAction: (afterWordId: string, action: PauseAction | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLSpanElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onDown(event: MouseEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const gap = pause.end - pause.start;
+  const cut = pauseCut(pause, action);
+  const after = cut ? gap - (cut.end - cut.start) : gap;
+  return (
+    <span ref={rootRef} className="relative mr-1 inline-block select-none align-baseline" contentEditable={false}>
+      <button
+        type="button"
+        disabled={readOnly}
+        onClick={() => setOpen((value) => !value)}
+        className={cn(
+          "inline-flex cursor-pointer items-center gap-0.5 rounded-full border px-1.5 text-xs leading-5 tabular-nums",
+          action === "remove"
+            ? "border-red-400/50 text-red-400 line-through"
+            : action === "shorten"
+              ? "border-emerald-400/50 text-emerald-400"
+              : "border-border text-muted-foreground hover:text-foreground",
+        )}
+        title={
+          action === "shorten"
+            ? `Pause shortened from ${gap.toFixed(1)}s to ${after.toFixed(1)}s`
+            : action === "remove"
+              ? `Pause of ${gap.toFixed(1)}s removed`
+              : `Pause of ${gap.toFixed(1)}s: click to shorten or remove`
+        }
+      >
+        <PauseIcon className="size-3" aria-hidden="true" />
+        {action === "shorten" ? `${gap.toFixed(1)}s → ${after.toFixed(1)}s` : `${gap.toFixed(1)}s`}
+      </button>
+      {open && (
+        <span className="absolute top-full left-0 z-30 mt-1 flex w-44 flex-col rounded-md border bg-popover p-1 text-sm shadow-lg">
+          {pauseActionLabels.map((option) => (
+            <button
+              key={option.label}
+              type="button"
+              className={cn(
+                "cursor-pointer rounded px-2 py-1 text-left hover:bg-muted",
+                (action ?? "keep") === option.action && "font-medium",
+              )}
+              onClick={() => {
+                onAction(pause.afterWordId, option.action === "keep" && !action ? null : option.action);
+                setOpen(false);
+              }}
+            >
+              {(action ?? "keep") === option.action ? "● " : "○ "}
+              {option.label}
+            </button>
+          ))}
+        </span>
+      )}
+    </span>
+  );
+}
+
 const Paragraph = memo(function Paragraph({
+  header,
   segment,
   words,
   showRemoved,
+  readOnly,
+  pausesByWordId,
+  pauseActions,
+  onPauseAction,
   onWordClick,
   onSeek,
 }: {
+  header?: string;
   segment: TranscriptSegment;
   words: TranscriptWord[];
   showRemoved: boolean;
+  readOnly: boolean;
+  pausesByWordId: ReadonlyMap<string, Pause>;
+  pauseActions: ReadonlyMap<string, PauseAction>;
+  onPauseAction: (afterWordId: string, action: PauseAction | null) => void;
   onWordClick: (idx: number, el: HTMLElement) => void;
   onSeek: (time: number) => void;
 }) {
@@ -95,27 +221,44 @@ const Paragraph = memo(function Paragraph({
   const shown = showRemoved ? words : words.filter((word) => !word.removed);
   if (shown.length === 0) return null;
   const firstIdx = words.length > 0 ? words[0].idx : 0;
+  // The paragraph may start mid-segment (a lesson segment cut there).
+  const firstStart = words[0]?.start ?? segment.start;
   return (
+    <>
+    {header && (
+      <p className="mt-2 mb-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase select-none">
+        {header}
+      </p>
+    )}
     <div className="word-transcript-paragraph mb-4 flex gap-3">
       <button
         type="button"
         className="mt-1.5 h-fit shrink-0 cursor-pointer text-xs tabular-nums text-muted-foreground hover:text-foreground"
-        onClick={() => onSeek(segment.start + SEEK_INTO_WORD_S)}
+        onClick={() => onSeek(firstStart + SEEK_INTO_WORD_S)}
         title="Play from here"
       >
-        {formatTimestamp(segment.start)}
+        {formatTimestamp(firstStart)}
       </button>
       <p className="m-0 min-w-0 flex-1 select-text text-[15px] leading-8">
-        {shown.map((word) => (
-          <WordSpan
-            key={word.id}
-            word={word}
-            text={displayTexts[word.idx - firstIdx] ?? word.text}
-            onClick={onWordClick}
-          />
-        ))}
+        {shown.map((word) => {
+          const pause = pausesByWordId.get(word.id);
+          return (
+            <Fragment key={word.id}>
+              <WordSpan word={word} text={displayTexts[word.idx - firstIdx] ?? word.text} onClick={onWordClick} />
+              {pause && (
+                <PauseChip
+                  pause={pause}
+                  action={pauseActions.get(word.id)}
+                  readOnly={readOnly}
+                  onAction={onPauseAction}
+                />
+              )}
+            </Fragment>
+          );
+        })}
       </p>
     </div>
+    </>
   );
 });
 
@@ -126,19 +269,22 @@ const Paragraph = memo(function Paragraph({
  * `showRemoved` is off.
  */
 const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(function WordTranscript(
-  { segments, words, visibleSegmentIds, showRemoved, readOnly = false, onRemove, onRestore, onSeek },
+  {
+    paragraphs,
+    words,
+    showRemoved,
+    readOnly = false,
+    active = true,
+    pausesByWordId,
+    pauseActions,
+    onPauseAction,
+    onRemove,
+    onRestore,
+    onSeek,
+  },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-
-  // Reuse last render's per-paragraph arrays when their words didn't change,
-  // so an edit re-renders only the paragraphs it touched.
-  const previousParagraphsRef = useRef<Map<string, TranscriptWord[]>>(new Map());
-  const paragraphs = useMemo(() => {
-    const next = groupIntoParagraphs(segments, words, previousParagraphsRef.current);
-    previousParagraphsRef.current = new Map(next.map((p) => [p.segment.id, p.words]));
-    return next;
-  }, [segments, words]);
 
   const removedIds = useMemo(() => {
     const ids = new Set<number>();
@@ -184,7 +330,7 @@ const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(fun
   // typing in a field (the search box).
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (!selection) return;
+      if (!selection || !active) return;
       const target = event.target as HTMLElement | null;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
         return;
@@ -199,7 +345,12 @@ const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(fun
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [selection, anyKept, removeSelection, restoreSelection, clearSelection]);
+  }, [selection, active, anyKept, removeSelection, restoreSelection, clearSelection]);
+
+  // Leaving the tab drops the selection, so nothing hidden can be removed.
+  useEffect(() => {
+    if (!active) clearSelection();
+  }, [active, clearSelection]);
 
   // --- Playhead highlight and follow -------------------------------------
   const activeElRef = useRef<HTMLElement | null>(null);
@@ -268,21 +419,22 @@ const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(fun
     activeElRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, []);
 
-  const shownParagraphs = visibleSegmentIds
-    ? paragraphs.filter((p) => visibleSegmentIds.has(p.segment.id))
-    : paragraphs;
-
   return (
     <div ref={containerRef} className="word-transcript relative">
-      {shownParagraphs.length === 0 ? (
-        <p>No matching transcript segments.</p>
+      {paragraphs.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No words in this lesson's segments.</p>
       ) : (
-        shownParagraphs.map((p) => (
+        paragraphs.map((p) => (
           <Paragraph
-            key={p.segment.id}
+            key={p.key}
+            header={p.header}
             segment={p.segment}
             words={p.words}
             showRemoved={showRemoved}
+            readOnly={readOnly}
+            pausesByWordId={pausesByWordId}
+            pauseActions={pauseActions}
+            onPauseAction={onPauseAction}
             onWordClick={handleWordClick}
             onSeek={stableSeek}
           />
@@ -316,7 +468,7 @@ const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(fun
           type="button"
           size="sm"
           variant="secondary"
-          className="fixed bottom-6 left-1/2 z-30 -translate-x-1/2 shadow-lg"
+          className="fixed bottom-24 left-1/2 z-30 -translate-x-1/2 shadow-lg"
           onClick={backToPlayhead}
         >
           <ArrowDown />
