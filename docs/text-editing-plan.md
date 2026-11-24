@@ -312,13 +312,11 @@ CREATE TABLE transcript_words (
     removed       INTEGER NOT NULL DEFAULT 0,
     suggested     TEXT                       -- NULL | 'filler' | 'hallucination'
 );
-CREATE UNIQUE INDEX idx_transcript_words_video_idx ON transcript_words(video_id, idx);
+CREATE INDEX idx_transcript_words_video_idx ON transcript_words(video_id, idx);  -- not unique, see Phase 1 status
 
 CREATE TABLE transcript_pauses (            -- user decisions on pauses
-    video_id  TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-    after_idx INTEGER NOT NULL,              -- the pause follows this word
-    action    TEXT NOT NULL,                 -- 'shorten' | 'remove' | 'keep'
-    PRIMARY KEY (video_id, after_idx)
+    after_word_id TEXT PRIMARY KEY REFERENCES transcript_words(id) ON DELETE CASCADE,
+    action        TEXT NOT NULL              -- 'shorten' | 'remove' | 'keep'
 );
 ```
 
@@ -434,6 +432,80 @@ Turning every word cut into its own piece would mean hundreds of ffmpeg runs and
 | **4. Overlays follow content** | Move `frame_overlays` and `lesson_regions` to source time (§7.3), migration `0015`, remap in preview and export, slide windows on edited length | 2–3 days | 3, and HCM features 1–2 merged |
 | **5. Lesson editor redesign + Script tab + Fix spelling** | Tabs on the left and one sticky video on the right (§6.3): move the existing cards into tabs; Final/Original dropdown and Hear original; Script tab; word-snapped trims; segment first/last words; corrections; one shared undo stack | 4–5 days | 3, and HCM features 1–2 merged |
 | **6. Polish (pick à la carte)** | VAD alignment (`align.ts`, run in Rust); timeline drawer with waveform (`Timeline.tsx` concepts, drawn from Rust-computed peaks); SRT/VTT export on the edited timeline; clean-room `…` markers for unspoken fillers | later | 3 |
+
+**Phase 0 status: done (2026-11-24).**
+
+* `src/lib/text-edit.ts` is Rescript `fb71f82` `lib/edits.ts`, with the types from `lib/types.ts` inlined. The logic is byte-identical to upstream, apart from one blank line.
+* `src/lib/text-edit.test.ts` is upstream `tests/edits-test.ts`, with only the import paths changed.
+* `npm test` runs the tests with plain Node 24 TypeScript (no test framework added). All pass; typecheck and lint are clean.
+* `THIRD_PARTY_NOTICES.md` carries the MIT text and pins `fb71f82`.
+* Upstream names (`deleted`, numeric `id`) are kept to make re-checking against upstream easy. Phase 1 maps them to `transcript_words.removed` and the text `id` at the DB boundary.
+* The whole of `edits.ts` was copied, including the manual-cut, scene-boundary and trim functions that only the Phase 6 timeline will use, so provenance stays one file to one file.
+
+**Phase 1 status: built and reviewed (2026-11-24), pending a hands-on check.**
+
+* Migration `0014_transcript_words`: `transcript_words` and `transcript_pauses`. Two changes from §7.1:
+  * The `(video_id, idx)` index is **not unique**, so renumbering after a chunk re-transcription can't collide.
+  * Pause decisions are keyed by **word id**, not `idx`, because `idx` is renumbered.
+* **No data migration was needed.** Old videos have no words. They get them only through "Listen again" (`fetch_word_timestamps`), never automatically, since it's a paid call.
+* `openai.rs`:
+  * Whisper words now keep their text and come back with segments from every path (single upload, WAV chunks, time chunks, chunk retry, cache).
+  * The cache copies only from a **Whisper-sourced** sibling **with words**. A VTT sibling no longer counts, which fixes VTT text being copied in as a Whisper transcript.
+  * New command `fetch_word_timestamps` stores words only and leaves segments untouched. The UI prompt for it comes in Phase 2, where words are first shown.
+* `words.rs` holds storage, renumbering, segment sync and `list_transcript_words`.
+* **Segments and words stay in agreement:**
+  * Transcription removes words inside hallucination-flagged segments (`suggested = 'hallucination'`).
+  * The Transcript page's segment toggle removes or restores its words in the same transaction.
+  * VTT import keeps existing words, since they time the same audio, and resets their flags.
+* **Tests:** 11 new Rust tests (storage order, chunk replacement, segment sync, cache copy, cascade delete, Whisper word conversion, chunk merge). Full suite passes.
+* **Review (independent-reviewer): nothing blocking.** Fixed:
+  * **Segment tightening** could leave a zero-length last word outside its own segment, so it escaped the segment's keep flag. Tightened segments now end just past their last word's start.
+  * **`retranscribe_chunk`** on a video with no words would have stored just that chunk's words, a partial list that looks complete. It now refreshes words only if the video already had them.
+  * **Overlapping segments:** restoring one segment no longer un-removes a word that another, still-dropped segment contains.
+  * **Docs:** the data-model skill now covers both tables and the invariant.
+* **Phase 2 must:** label `fetch_word_timestamps` progress as "Getting word timings", not as re-transcribing (it reuses the Transcribing progress events).
+* **Still to check by hand:** transcribe one real recording and confirm `transcript_words` fills with sensible timings.
+
+**Phase 2 status: built and reviewed (2026-11-24), pending a hands-on check.**
+
+* **Transcript page, word mode** (when the video has word timings):
+  * Paragraphs of words, one per segment, with punctuation and casing copied from the segment text (`punctuateWords`, display only).
+  * Select words, then Remove/Restore from the floating bar or Delete/Backspace. Escape clears the selection.
+  * Click a word or a paragraph's timestamp to play from there.
+  * Removed words show struck through in red, or hidden with the eye toggle. A hallucination-flagged word explains itself on hover.
+  * "Length 52:10 → 47:58 (−4:12)" above the transcript.
+  * Undo/Redo buttons and ⌘Z / ⇧⌘Z.
+  * Search and the chunk filter still work; they filter paragraphs.
+* **Sticky video on the right** (`SourceVideoPreview`, two new optional props):
+  * `skipRanges` jumps removed parts on every animation frame. "Skip removed parts while playing" turns it off to hear the original.
+  * `onFrameTime` drives the word highlight directly on the DOM. The transcript follows the playhead until the user scrolls, then shows "Back to playhead".
+* **Without word timings** the page shows the existing segment list plus an "Edit by word" card. Its **Get word timings** button runs `fetch_word_timestamps`, labelled "Getting word timings", as Phase 1's review asked.
+* **Saving:**
+  * Edits apply in memory at once. A batched `update_transcript_words` call goes out 500 ms after the last edit and re-derives segment `keep` in the same transaction, so Analyze sees the edits.
+  * Edits are flushed before Analyze, VTT import and chunk re-transcribe, and on leaving the page.
+  * A failed save keeps its edits pending and retries.
+* **Performance:**
+  * Paragraphs are memoised and reuse their word arrays when untouched, so an edit re-renders only the paragraphs it touched.
+  * `content-visibility: auto` on each paragraph.
+  * The playback time never goes through React state.
+* **Adapted from Rescript v1.0.9:** `useWordSelection.ts` (from `useTranscriptSelection.ts`) and `findActiveWordIndex` (from `lib/transcript.ts`). Both have provenance headers and are listed in `THIRD_PARTY_NOTICES.md`.
+* **Review (independent-reviewer): nothing blocking.** Fixed:
+  * **Stop on failed save.** `flush()` now rejects if anything is still unsaved, and Analyze, VTT import, chunk re-transcribe and Get word timings stop instead of running on stale data or discarding edits.
+  * **`flush()` waits for every in-flight save,** not just the first.
+  * **Read-only while busy.** The transcript is read-only (no Remove/Restore/undo) while those operations run, so the reload afterwards can't drop an edit.
+  * **Failed saves retry by themselves** every 3 s.
+  * **The selection toolbar's actions** follow the words' current state after an undo, and the toolbar stays inside the window and container.
+  * **Playhead lookup:** the DOM lookup runs only when the active word changes, not every frame.
+  * **Stable callbacks:** the page uses the hook's stable functions, not the per-render object.
+* **Known gaps, accepted for now:**
+  * **Quitting within ~0.5 s of an edit can lose that edit.** Cmd+Q doesn't fire a close event we could wait on, and closing a window from code would need a new Tauri permission.
+  * **Shift+Arrow can't extend a selection.** The video player's existing arrow-key shortcuts take those keys. Mouse selection is unaffected.
+  * **Gap words are attributed differently.** A word in a gap between segments shows in the paragraph before it, but the database treats it as belonging to no segment. Display only: a paragraph can still show one kept gap word after all its own words are removed.
+* **Not yet:** pause chips and the Quick cleanup card (Phase 3); Fix spelling (Phase 5).
+* **Still to check by hand:**
+  * whether seeking stutters on a real screen recording
+  * scroll and select speed on a 2-hour transcript
+  * whether the original video file plays on the Transcript page for the recordings that once needed the per-segment WAV workaround. The Lesson editor already plays them directly.
 
 About **15–20 working days** for Phases 0–5.
 

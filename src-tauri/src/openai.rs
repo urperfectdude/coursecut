@@ -114,12 +114,27 @@ struct WhisperSegment {
 }
 
 /// One word-level timestamp, requested alongside segments (see
-/// `upload_chunk`'s `timestamp_granularities[]` fields) specifically to
-/// tighten segment boundaries — see `tighten_segment_bounds_to_words`.
+/// `upload_chunk`'s `timestamp_granularities[]` fields). Used to tighten
+/// segment boundaries (see `tighten_segment_bounds_to_words`) and stored
+/// as-is in `transcript_words` for text-based editing
+/// (`docs/text-editing-plan.md` §7.2). Whisper's word text carries no
+/// punctuation, unlike its segment text.
 #[derive(serde::Deserialize)]
 struct WhisperWord {
+    #[serde(default)]
+    word: String,
     start: f64,
     end: f64,
+}
+
+/// What one transcription returns: Whisper's segments (with `keep` flags)
+/// plus the word-level timestamps from the same response, both on the same
+/// timeline. Words are not assigned to segments here — that's by time, in
+/// `words.rs`.
+#[derive(Debug, Clone, Default)]
+pub struct Transcript {
+    pub segments: Vec<TranscriptSegment>,
+    pub words: Vec<crate::words::TranscriptWord>,
 }
 
 /// Whisper's documented upload cap is 25MB. This is kept comfortably under
@@ -179,7 +194,7 @@ pub async fn transcribe_audio(
     attempt: u32,
     audio_path: &str,
     api_key: &str,
-) -> Result<Vec<TranscriptSegment>, String> {
+) -> Result<Transcript, String> {
     let duration = ffmpeg::probe_duration(app, audio_path).await?;
     if duration > CHUNK_DURATION_THRESHOLD_SECS {
         return transcribe_in_time_chunks(app, video_id, attempt, audio_path, api_key, duration)
@@ -213,7 +228,7 @@ pub async fn transcribe_audio(
     let total = chunks.len();
     progress::emit(app, video_id, Stage::Transcribing, None, None, attempt);
 
-    let mut chunk_results: Vec<(Vec<TranscriptSegment>, f64)> = Vec::with_capacity(total);
+    let mut chunk_results: Vec<(Transcript, f64)> = Vec::with_capacity(total);
     for (index, (chunk_bytes, start_offset_secs)) in chunks.into_iter().enumerate() {
         progress::emit(
             app,
@@ -228,11 +243,11 @@ pub async fn transcribe_audio(
         // `mark_error` path, so no partial/ambiguous transcript is ever
         // written.
         let chunk_name = format!("chunk-{index:03}-{file_name}");
-        let segments = upload_chunk(chunk_bytes, chunk_name, "audio/wav", api_key).await?;
-        chunk_results.push((segments, start_offset_secs));
+        let transcript = upload_chunk(chunk_bytes, chunk_name, "audio/wav", api_key).await?;
+        chunk_results.push((transcript, start_offset_secs));
     }
 
-    Ok(merge_chunk_segments(chunk_results))
+    Ok(merge_chunks(chunk_results))
 }
 
 /// Splits a recording longer than `CHUNK_DURATION_THRESHOLD_SECS` into
@@ -248,7 +263,7 @@ async fn transcribe_in_time_chunks(
     audio_path: &str,
     api_key: &str,
     total_duration_secs: f64,
-) -> Result<Vec<TranscriptSegment>, String> {
+) -> Result<Transcript, String> {
     let chunk_paths = ffmpeg::split_audio_by_time(
         app,
         audio_path,
@@ -264,7 +279,7 @@ async fn transcribe_in_time_chunks(
     // comment) — the mime must match that, not whatever `audio_path` itself
     // happens to be.
     let mime = "audio/ogg";
-    let mut chunk_results: Vec<(Vec<TranscriptSegment>, f64)> = Vec::with_capacity(total);
+    let mut chunk_results: Vec<(Transcript, f64)> = Vec::with_capacity(total);
 
     let upload_result: Result<(), String> = async {
         for (index, (chunk_path, start_offset_secs)) in chunk_paths.iter().enumerate() {
@@ -284,8 +299,8 @@ async fn transcribe_in_time_chunks(
                 .and_then(|name| name.to_str())
                 .unwrap_or("chunk.ogg")
                 .to_string();
-            let segments = upload_chunk(chunk_bytes, chunk_name, mime, api_key).await?;
-            chunk_results.push((segments, *start_offset_secs));
+            let transcript = upload_chunk(chunk_bytes, chunk_name, mime, api_key).await?;
+            chunk_results.push((transcript, *start_offset_secs));
         }
         Ok(())
     }
@@ -296,7 +311,7 @@ async fn transcribe_in_time_chunks(
     }
 
     upload_result?;
-    Ok(merge_chunk_segments(chunk_results))
+    Ok(merge_chunks(chunk_results))
 }
 
 /// Content type for `file_name`'s extension. Whisper keys off the filename
@@ -329,6 +344,10 @@ fn mime_for(file_name: &str) -> &'static str {
 /// segments (silence Whisper already represented as a gap, not absorbed
 /// into either segment) is simply left unused — this function only ever
 /// tightens existing segments, never invents new ones from words.
+/// How far past its last word's start a tightened segment must end, so that
+/// word still falls inside the segment's half-open range.
+const SEGMENT_END_EPSILON_SECS: f64 = 0.001;
+
 fn tighten_segment_bounds_to_words(
     segments: Vec<WhisperSegment>,
     words: &[WhisperWord],
@@ -342,7 +361,12 @@ fn tighten_segment_bounds_to_words(
             let (mut tight_start, mut tight_end) = (f64::INFINITY, f64::NEG_INFINITY);
             for word in matching {
                 tight_start = tight_start.min(word.start);
-                tight_end = tight_end.max(word.end);
+                // Never end at or before an included word's start: Whisper
+                // often returns a zero-length (or backwards) last word, and
+                // with half-open [start, end) that word would fall outside
+                // its own segment and escape the segment's keep flag
+                // (words.rs invariant).
+                tight_end = tight_end.max(word.end).max(word.start + SEGMENT_END_EPSILON_SECS);
             }
             if !tight_start.is_finite() || !tight_end.is_finite() {
                 return segment;
@@ -369,7 +393,11 @@ mod tighten_segment_bounds_tests {
     }
 
     fn word(start: f64, end: f64) -> WhisperWord {
-        WhisperWord { start, end }
+        WhisperWord {
+            word: String::new(),
+            start,
+            end,
+        }
     }
 
     #[test]
@@ -434,7 +462,7 @@ mod tighten_segment_bounds_tests {
 
 /// Uploads a single already-in-memory audio file (a whole recording, or one
 /// WAV chunk of a legacy oversized one) to Whisper and parses the response
-/// into `TranscriptSegment`s, with timestamps relative to the start of
+/// into `TranscriptSegment`s plus word timestamps, with timestamps relative to the start of
 /// `audio_bytes` (i.e. not yet offset for its position in a longer
 /// recording — see `merge_chunk_segments` for that).
 async fn upload_chunk(
@@ -442,7 +470,7 @@ async fn upload_chunk(
     file_name: String,
     mime: &str,
     api_key: &str,
-) -> Result<Vec<TranscriptSegment>, String> {
+) -> Result<Transcript, String> {
     let file_part = reqwest::multipart::Part::bytes(audio_bytes)
         .file_name(file_name)
         .mime_str(mime)
@@ -490,7 +518,8 @@ async fn upload_chunk(
         .await
         .map_err(|err| format!("could not parse Whisper response: {err}"))?;
 
-    Ok(tighten_segment_bounds_to_words(parsed.segments, &parsed.words)
+    let words = whisper_words_to_transcript_words(&parsed.words);
+    let segments = tighten_segment_bounds_to_words(parsed.segments, &parsed.words)
         .into_iter()
         .map(|segment| TranscriptSegment {
             start: segment.start,
@@ -498,7 +527,47 @@ async fn upload_chunk(
             text: segment.text,
             keep: true,
         })
-        .collect())
+        .collect();
+    Ok(Transcript { segments, words })
+}
+
+/// Whisper's words → ours: trimmed text, empty words dropped, and `end`
+/// never before `start` (Whisper occasionally returns zero-length words;
+/// those are kept, since text editing still needs them).
+fn whisper_words_to_transcript_words(words: &[WhisperWord]) -> Vec<crate::words::TranscriptWord> {
+    words
+        .iter()
+        .filter_map(|word| {
+            let text = word.word.trim();
+            if text.is_empty() || !word.start.is_finite() || !word.end.is_finite() {
+                return None;
+            }
+            Some(crate::words::TranscriptWord {
+                start: word.start,
+                end: word.end.max(word.start),
+                text: text.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// `merge_chunk_segments` for a whole `Transcript`: offsets both segments
+/// and words by each chunk's position in the full recording.
+fn merge_chunks(chunks: Vec<(Transcript, f64)>) -> Transcript {
+    let mut words = Vec::new();
+    let mut segment_chunks = Vec::with_capacity(chunks.len());
+    for (transcript, offset) in chunks {
+        words.extend(transcript.words.into_iter().map(|word| crate::words::TranscriptWord {
+            start: word.start + offset,
+            end: word.end + offset,
+            text: word.text,
+        }));
+        segment_chunks.push((transcript.segments, offset));
+    }
+    Transcript {
+        segments: merge_chunk_segments(segment_chunks),
+        words,
+    }
 }
 
 /// Offsets each chunk's Whisper-returned segment timestamps by that
@@ -710,6 +779,69 @@ mod hallucination_flagging_tests {
 }
 
 #[cfg(test)]
+mod word_timestamp_tests {
+    use super::{merge_chunks, whisper_words_to_transcript_words, Transcript, TranscriptSegment, WhisperWord};
+    use crate::words::TranscriptWord;
+
+    fn ww(word: &str, start: f64, end: f64) -> WhisperWord {
+        WhisperWord {
+            word: word.to_string(),
+            start,
+            end,
+        }
+    }
+
+    fn tw(text: &str, start: f64, end: f64) -> TranscriptWord {
+        TranscriptWord {
+            start,
+            end,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn tightened_segment_still_contains_a_zero_length_last_word() {
+        let segments = vec![super::WhisperSegment {
+            start: 10.0,
+            end: 12.0,
+            text: "Thanks for watching you".to_string(),
+        }];
+        let words = [ww("Thanks", 10.0, 10.4), ww("you", 11.2, 11.2)];
+        let tightened = super::tighten_segment_bounds_to_words(segments, &words);
+        assert_eq!(tightened[0].start, 10.0);
+        assert!(11.2 < tightened[0].end, "zero-length last word must stay inside [start, end)");
+    }
+
+    #[test]
+    fn trims_text_drops_empty_and_fixes_backwards_ends() {
+        let words = whisper_words_to_transcript_words(&[
+            ww(" Okay", 0.0, 0.4),
+            ww("  ", 0.4, 0.5),
+            ww("so", 0.6, 0.5),
+            ww("um", 1.0, 1.0),
+        ]);
+        assert_eq!(words, vec![tw("Okay", 0.0, 0.4), tw("so", 0.6, 0.6), tw("um", 1.0, 1.0)]);
+    }
+
+    #[test]
+    fn merge_offsets_words_and_segments_by_chunk() {
+        let chunk = |text: &str| Transcript {
+            segments: vec![TranscriptSegment {
+                start: 0.0,
+                end: 2.0,
+                text: text.to_string(),
+                keep: true,
+            }],
+            words: vec![tw(text, 0.5, 1.0)],
+        };
+        let merged = merge_chunks(vec![(chunk("a"), 0.0), (chunk("b"), 600.0)]);
+        assert_eq!(merged.words, vec![tw("a", 0.5, 1.0), tw("b", 600.5, 601.0)]);
+        assert_eq!(merged.segments[1].start, 600.0);
+        assert_eq!(merged.segments[1].text, "b");
+    }
+}
+
+#[cfg(test)]
 mod chunk_merge_tests {
     use super::{merge_chunk_segments, TranscriptSegment};
 
@@ -839,16 +971,23 @@ async fn run_transcription(
 
     // Cache check (PRD §7.4): if another video row shares this content hash
     // and has already finished transcription, copy its segments rather than
-    // re-calling Whisper.
+    // re-calling Whisper. Only a Whisper-transcribed sibling that also has
+    // word timestamps counts: one transcribed before words were stored
+    // would spread a word-less transcript, and a VTT sibling's text isn't
+    // a Whisper transcript (docs/text-editing-plan.md §7.2). Edit state
+    // (removed words, corrections) is never copied.
+    let mut cached_words: Vec<crate::words::TranscriptWord> = Vec::new();
     let cached_segments: Vec<(f64, f64, String)> = match &content_hash {
         Some(hash) => {
             let guard = conn.0.lock().map_err(|err| err.to_string())?;
             let source_video_id: Option<String> = guard
                 .query_row(
                     "SELECT v.id FROM videos v
-                     JOIN transcript_segments ts ON ts.video_id = v.id
                      WHERE v.content_hash = ?1 AND v.id != ?2
                      AND v.transcript_status = 'transcribed'
+                     AND v.transcript_source = 'whisper'
+                     AND EXISTS (SELECT 1 FROM transcript_segments ts WHERE ts.video_id = v.id)
+                     AND EXISTS (SELECT 1 FROM transcript_words tw WHERE tw.video_id = v.id)
                      LIMIT 1",
                     params![hash, video_id],
                     |row| row.get::<_, String>(0),
@@ -858,6 +997,7 @@ async fn run_transcription(
 
             match source_video_id {
                 Some(source_id) => {
+                    cached_words = crate::words::query_source_words(&guard, &source_id)?;
                     let mut stmt = guard
                         .prepare(
                             "SELECT start, end, text FROM transcript_segments
@@ -882,11 +1022,14 @@ async fn run_transcription(
         None => Vec::new(),
     };
 
-    let mut segments: Vec<TranscriptSegment> = if !cached_segments.is_empty() {
-        cached_segments
-            .into_iter()
-            .map(|(start, end, text)| TranscriptSegment { start, end, text, keep: true })
-            .collect()
+    let Transcript { mut segments, words } = if !cached_segments.is_empty() {
+        Transcript {
+            segments: cached_segments
+                .into_iter()
+                .map(|(start, end, text)| TranscriptSegment { start, end, text, keep: true })
+                .collect(),
+            words: cached_words,
+        }
     } else {
         let api_key = settings::read_stored_key()?
             .ok_or_else(|| "No OpenAI API key saved — add one in Settings".to_string())?;
@@ -919,6 +1062,7 @@ async fn run_transcription(
             )
             .map_err(|err| err.to_string())?;
         }
+        crate::words::replace_words(&tx, video_id, None, &words, Some("hallucination"))?;
         tx.execute(
             "UPDATE videos SET transcript_status = 'transcribed', transcript_source = 'whisper', updated_at = ?1 WHERE id = ?2",
             params![now, video_id],
@@ -937,6 +1081,64 @@ async fn run_transcription(
             db::row_to_video,
         )
         .map_err(|err| err.to_string())
+}
+
+/// "Listen again for word-level editing" (`docs/text-editing-plan.md`
+/// §6.6): runs Whisper over `video_id`'s already-extracted audio and stores
+/// **only** the word timestamps, leaving `transcript_segments` untouched.
+/// For a video whose transcript came from a VTT import (cue-level timing
+/// only), or one transcribed before words were stored. The user triggers
+/// it; it's never run automatically, since it's a paid Whisper call.
+///
+/// Privacy: the same extracted audio goes to the same Whisper endpoint as
+/// `transcribe_video`. No video, no transcript text, nothing new leaves the
+/// device.
+///
+/// Replaces any existing words, and so their edit state, including pause
+/// decisions (`transcript_pauses` cascades on word id). Emits the usual
+/// `Stage::Transcribing` progress for the video; a caller showing progress
+/// should label it as fetching word timings, not re-transcribing. Words inside a
+/// segment the user dropped come back removed, with no reason tag, since
+/// that was the user's choice rather than a hallucination flag.
+#[tauri::command(async)]
+pub async fn fetch_word_timestamps(
+    app: AppHandle,
+    conn: tauri::State<'_, DbConnection>,
+    locks: tauri::State<'_, TranscriptionLocks>,
+    video_id: String,
+    attempt: u32,
+) -> Result<Vec<crate::words::TranscriptWordRow>, String> {
+    let _lock = TranscriptionLockGuard::acquire(&locks, &video_id)?;
+    let audio_path: Option<String> = {
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        guard
+            .query_row(
+                "SELECT audio_path FROM videos WHERE id = ?1",
+                params![video_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    format!("video {video_id} does not exist")
+                }
+                other => other.to_string(),
+            })?
+    };
+    let audio_path =
+        audio_path.ok_or_else(|| "audio not extracted yet for this video".to_string())?;
+    let api_key = settings::read_stored_key()?
+        .ok_or_else(|| "No OpenAI API key saved — add one in Settings".to_string())?;
+
+    let transcript = transcribe_audio(&app, &video_id, attempt, &audio_path, &api_key).await?;
+    if transcript.words.is_empty() {
+        return Err("Whisper returned no words for this recording".to_string());
+    }
+
+    let mut guard = conn.0.lock().map_err(|err| err.to_string())?;
+    let tx = guard.transaction().map_err(|err| err.to_string())?;
+    crate::words::replace_words(&tx, &video_id, None, &transcript.words, None)?;
+    tx.commit().map_err(|err| err.to_string())?;
+    crate::words::query_words(&guard, &video_id)
 }
 
 /// Re-transcribes a single ~`CHUNK_DURATION_THRESHOLD_SECS`-long chunk of
@@ -1030,7 +1232,22 @@ pub async fn retranscribe_chunk(
 
     let _ = tokio::fs::remove_file(&chunk_path).await;
 
-    let mut segments = upload_result?;
+    let Transcript { mut segments, words } = upload_result?;
+
+    // Only refresh words if the video already has them. Writing one chunk's
+    // words into a video with none would leave a partial word list that
+    // looks complete: "Listen again" would no longer be offered, and the
+    // transcript cache would copy it as a full hit.
+    let had_words: bool = {
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        guard
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM transcript_words WHERE video_id = ?1)",
+                params![video_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?
+    };
 
     // Count repeats against the rest of this video's *already-persisted*
     // transcript too, not just this one chunk's own freshly-returned batch
@@ -1081,6 +1298,24 @@ pub async fn retranscribe_chunk(
                 ],
             )
             .map_err(|err| err.to_string())?;
+        }
+
+        if had_words {
+            let words: Vec<crate::words::TranscriptWord> = words
+                .into_iter()
+                .map(|word| crate::words::TranscriptWord {
+                    start: word.start + chunk_start,
+                    end: word.end + chunk_start,
+                    text: word.text,
+                })
+                .collect();
+            crate::words::replace_words(
+                &tx,
+                &video_id,
+                Some((chunk_start, chunk_end)),
+                &words,
+                Some("hallucination"),
+            )?;
         }
 
         tx.execute(

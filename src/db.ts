@@ -175,6 +175,47 @@ export async function listTranscriptSegments(videoId: string): Promise<Transcrip
   return invoke<TranscriptSegment[]>("list_transcript_segments", { videoId });
 }
 
+/** One Whisper word (`transcript_words`, docs/text-editing-plan.md §7.1).
+ * Times are source-video seconds. A word belongs to the segment whose
+ * [start, end) contains its `start`; its `removed` flag follows that
+ * segment's `keep`. Whisper's word text has no punctuation. */
+export interface TranscriptWord {
+  id: string;
+  video_id: string;
+  idx: number;
+  text: string;
+  /** Whisper's text, set only when the user corrected the word. */
+  original_text: string | null;
+  start: number;
+  end: number;
+  removed: boolean;
+  /** Why the app removed or suggests removing it. */
+  suggested: "filler" | "hallucination" | null;
+}
+
+/** Empty for a video with no word timestamps yet (VTT import, or
+ * transcribed before words were stored): offer `fetchWordTimestamps`. */
+export async function listTranscriptWords(videoId: string): Promise<TranscriptWord[]> {
+  return invoke<TranscriptWord[]>("list_transcript_words", { videoId });
+}
+
+/** Saves a batch of word removals/restores and returns the video's
+ * segments, whose `keep` flags are re-derived from their words. Local only. */
+export async function updateTranscriptWords(
+  videoId: string,
+  changes: { id: string; removed: boolean }[],
+): Promise<TranscriptSegment[]> {
+  return invoke<TranscriptSegment[]>("update_transcript_words", { videoId, changes });
+}
+
+// "Listen again for word-level editing": sends the video's already-extracted
+// local audio to Whisper (same as transcription, see
+// `coursecut-privacy-invariants`) and stores only word timestamps; the
+// transcript segments are left as they are. A paid call: only on user action.
+export async function fetchWordTimestamps(videoId: string, attempt: number): Promise<TranscriptWord[]> {
+  return invoke<TranscriptWord[]>("fetch_word_timestamps", { videoId, attempt });
+}
+
 // Imports a local .vtt file as videoId's transcript, bypassing Whisper
 // entirely — for videos where the user already has an accurate transcript
 // from the recording platform (e.g. a Zoom/Teams .vtt export with real

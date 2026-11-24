@@ -12,6 +12,8 @@ Schema lives in `src-tauri/migrations/0001_init.sql` — that file is the source
 * **projects**(`id`, `name`, `created_at`, `updated_at`)
 * **videos**(`id`, `project_id` → projects, `file_path`, `duration`, `transcript_status` default `'pending'`, `created_at`, `updated_at`)
 * **transcript_segments**(`id`, `video_id` → videos, `start`, `end`, `text`, `keep` default `1`) — one row per sentence/word-group; `keep` is the transcript-mode delete flag (PRD §8.1), not a row delete.
+* **transcript_words**(`id`, `video_id` → videos, `idx`, `text`, `original_text`, `start`, `end`, `removed` default `0`, `suggested`) — migration `0014`. Whisper word timestamps for text-based editing (`docs/text-editing-plan.md` §7). A word belongs to the segment whose `[start, end)` contains its `start`. **Invariant:** a segment's `keep` and its words' `removed` agree; write both in one transaction (`src-tauri/src/words.rs`). `idx` is the order within the video, renumbered 0..n by time after any replacement (index is not unique on purpose). Cuts are derived from `removed`, never stored. Empty for videos transcribed before 0014 or VTT-only; filled by `fetch_word_timestamps` on user request.
+* **transcript_pauses**(`after_word_id` → transcript_words, `action` `'shorten'|'remove'|'keep'`) — the user's decision on the gap after a word. Pauses themselves are derived from word gaps.
 * **lessons**(`id`, `video_id` → videos, `title`, `summary`, `start`, `end`, `sort_order` default `0`)
 * **exports**(`id`, `lesson_id` → lessons, `output_path`, `status` default `'pending'`, `created_at`)
 

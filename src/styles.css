@@ -198,3 +198,28 @@ body {
     @apply font-sans;
   }
 }
+/* Word-level transcript editor (`WordTranscript`, docs/text-editing-plan.md
+   Phase 2). The native selection highlight is hidden inside it; selected
+   words get `[data-sel]` from `useWordSelection` instead, a continuous
+   highlight that includes the trailing space each word span carries.
+   `[data-active]` is the word under the playhead, set directly on the DOM
+   from the playback loop. Each paragraph skips layout and paint while off
+   screen (`content-visibility`) without unmounting, so native selection
+   and Cmd+F still work across a 2-hour transcript. */
+.word-transcript ::selection {
+  background: transparent;
+}
+.word-transcript [data-wid][data-sel] {
+  background-color: oklch(0.45 0.12 275 / 0.55);
+}
+.word-transcript [data-wid][data-sel][data-removed] {
+  background-color: oklch(0.45 0.13 25 / 0.6);
+}
+.word-transcript [data-wid][data-active] {
+  background-color: oklch(0.4 0 0);
+  color: var(--foreground);
+}
+.word-transcript-paragraph {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 6rem;
+}

@@ -7,6 +7,7 @@ mod progress;
 mod settings;
 mod vtt;
 mod wav;
+mod words;
 
 use tauri::Manager;
 
@@ -84,6 +85,9 @@ pub fn run() {
             ffmpeg::delete_playback_clip,
             openai::transcribe_video,
             openai::retranscribe_chunk,
+            openai::fetch_word_timestamps,
+            words::list_transcript_words,
+            words::update_transcript_words,
             openai::analyze_video,
             openai::preview_lesson_segment_edit,
             openai::apply_lesson_segment_edit,

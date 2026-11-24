@@ -171,6 +171,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|err| format!("could not update schema version: {err}"))?;
     }
 
+    if version < 14 {
+        conn.execute_batch(include_str!("../migrations/0014_transcript_words.sql"))
+            .map_err(|err| format!("migration 0014_transcript_words failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 14)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
     Ok(())
 }
 
@@ -624,6 +631,15 @@ pub fn import_vtt_transcript(
             )
             .map_err(|err| err.to_string())?;
         }
+        // Word timestamps from an earlier Whisper pass stay: they time the
+        // same audio, and save a Whisper call when the user edits by word.
+        // Their removed flags followed the old segments' keep flags, which
+        // are gone, so reset them to match the new all-kept segments.
+        tx.execute(
+            "UPDATE transcript_words SET removed = 0, suggested = NULL WHERE video_id = ?1",
+            params![video_id],
+        )
+        .map_err(|err| err.to_string())?;
         tx.execute(
             "UPDATE videos SET transcript_status = 'transcribed', transcript_source = 'vtt', updated_at = ?1 WHERE id = ?2",
             params![now, video_id],
@@ -713,7 +729,10 @@ pub fn update_transcript_segment(
     keep: bool,
 ) -> Result<TranscriptSegmentRow, String> {
     let conn = conn.0.lock().map_err(|err| err.to_string())?;
-    let updated = conn
+    // One transaction: the segment's words must follow its keep flag
+    // (`words.rs` invariant), or text editing would disagree with it.
+    let tx = conn.unchecked_transaction().map_err(|err| err.to_string())?;
+    let updated = tx
         .execute(
             "UPDATE transcript_segments SET keep = ?1 WHERE id = ?2",
             params![keep, id],
@@ -722,12 +741,16 @@ pub fn update_transcript_segment(
     if updated == 0 {
         return Err(format!("transcript segment {id} does not exist"));
     }
-    conn.query_row(
-        "SELECT id, video_id, start, end, text, keep FROM transcript_segments WHERE id = ?1",
-        params![id],
-        row_to_transcript_segment,
-    )
-    .map_err(|err| err.to_string())
+    let row = tx
+        .query_row(
+            "SELECT id, video_id, start, end, text, keep FROM transcript_segments WHERE id = ?1",
+            params![id],
+            row_to_transcript_segment,
+        )
+        .map_err(|err| err.to_string())?;
+    crate::words::set_removed_in_range(&tx, &row.video_id, row.start, row.end, !keep)?;
+    tx.commit().map_err(|err| err.to_string())?;
+    Ok(row)
 }
 
 /// `pub(crate)` so `openai.rs`'s per-lesson AI edit commands (`preview_lesson_segment_edit`/

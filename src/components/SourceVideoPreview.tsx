@@ -70,7 +70,19 @@ interface SourceVideoPreviewProps {
    * adding a segment now happens on a lesson's own `LessonSegmentsView`
    * page instead. */
   controlsLayout?: "side" | "stacked" | "minimal";
+  /** Source-time ranges to jump over while playing (removed words on the
+   * Transcript page, docs/text-editing-plan.md §6.2). Checked every
+   * animation frame, not on `timeupdate` (~250 ms), so a removed "um" isn't
+   * heard before the jump. Seeking or pausing inside a range is allowed. */
+  skipRanges?: readonly { start: number; end: number }[];
+  /** Called every animation frame with the playhead, for UI that must
+   * follow playback closely without a React render per frame (the word
+   * highlight). */
+  onFrameTime?: (time: number, playing: boolean) => void;
 }
+
+/** Lands the playhead just past a skipped range. */
+const SKIP_PAST_S = 0.001;
 
 /** One "[key] [key]  label" hint, e.g. the Space/←→/Shift+←→ rows below —
  * factored out since that same trio of hints is rendered twice (the "side"
@@ -125,10 +137,57 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
       onTimeUpdate,
       onAddSegment,
       controlsLayout = "minimal",
+      skipRanges,
+      onFrameTime,
     },
     ref,
   ) {
     const videoRef = useRef<HTMLVideoElement | null>(null);
+
+    // Per-frame loop for `skipRanges` / `onFrameTime` (the approach of
+    // Rescript v1.0.9's MediaPreview playback loop). Props go through refs
+    // so the loop starts once and never restarts.
+    const skipRangesRef = useRef(skipRanges);
+    skipRangesRef.current = skipRanges;
+    const onFrameTimeRef = useRef(onFrameTime);
+    onFrameTimeRef.current = onFrameTime;
+    const frameLoopWanted = skipRanges !== undefined || onFrameTime !== undefined;
+    useEffect(() => {
+      if (!frameLoopWanted) return;
+      let raf = 0;
+      let lastTime = -1;
+      let lastPlaying = false;
+      const tick = () => {
+        const video = videoRef.current;
+        if (video) {
+          let time = video.currentTime;
+          const playing = !video.paused;
+          const ranges = skipRangesRef.current;
+          if (playing && ranges) {
+            const cut = ranges.find((range) => time >= range.start && time < range.end);
+            if (cut) {
+              const target = cut.end + SKIP_PAST_S;
+              if (video.duration && target >= video.duration - 0.05) {
+                video.pause();
+                video.currentTime = cut.start;
+                time = cut.start;
+              } else {
+                video.currentTime = target;
+                time = target;
+              }
+            }
+          }
+          if (time !== lastTime || playing !== lastPlaying) {
+            lastTime = time;
+            lastPlaying = playing;
+            onFrameTimeRef.current?.(time, playing);
+          }
+        }
+        raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+      return () => cancelAnimationFrame(raf);
+    }, [frameLoopWanted]);
     const overlayContainerRef = useRef<HTMLDivElement | null>(null);
     const [currentTime, setCurrentTime] = useState(0);
     const [duration, setDuration] = useState(0);

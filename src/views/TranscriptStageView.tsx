@@ -1,17 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Loader2, Pause, Play, RotateCw } from "lucide-react";
+import { Eye, EyeOff, Loader2, Pause, Play, RotateCw } from "lucide-react";
 import Breadcrumbs from "../components/Breadcrumbs";
+import SourceVideoPreview, { type SourceVideoPreviewHandle } from "../components/SourceVideoPreview";
+import WordTranscript, { type WordTranscriptHandle } from "../components/WordTranscript";
+import { useWordEdits } from "../hooks/useWordEdits";
+import { formatLength, summarizeEdits } from "../lib/transcript-words";
 import { basename } from "./ProjectDetailView";
 import {
   analyzeVideo,
   deletePlaybackClip,
+  fetchWordTimestamps,
   getProject,
   getVideo,
   importVttTranscript,
   listLessons,
   listTranscriptSegments,
+  listTranscriptWords,
   prepareSegmentPlaybackClip,
   retranscribeChunk,
   updateTranscriptSegment,
@@ -107,6 +113,42 @@ export default function TranscriptStageView({
 
   const [undoStack, setUndoStack] = useState<UndoableAction[]>([]);
   const [redoStack, setRedoStack] = useState<UndoableAction[]>([]);
+
+  // Word-level editing (docs/text-editing-plan.md Phase 2). Used whenever
+  // this video has word timestamps; otherwise the page shows the segment
+  // list below with a "Get word timings" card. Word edits have their own
+  // in-memory undo history (`useWordEdits`); the segment-toggle stack above
+  // only applies to the segment list.
+  // A save returns fresh segment objects; keep the old object wherever
+  // nothing changed so memoised word paragraphs don't all re-render.
+  const handleSegmentsSaved = useCallback((next: TranscriptSegment[]) => {
+    setSegments((prev) => {
+      const byId = new Map(prev.map((segment) => [segment.id, segment]));
+      return next.map((segment) => {
+        const old = byId.get(segment.id);
+        return old &&
+          old.keep === segment.keep &&
+          old.start === segment.start &&
+          old.end === segment.end &&
+          old.text === segment.text
+          ? old
+          : segment;
+      });
+    });
+  }, []);
+  const wordEdits = useWordEdits({
+    videoId,
+    onSegmentsSaved: handleSegmentsSaved,
+    onError: setError,
+  });
+  // The hook returns a new object each render; its functions are stable.
+  const { load: loadWords, flush: flushWords, undo: undoWords, redo: redoWords } = wordEdits;
+  const wordMode = wordEdits.words.length > 0;
+  const [showRemoved, setShowRemoved] = useState(true);
+  const [skipRemoved, setSkipRemoved] = useState(true);
+  const [fetchingWords, setFetchingWords] = useState(false);
+  const playerRef = useRef<SourceVideoPreviewHandle>(null);
+  const wordTranscriptRef = useRef<WordTranscriptHandle>(null);
 
   // Chunk sidebar (only shown for recordings long enough to have been
   // chunked at transcription time — see `TRANSCRIPT_CHUNK_SECONDS`).
@@ -245,12 +287,14 @@ export default function TranscriptStageView({
       getVideo(videoId),
       listTranscriptSegments(videoId),
       listLessons(videoId),
+      listTranscriptWords(videoId),
     ])
-      .then(([projectRow, videoRow, segmentRows, lessonRows]) => {
+      .then(([projectRow, videoRow, segmentRows, lessonRows, wordRows]) => {
         if (cancelled) return;
         setProject(projectRow);
         setVideo(videoRow);
         setSegments(segmentRows);
+        loadWords(wordRows);
         setHasLessons(lessonRows.length > 0);
       })
       .catch((err) => {
@@ -262,7 +306,7 @@ export default function TranscriptStageView({
     return () => {
       cancelled = true;
     };
-  }, [projectId, videoId]);
+  }, [projectId, videoId, loadWords]);
 
   const pushUndo = useCallback((action: UndoableAction) => {
     setUndoStack((prev) => [...prev, action]);
@@ -308,6 +352,9 @@ export default function TranscriptStageView({
     if (importingTranscript || analyzing || busyChunkIndex !== null) return;
     setImportingTranscript(true);
     try {
+      // Unsaved word edits must land before the import resets them; a
+      // failed save stops the import here.
+      await flushWords();
       const selection = await open({
         filters: [{ name: "Subtitles", extensions: ["vtt"] }],
       });
@@ -316,6 +363,7 @@ export default function TranscriptStageView({
       const updated = await importVttTranscript(videoId, selection);
       setVideo(updated);
       setSegments(await listTranscriptSegments(videoId));
+      loadWords(await listTranscriptWords(videoId));
       // The chunk sidebar (if it was showing) is now gated off by
       // `transcript_source`, so a stale chunk selection would otherwise
       // keep silently filtering the segment list below with no visible
@@ -327,7 +375,7 @@ export default function TranscriptStageView({
     } finally {
       setImportingTranscript(false);
     }
-  }, [importingTranscript, analyzing, busyChunkIndex, videoId]);
+  }, [importingTranscript, analyzing, busyChunkIndex, videoId, flushWords, loadWords]);
 
   async function applySegmentKeep(segmentId: string, keep: boolean) {
     const updated = await updateTranscriptSegment(segmentId, keep);
@@ -410,15 +458,17 @@ export default function TranscriptStageView({
       setBusyChunkIndex(chunkIndex);
       clearProgress(videoId);
       try {
+        await flushWords();
         await retranscribeChunk(videoId, chunkIndex, nextAttempt);
         setSegments(await listTranscriptSegments(videoId));
+        loadWords(await listTranscriptWords(videoId));
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         setBusyChunkIndex(null);
       }
     },
-    [videoId, busyChunkIndex, clearProgress],
+    [videoId, busyChunkIndex, clearProgress, flushWords, loadWords],
   );
 
   const handleAnalyze = useCallback(async () => {
@@ -430,6 +480,8 @@ export default function TranscriptStageView({
     // stale event left over from this video's extract/transcribe pass.
     clearProgress(videoId);
     try {
+      // Analysis reads segment keep flags, which word saves re-derive.
+      await flushWords();
       await analyzeVideo(videoId, 1);
       onOpenLessons();
     } catch (err) {
@@ -437,7 +489,66 @@ export default function TranscriptStageView({
     } finally {
       setAnalyzing(false);
     }
-  }, [analyzing, videoId, clearProgress, onOpenLessons]);
+  }, [analyzing, videoId, clearProgress, onOpenLessons, flushWords]);
+
+  /** "Get word timings": one Whisper pass that stores word timestamps only
+   * (`fetch_word_timestamps`), for a video transcribed before words were
+   * stored or one whose transcript came from a VTT import. User-triggered
+   * only, since it's a paid call. */
+  const handleFetchWords = useCallback(async () => {
+    if (fetchingWords) return;
+    setFetchingWords(true);
+    clearProgress(videoId);
+    try {
+      await flushWords();
+      loadWords(await fetchWordTimestamps(videoId, 1));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFetchingWords(false);
+    }
+  }, [fetchingWords, videoId, clearProgress, flushWords, loadWords]);
+
+  // Operations that replace or read the words: the editor is read-only
+  // while they run, so no edit is made that the reload would drop.
+  const wordsBusy = analyzing || importingTranscript || busyChunkIndex !== null || fetchingWords;
+
+  // ⌘Z / ⇧⌘Z (Ctrl on Windows) for word edits, outside text fields.
+  useEffect(() => {
+    if (!wordMode || wordsBusy) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "z") return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+      event.preventDefault();
+      if (event.shiftKey) redoWords();
+      else undoWords();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [wordMode, wordsBusy, undoWords, redoWords]);
+
+  const editSummary = useMemo(
+    () => summarizeEdits(wordEdits.words, video?.duration ?? 0),
+    [wordEdits.words, video?.duration],
+  );
+
+  // Search / chunk filter as a set of visible paragraphs for the word view.
+  const visibleSegmentIds = useMemo(
+    () =>
+      searchQuery.trim() || selectedChunkIndex != null
+        ? new Set(filteredSegments.map((segment) => segment.id))
+        : null,
+    [filteredSegments, searchQuery, selectedChunkIndex],
+  );
+
+  const handleSeek = useCallback((time: number) => playerRef.current?.seekTo(time), []);
+  const handleFrameTime = useCallback(
+    (time: number, playing: boolean) => wordTranscriptRef.current?.setPlayhead(time, playing),
+    [],
+  );
+  const noopTimeUpdate = useCallback(() => {}, []);
 
   const videoProgress = progress[videoId];
 
@@ -475,8 +586,8 @@ export default function TranscriptStageView({
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => void handleUndo()}
-                disabled={undoStack.length === 0}
+                onClick={() => (wordMode ? undoWords() : void handleUndo())}
+                disabled={wordMode ? !wordEdits.canUndo || wordsBusy : undoStack.length === 0}
               >
                 Undo
               </Button>
@@ -484,8 +595,8 @@ export default function TranscriptStageView({
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => void handleRedo()}
-                disabled={redoStack.length === 0}
+                onClick={() => (wordMode ? redoWords() : void handleRedo())}
+                disabled={wordMode ? !wordEdits.canRedo || wordsBusy : redoStack.length === 0}
               >
                 Redo
               </Button>
@@ -541,6 +652,63 @@ export default function TranscriptStageView({
             </Alert>
           )}
 
+          {wordMode && video.duration != null && (
+            <div className="my-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+              <span className="tabular-nums" title="Length before → after your removals">
+                Length {formatLength(video.duration)} → {formatLength(editSummary.editedDuration)}
+                {video.duration - editSummary.editedDuration >= 0.5 && (
+                  <span className="ml-1.5 text-red-400">
+                    (−{formatLength(video.duration - editSummary.editedDuration)})
+                  </span>
+                )}
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowRemoved((value) => !value)}
+                aria-pressed={showRemoved}
+              >
+                {showRemoved ? <Eye /> : <EyeOff />}
+                {showRemoved ? "Showing removed words" : "Hiding removed words"}
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                Select words, then press Delete or click Remove. Click a word to play from it.
+              </span>
+            </div>
+          )}
+
+          {!wordMode && segments.length > 0 && (
+            <div className="my-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3 text-sm">
+              <div className="min-w-0 flex-1">
+                <p className="m-0 font-medium">Edit by word</p>
+                <p className="m-0 text-muted-foreground">
+                  Remove single words, filler and mistakes by editing the text. CourseCut needs to listen to
+                  the audio once more to time every word. This uses your OpenAI key, like transcription did.
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void handleFetchWords()}
+                disabled={fetchingWords || analyzing || importingTranscript || busyChunkIndex !== null}
+              >
+                {fetchingWords && <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden="true" />}
+                {fetchingWords
+                  ? videoProgress?.detail
+                    ? `Getting word timings (${videoProgress.detail})`
+                    : "Getting word timings…"
+                  : "Get word timings"}
+              </Button>
+            </div>
+          )}
+
+          <div
+            className={cn(
+              wordMode && "grid grid-cols-[minmax(0,1fr)_minmax(16rem,38%)] items-start gap-6",
+            )}
+          >
+          <div className="min-w-0">
           <Input
             type="search"
             className="my-2"
@@ -595,7 +763,21 @@ export default function TranscriptStageView({
               </ul>
             )}
 
-            {filteredSegments.length === 0 ? (
+            {wordMode ? (
+              <div className="min-w-0 flex-1">
+                <WordTranscript
+                  ref={wordTranscriptRef}
+                  segments={segments}
+                  words={wordEdits.words}
+                  visibleSegmentIds={visibleSegmentIds}
+                  showRemoved={showRemoved}
+                  readOnly={wordsBusy}
+                  onRemove={wordEdits.remove}
+                  onRestore={wordEdits.restore}
+                  onSeek={handleSeek}
+                />
+              </div>
+            ) : filteredSegments.length === 0 ? (
               <p className="min-w-0 flex-1">No matching transcript segments.</p>
             ) : (
               <ul className="m-0 flex min-w-0 flex-1 list-none flex-col gap-1.5 p-0">
@@ -676,6 +858,31 @@ export default function TranscriptStageView({
                 })}
               </ul>
             )}
+          </div>
+          </div>
+
+          {wordMode && (
+            <aside className="sticky top-4 min-w-0">
+              <SourceVideoPreview
+                ref={playerRef}
+                filePath={video.file_path}
+                onTimeUpdate={noopTimeUpdate}
+                skipRanges={skipRemoved ? editSummary.cuts : undefined}
+                onFrameTime={handleFrameTime}
+                controlsLayout="minimal"
+              />
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <Checkbox
+                  checked={skipRemoved}
+                  onCheckedChange={(checked) => setSkipRemoved(checked === true)}
+                />
+                Skip removed parts while playing
+              </label>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Turn off to hear the original recording.
+              </p>
+            </aside>
+          )}
           </div>
         </>
       )}
