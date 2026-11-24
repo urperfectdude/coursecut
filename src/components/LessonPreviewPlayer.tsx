@@ -65,6 +65,9 @@ interface LessonPreviewPlayerProps {
   slides?: Pick<LessonSlide, "id" | "position" | "mode" | "duration" | "image_path" | "mute_audio">[];
   /** Reports the video's pixel size once its metadata has loaded. */
   onVideoSize?: (size: { width: number; height: number }) => void;
+  /** An AI voice track (a WAV on the lesson's timeline, see `voice.rs`).
+   * When set, the recording is muted and the track plays in sync. */
+  voiceTrackPath?: string | null;
   /** Called every animation frame with the source-time playhead, for the
    * word highlight (no React render per frame). */
   onFrameTime?: (time: number, playing: boolean) => void;
@@ -99,6 +102,7 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
   slides = [],
   onVideoSize,
   onFrameTime,
+  voiceTrackPath = null,
 }: LessonPreviewPlayerProps, ref) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayContainerRef = useRef<HTMLDivElement | null>(null);
@@ -263,8 +267,8 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
   const overlaySlideMuted = activeOverlaySlides.some((slide) => slide.mute_audio);
 
   useEffect(() => {
-    if (videoRef.current) videoRef.current.muted = overlaySlideMuted;
-  }, [overlaySlideMuted]);
+    if (videoRef.current) videoRef.current.muted = overlaySlideMuted || voiceTrackPath !== null;
+  }, [overlaySlideMuted, voiceTrackPath]);
 
   const insertedIntro = slides.find((slide) => slide.mode === "insert" && slide.position === "intro") ?? null;
   const insertedOutro = slides.find((slide) => slide.mode === "insert" && slide.position === "outro") ?? null;
@@ -374,6 +378,56 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
     return () => cancelAnimationFrame(raf);
   }, [frameLoopWanted]);
 
+  // AI voice: keeps the track at the lesson-time playhead every frame. The
+  // lesson time runs on across segment joins, so the track only needs a
+  // seek after a user seek (or drift), not at each join. Paused while an
+  // inserted slide holds the screen.
+  const voiceRef = useRef<HTMLAudioElement | null>(null);
+  const voiceSyncRef = useRef({ segments, segmentOffsets, playbackRate, holding: hold !== null, muted: false });
+  voiceSyncRef.current = {
+    segments,
+    segmentOffsets,
+    playbackRate,
+    holding: hold !== null,
+    // Silent under an overlay slide set to mute, as the recording would be.
+    muted: overlaySlideMuted,
+  };
+  useEffect(() => {
+    if (!voiceTrackPath) return;
+    let raf = 0;
+    const tick = () => {
+      const video = videoRef.current;
+      const audio = voiceRef.current;
+      const { segments: segs, segmentOffsets: offsets, playbackRate: rate, holding, muted } = voiceSyncRef.current;
+      const segment = segs[activeIndexRef.current];
+      if (audio && audio.muted !== muted) audio.muted = muted;
+      if (video && audio && segment && (video.seeking || video.readyState < 3)) {
+        // Jumping to the next row, or buffering: the lesson time is held
+        // at the old row's end meanwhile, so wait rather than re-seek the
+        // voice back (it would repeat a fragment at every cut).
+        if (!audio.paused) audio.pause();
+      } else if (video && audio && segment) {
+        const lessonTime =
+          offsets[activeIndexRef.current] + Math.min(Math.max(video.currentTime, segment.start), segment.end) - segment.start;
+        if (!video.paused && !holding) {
+          if (audio.playbackRate !== rate) audio.playbackRate = rate;
+          if (Math.abs(audio.currentTime - lessonTime) > 0.15) audio.currentTime = lessonTime;
+          if (audio.paused) void audio.play().catch(() => undefined);
+        } else {
+          if (!audio.paused) audio.pause();
+          if (Math.abs(audio.currentTime - lessonTime) > 0.05) audio.currentTime = lessonTime;
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    const audio = voiceRef.current;
+    return () => {
+      cancelAnimationFrame(raf);
+      audio?.pause();
+    };
+  }, [voiceTrackPath]);
+
   useImperativeHandle(ref, () => ({
     seekToSource(time: number) {
       const index = segments.findIndex((segment) => time >= segment.start && time < segment.end);
@@ -462,6 +516,7 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
           onPlay={() => setIsPaused(false)}
           onPause={() => setIsPaused(true)}
         />
+        {voiceTrackPath && <audio ref={voiceRef} src={convertFileSrc(voiceTrackPath)} preload="auto" />}
         {/* Before the overlay images, matching the export's chain order
            (shapes -> image overlays). */}
         {contentRect && videoWidth > 0 && (

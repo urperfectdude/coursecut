@@ -7,6 +7,7 @@ import {
   testOpenAiKey,
   type KeyStatus,
 } from "../db";
+import { VoiceSettingsForm, useVoiceSettings } from "../components/VoicePanel";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -199,6 +200,27 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
           </Alert>
         )}
       </section>
+
+      <AiVoiceSection />
     </div>
+  );
+}
+
+/** AI voice (HCM feature 4): the privacy opt-in and the voice. */
+function AiVoiceSection() {
+  const { settings, error, save } = useVoiceSettings();
+  return (
+    <section>
+      <h2>AI voice</h2>
+      <p className="max-w-2xl text-sm text-muted-foreground">
+        Reads your corrected lesson scripts aloud in a studio voice. Generate it from a lesson's AI voice tab.
+      </p>
+      <div className="max-w-2xl">{settings && <VoiceSettingsForm settings={settings} onChange={save} />}</div>
+      {error && (
+        <Alert variant="destructive" className="mt-4">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+    </section>
   );
 }

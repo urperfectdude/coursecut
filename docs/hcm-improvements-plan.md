@@ -15,7 +15,7 @@ Client asks:
 | 1 | Intro/outro: **overlay** or **insert** mode | **Built** (`0013_lesson_slides`, `IntroOutroPanel`, title cards via `titleCard.ts`); needs a hands-on test |
 | 2 | Shape layers (blur / solid cover) | **Built** (`0012_lesson_regions`); crop removed 2026-11-23, so it needs a fresh review, and the in-app editor still needs a hands-on test |
 | 3 | Rescript-style silence and filler removal, with word correction | In progress: see `docs/text-editing-plan.md` |
-| 4 | AI studio voice from the (corrected) transcript | Not started |
+| 4 | AI studio voice from the (corrected) transcript | **V1 built** (2026-11-24): opt-in, AI voice tab, generate + preview. Export (V2) not yet; see §4 |
 
 Build order: 2 → 1 → 3 → 4. The voice comes last because it should read the corrected transcript and fit the cut timeline.
 
@@ -73,10 +73,37 @@ Crop was dropped by the user on 2026-11-23: shape layers cover the need, and a c
 
 ## 4. AI studio voice
 
-* The source is the corrected transcript with fillers removed, one TTS clip per segment (OpenAI `gpt-4o-mini-tts`). This is a stock voice, not a clone.
-* **Fitting each clip to its slot.** `atempo` within 0.85–1.15×. A clip that's too long beyond that extends the slot by freezing the last frame; one that's too short is padded with silence.
-* **Non-destructive.** The original audio stays. Voice is a per-export toggle, and generated clips are cached by text hash.
-* **Privacy: needs a change, done as part of this feature.** Sending transcript text to OpenAI for speech is a new purpose. It needs an explicit opt-in in Settings, and an update to `coursecut-privacy-invariants`.
+The voice reads the lesson's **corrected script**: the words the lesson keeps (its `lesson_segments`), with the user's text fixes from the Script tab's **Edit** option (`docs/text-editing-plan.md` §6.4). It's an OpenAI stock voice (`gpt-4o-mini-tts`), not a clone.
+
+### How it works (decided 2026-11-24)
+
+* **Lines, not segments.** With per-lesson cuts a lesson can have dozens of short rows after Quick cleanup, and a clip per row would sound choppy. Instead the script is split into **one line per sentence** (transcript segment), in lesson order. A sentence with words cut out of it is still one line. A backward jump (a reordered lesson) starts a new line. Built in TS by `src/lib/voice-script.ts::buildVoiceLines` (tested).
+* **Placement.** Each line starts where its first word is said in the lesson (lesson time, 0 = first kept frame; inserted intros not counted). Its slot runs to the next line's start.
+* **Fitting** (`voice.rs::place_lines`, tested):
+  * Shorter than its slot: played at normal speed, the rest is silence (like a speaker's pause). Never slowed down.
+  * Longer: sped up with ffmpeg `atempo`, at most **1.25×**.
+  * Still too long: it runs over and the next line starts when it ends (lines never overlap). Lines that start more than 0.3 s late are flagged in the tab: "shorten the text". The video is never frozen or stretched. This replaces the earlier "freeze the last frame" idea, which would have changed the edited timeline under the overlays.
+* **Cache.** Each clip is cached as raw PCM (24 kHz mono) in `$APPCACHE/tts/<sha256(model, voice, style, text)>.pcm`, so regenerating after an edit only pays for changed lines. The track is rebuilt locally every time (a mono WAV in `$APPCACHE/voice_tracks/`, one per lesson).
+* **Non-destructive.** The original audio stays. Nothing about the voice is stored in SQLite yet; the track lives for the editor visit and is rebuilt from the cache (free) on the next Generate.
+* **Privacy.** Sending script text to the speech endpoint is a new purpose. It's behind an explicit opt-in (`ai_voice_enabled` in `app_settings`, off by default), checked in Rust on every call. `coursecut-privacy-invariants` lists it as the third allowed use. Only line text, the voice name and the optional speaking style are sent.
+
+### Phases
+
+| Phase | Scope | Status |
+|---|---|---|
+| **V0. Text fixes** | Script tab: select words, **Edit**, type the right text. Timing stays; `original_text` keeps Whisper's text; one undo step; edited words get a dotted blue underline. | **Built** 2026-11-24 |
+| **V1. Generate and preview** | Settings → AI voice (opt-in, 11 stock voices, speaking style). Lesson editor **AI voice** tab: the lines, Generate (4 requests at a time, progress), per-line speed/late flags, click a line to play there. "Hear the AI voice in the Final video" mutes the recording and plays the track in sync. | **Built** 2026-11-24, needs a hands-on test with a real key |
+| **V2. Export with the voice** | Per-lesson "Use AI voice" saved in SQLite (a `lesson_voice` row: enabled + the script signature), so an export can tell when the voice is stale. Export: after the pieces are joined, one more ffmpeg pass maps the video stream (copy) and the voice track as audio, delayed by an inserted intro's length and padded to the full length. Refuse with a clear message if the script changed since the voice was made. | Next |
+| **V3. Polish** | Per-line regenerate; a pronunciation glossary (open question 4); intro/outro lines read by the voice; keep the recording faintly under the voice (ducking) as an option. | Later |
+
+### Known limits of V1
+
+* **Re-transcribing** ("Listen again", or a chunk retry) replaces the words and drops text fixes, like the other word edits (`text-editing-plan.md` §6.6).
+* **Text fixes don't change `transcript_segments.text`**, so the Transcript page and GPT analysis still show Whisper's sentence. The Script tab, the voice and future captions use the fixes.
+* **An edit with fewer words than it replaces** leaves the leftover words empty (still timed, shown as nothing). An edit with more words puts several on one word.
+* **Edit only touches kept words.** Struck-through (cut) words in a selection are left out of the edit box, since they're never read.
+* **Review (independent-reviewer, 2026-11-24): nothing blocking; privacy passes.** Fixed: Edit spreading text onto cut words; the preview voice repeating a fragment at every cut (it now waits while the video seeks or buffers); typing Whisper's own text being treated as "not edited" (reverts are now explicit, `text: null`); a stale track still playing after an edit (listening switches off); the voice playing under a muted overlay slide; track cleanup deleting another run's temp file. **Open, cosmetic:** words the user didn't change can occasionally get the "edited" underline when a paragraph starts mid-sentence (the box's text and the comparison are aligned slightly differently).
+* **The track isn't saved.** Leaving the lesson and coming back needs Generate again (it reuses every cached clip, so it's free and quick).
 
 ---
 

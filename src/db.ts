@@ -199,6 +199,73 @@ export async function listTranscriptWords(videoId: string): Promise<TranscriptWo
   return invoke<TranscriptWord[]>("list_transcript_words", { videoId });
 }
 
+/** Corrects words' text, keeping their timing (Script tab "Edit"). An
+ * empty text is allowed for words an edit left without one; `null` puts
+ * Whisper's text back. Returns the changed rows. Local only. */
+export async function setTranscriptWordTexts(
+  videoId: string,
+  changes: { id: string; text: string | null }[],
+): Promise<TranscriptWord[]> {
+  return invoke<TranscriptWord[]>("set_transcript_word_texts", { videoId, changes });
+}
+
+/** AI voice settings (HCM feature 4). `enabled` is the privacy opt-in:
+ * nothing is sent to OpenAI's speech endpoint until it's on. */
+export interface VoiceSettings {
+  enabled: boolean;
+  voice: string;
+  instructions: string;
+}
+
+export const AI_VOICES = [
+  "alloy",
+  "ash",
+  "ballad",
+  "coral",
+  "echo",
+  "fable",
+  "nova",
+  "onyx",
+  "sage",
+  "shimmer",
+  "verse",
+] as const;
+
+export async function getVoiceSettings(): Promise<VoiceSettings> {
+  return invoke<VoiceSettings>("get_voice_settings");
+}
+
+export async function saveVoiceSettings(settings: VoiceSettings): Promise<VoiceSettings> {
+  return invoke<VoiceSettings>("save_voice_settings", { settings });
+}
+
+export interface VoiceLinePlacement {
+  start: number;
+  duration: number;
+  rate: number;
+  late_by: number;
+}
+
+export interface VoiceTrack {
+  /** WAV in the app cache; play it with `convertFileSrc`. */
+  path: string;
+  duration: number;
+  lines: VoiceLinePlacement[];
+  generated: number;
+  late_lines: number;
+}
+
+/** Reads each line with the AI voice (only lines not cached yet go to
+ * OpenAI: their text only) and builds the lesson's voice track. Emits
+ * `"voice-progress"` `{ lesson_id, done, total }`. */
+export async function generateLessonVoice(
+  lessonId: string,
+  lines: { text: string; start: number; end: number }[],
+  lessonLength: number,
+): Promise<VoiceTrack> {
+  return invoke<VoiceTrack>("generate_lesson_voice", { lessonId, lines, lessonLength });
+}
+
 export type PauseAction = "shorten" | "remove" | "keep";
 
 

@@ -9,20 +9,21 @@ import {
   useRef,
   useState,
 } from "react";
-import { ArrowDown, Pause as PauseIcon, RotateCcw, Trash2 } from "lucide-react";
+import { ArrowDown, Check, Pause as PauseIcon, Pencil, RotateCcw, Trash2, X } from "lucide-react";
 import type { PauseAction, TranscriptSegment, TranscriptWord } from "../db";
 import { isFillerWord } from "../lib/fillers";
 import { useWordSelection } from "../hooks/useWordSelection";
 import {
+  displayWordTexts,
   findActiveWordIndex,
   pauseCut,
-  punctuateWords,
   SHORTENED_PAUSE_S,
   type Pause,
   type ScriptParagraph,
 } from "../lib/transcript-words";
 import { formatTimestamp } from "../lib/timestamp";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
 export interface WordTranscriptHandle {
@@ -54,6 +55,9 @@ interface WordTranscriptProps {
   onPauseAction: (afterWordId: string, action: PauseAction | null) => void;
   onRemove: (idxs: number[]) => void;
   onRestore: (idxs: number[]) => void;
+  /** Corrects the selected words' text (their timing stays). Omit to hide
+   * the Edit option. */
+  onEditText?: (idxs: number[], text: string) => void;
   onSeek: (time: number) => void;
 }
 
@@ -82,7 +86,9 @@ const WordSpan = memo(function WordSpan({
       data-wid={word.idx}
       data-removed={word.removed ? "" : undefined}
       title={
-        word.suggested
+        word.original_text !== null
+          ? `Edited. Was "${word.original_text}"`
+          : word.suggested
           ? reasonLabel[word.suggested]
           : !word.removed && isFillerWord(word.text)
             ? "Filler word: Clean up can remove it"
@@ -93,12 +99,16 @@ const WordSpan = memo(function WordSpan({
         "cursor-pointer rounded-[3px] py-0.5 transition-colors duration-75",
         word.removed
           ? "bg-red-950/40 text-red-400 line-through decoration-red-400/70"
-          : isFillerWord(word.text)
-            ? "underline decoration-amber-400 decoration-2 underline-offset-4 hover:bg-muted"
-            : "hover:bg-muted",
+          : word.original_text !== null
+            ? "underline decoration-sky-400 decoration-dotted decoration-2 underline-offset-4 hover:bg-muted"
+            : isFillerWord(word.text)
+              ? "underline decoration-amber-400 decoration-2 underline-offset-4 hover:bg-muted"
+              : "hover:bg-muted",
       )}
     >
-      {text}{" "}
+      {/* A word an edit left empty still times audio: it stays in the DOM
+         (so a drag across it selects it) but shows nothing. */}
+      {text ? `${text} ` : null}
     </span>
   );
 });
@@ -217,7 +227,7 @@ const Paragraph = memo(function Paragraph({
   onWordClick: (idx: number, el: HTMLElement) => void;
   onSeek: (time: number) => void;
 }) {
-  const displayTexts = useMemo(() => punctuateWords(segment.text, words), [segment.text, words]);
+  const displayTexts = useMemo(() => displayWordTexts(segment.text, words), [segment.text, words]);
   const shown = showRemoved ? words : words.filter((word) => !word.removed);
   if (shown.length === 0) return null;
   const firstIdx = words.length > 0 ? words[0].idx : 0;
@@ -280,6 +290,7 @@ const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(fun
     onPauseAction,
     onRemove,
     onRestore,
+    onEditText,
     onSeek,
   },
   ref,
@@ -325,6 +336,36 @@ const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(fun
     onRestore(selection.ids);
     clearSelection();
   }, [selection, readOnly, onRestore, clearSelection]);
+
+  // "Edit": the selection is copied here when editing starts, since
+  // focusing the text box ends the page's text selection.
+  const [editing, setEditing] = useState<{ ids: number[]; draft: string; top: number; left: number } | null>(
+    null,
+  );
+  // Only the words the lesson keeps: struck-through words are cut and
+  // never read, so text spread onto them would be lost.
+  const startEditing = useCallback(() => {
+    if (!selection || readOnly) return;
+    const container = containerRef.current;
+    const ids = selection.ids.filter((id) => !removedIds.has(id));
+    if (ids.length === 0) return;
+    const draft = ids
+      .map((id) => container?.querySelector<HTMLElement>(`[data-wid="${id}"]`)?.textContent?.trim() ?? "")
+      .filter(Boolean)
+      .join(" ");
+    setEditing({ ids, draft, top: selection.top, left: selection.left });
+  }, [selection, readOnly, removedIds]);
+  const finishEditing = useCallback(
+    (save: boolean) => {
+      if (save && editing && editing.draft.trim() && onEditText) onEditText(editing.ids, editing.draft);
+      setEditing(null);
+      clearSelection();
+    },
+    [editing, onEditText, clearSelection],
+  );
+  useEffect(() => {
+    if (!active || readOnly) setEditing(null);
+  }, [active, readOnly]);
 
   // Backspace/Delete removes the selection; Escape clears it. Not while
   // typing in a field (the search box).
@@ -441,7 +482,49 @@ const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(fun
         ))
       )}
 
-      {selection && !readOnly && (
+      {editing && !readOnly && (
+        <div
+          data-transcript-toolbar
+          className="absolute z-20 flex w-[min(32rem,100%)] -translate-x-1/2 flex-col gap-1.5 rounded-lg border bg-popover p-2 shadow-lg"
+          style={{ top: editing.top, left: `clamp(16rem, ${editing.left}px, calc(100% - 16rem))` }}
+        >
+          <div className="flex items-center gap-1">
+            <Input
+              autoFocus
+              value={editing.draft}
+              onChange={(event) => setEditing((prev) => (prev ? { ...prev, draft: event.target.value } : prev))}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  finishEditing(true);
+                } else if (event.key === "Escape") {
+                  event.preventDefault();
+                  finishEditing(false);
+                }
+              }}
+              aria-label="Corrected text"
+              className="h-8 flex-1 text-sm"
+            />
+            <Button
+              type="button"
+              size="icon-sm"
+              disabled={!editing.draft.trim()}
+              onClick={() => finishEditing(true)}
+              aria-label="Save text"
+            >
+              <Check />
+            </Button>
+            <Button type="button" size="icon-sm" variant="ghost" onClick={() => finishEditing(false)} aria-label="Cancel">
+              <X />
+            </Button>
+          </div>
+          <p className="m-0 text-xs text-muted-foreground">
+            Fixes the text only (for the AI voice and captions); the video is unchanged. Use Remove to cut words.
+          </p>
+        </div>
+      )}
+
+      {selection && !readOnly && !editing && (
         <div
           data-transcript-toolbar
           className="absolute z-20 flex -translate-x-1/2 items-center gap-0.5 rounded-lg border bg-popover p-1 shadow-lg"
@@ -458,6 +541,12 @@ const WordTranscript = forwardRef<WordTranscriptHandle, WordTranscriptProps>(fun
             <Button type="button" size="sm" variant="ghost" onClick={restoreSelection}>
               <RotateCcw />
               Restore
+            </Button>
+          )}
+          {onEditText && anyKept && (
+            <Button type="button" size="sm" variant="ghost" onClick={startEditing}>
+              <Pencil />
+              Edit
             </Button>
           )}
         </div>

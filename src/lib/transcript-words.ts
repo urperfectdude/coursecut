@@ -146,6 +146,40 @@ export function punctuateWords(segmentText: string, words: readonly { text: stri
 // --- Pauses (docs/text-editing-plan.md §6.1, §6.5) -------------------------
 
 /** A gap between words at least this long is a "long pause". */
+/**
+ * Display text for each word: punctuation and casing from the segment text
+ * (see `punctuateWords`), except that a word the user edited shows its own
+ * text. Edited words are aligned by Whisper's text (`original_text`), so
+ * an edit doesn't throw the alignment of the words around it off.
+ */
+export function displayWordTexts(
+  segmentText: string,
+  words: readonly { text: string; original_text: string | null }[],
+): string[] {
+  const aligned = punctuateWords(
+    segmentText,
+    words.map((word) => ({ text: word.original_text ?? word.text })),
+  );
+  return words.map((word, i) => (word.original_text !== null ? word.text : aligned[i]));
+}
+
+/**
+ * Spreads edited text over `count` selected words, in order, so each word
+ * keeps its timing and roughly its share of the text. With more new words
+ * than selected ones, some words hold several; with fewer, the last words
+ * are left empty (they still time audio, they just say nothing).
+ */
+export function spreadEditedText(count: number, text: string): string[] {
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  const out: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const from = Math.ceil((i * tokens.length) / count);
+    const to = Math.ceil(((i + 1) * tokens.length) / count);
+    out.push(tokens.slice(from, to).join(" "));
+  }
+  return out;
+}
+
 export const LONG_PAUSE_S = 1.0;
 /** "Shorten" leaves this much of the pause. */
 export const SHORTENED_PAUSE_S = 0.3;

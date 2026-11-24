@@ -348,6 +348,81 @@ fn apply_word_changes(
     tx.commit().map_err(|err| err.to_string())
 }
 
+/// One word's corrected text, from the lesson editor's Edit option
+/// (`docs/text-editing-plan.md` §6.4). The word keeps its timing; only its
+/// text changes. Empty text is allowed: when an edit has fewer words than
+/// it replaces, the leftover words carry no text (they still time audio).
+#[derive(Debug, serde::Deserialize)]
+pub struct WordTextChange {
+    pub id: String,
+    /// `None` puts Whisper's text back (an undo of a first edit). A text
+    /// equal to Whisper's still counts as an edit: the shown word may carry
+    /// the sentence's punctuation and casing, which the user removed.
+    pub text: Option<String>,
+}
+
+/// Longest text one word may hold (an edit can put several words on one).
+const MAX_WORD_TEXT_LEN: usize = 500;
+
+/// Saves corrected word texts in one transaction and returns the changed
+/// rows. `original_text` keeps Whisper's text the first time a word is
+/// changed, and is cleared only by an explicit revert, so
+/// `original_text IS NOT NULL` always means "corrected". Pure DB, no
+/// network.
+#[tauri::command]
+pub fn set_transcript_word_texts(
+    conn: tauri::State<'_, DbConnection>,
+    video_id: String,
+    changes: Vec<WordTextChange>,
+) -> Result<Vec<TranscriptWordRow>, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    apply_word_texts(&conn, &video_id, &changes)
+}
+
+pub(crate) fn apply_word_texts(
+    conn: &Connection,
+    video_id: &str,
+    changes: &[WordTextChange],
+) -> Result<Vec<TranscriptWordRow>, String> {
+    for change in changes {
+        if change.text.as_deref().unwrap_or("").chars().count() > MAX_WORD_TEXT_LEN {
+            return Err(format!("A word's text can be at most {MAX_WORD_TEXT_LEN} characters."));
+        }
+    }
+    let tx = conn.unchecked_transaction().map_err(|err| err.to_string())?;
+    {
+        // Right-hand sides read the row's values from before this UPDATE.
+        let mut update = tx
+            .prepare(
+                "UPDATE transcript_words SET original_text = COALESCE(original_text, text), text = ?1
+                 WHERE id = ?2 AND video_id = ?3",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut revert = tx
+            .prepare(
+                "UPDATE transcript_words SET text = COALESCE(original_text, text), original_text = NULL
+                 WHERE id = ?1 AND video_id = ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        for change in changes {
+            match &change.text {
+                Some(text) => {
+                    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    update.execute(params![text, change.id, video_id])
+                }
+                None => revert.execute(params![change.id, video_id]),
+            }
+            .map_err(|err| err.to_string())?;
+        }
+    }
+    tx.commit().map_err(|err| err.to_string())?;
+    let ids: std::collections::HashSet<&str> = changes.iter().map(|c| c.id.as_str()).collect();
+    Ok(query_words(conn, video_id)?
+        .into_iter()
+        .filter(|row| ids.contains(row.id.as_str()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +650,36 @@ mod tests {
         replace_words(&conn, "v", None, &[w(1.0, "a")], None).unwrap();
         conn.execute("DELETE FROM videos WHERE id = 'v'", []).unwrap();
         assert!(texts(&conn).is_empty());
+    }
+
+    #[test]
+    fn word_text_edits_keep_whisper_text_and_clear_on_revert() {
+        let conn = setup();
+        replace_words(&conn, "v", None, &[w(0.0, "hello"), w(1.0, "wrold")], None).unwrap();
+        let rows = query_words(&conn, "v").unwrap();
+        let id = rows[1].id.clone();
+        let changed = apply_word_texts(
+            &conn,
+            "v",
+            &[WordTextChange { id: id.clone(), text: Some("  world, ".into()) }],
+        )
+        .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].text, "world,");
+        assert_eq!(changed[0].original_text.as_deref(), Some("wrold"));
+        // A second edit keeps the first original.
+        let changed = apply_word_texts(&conn, "v", &[WordTextChange { id: id.clone(), text: Some("World".into()) }]).unwrap();
+        assert_eq!(changed[0].original_text.as_deref(), Some("wrold"));
+        // Typing Whisper's own text is still an edit (it drops the
+        // sentence's punctuation from the shown word).
+        let changed = apply_word_texts(&conn, "v", &[WordTextChange { id: id.clone(), text: Some("wrold".into()) }]).unwrap();
+        assert_eq!(changed[0].original_text.as_deref(), Some("wrold"));
+        // A revert puts Whisper's text back: no longer corrected.
+        let changed = apply_word_texts(&conn, "v", &[WordTextChange { id: id.clone(), text: None }]).unwrap();
+        assert_eq!(changed[0].text, "wrold");
+        assert_eq!(changed[0].original_text, None);
+        // Other videos' ids are ignored.
+        let changed = apply_word_texts(&conn, "other", &[WordTextChange { id, text: Some("x".into()) }]).unwrap();
+        assert!(changed.is_empty());
     }
 }

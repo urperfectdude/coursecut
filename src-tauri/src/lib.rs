@@ -5,6 +5,7 @@ mod ffmpeg;
 mod openai;
 mod progress;
 mod settings;
+mod voice;
 mod vtt;
 mod wav;
 mod words;
@@ -103,6 +104,10 @@ pub fn run() {
             words::list_transcript_words,
             words::update_transcript_words,
             words::list_transcript_pauses,
+            words::set_transcript_word_texts,
+            voice::get_voice_settings,
+            voice::save_voice_settings,
+            voice::generate_lesson_voice,
             openai::analyze_video,
             openai::preview_lesson_segment_edit,
             openai::apply_lesson_segment_edit,

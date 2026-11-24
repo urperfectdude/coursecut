@@ -38,6 +38,8 @@ interface LessonScriptProps {
   /** Replace the lesson's segments with `ranges` (one undo step).
    * Resolves true once saved. */
   onApplyRanges: (ranges: Range[]) => Promise<boolean>;
+  /** Corrects the text of the words at `idxs` (their timing stays). */
+  onEditText: (idxs: number[], text: string) => void;
   /** The lesson has overlays or blur/cover shapes, which sit on the
    * lesson's timeline and shift when earlier parts are cut. */
   hasTimedLayers: boolean;
@@ -77,6 +79,7 @@ const LessonScript = forwardRef<WordTranscriptHandle, LessonScriptProps>(functio
     fetchDetail,
     onFetchWords,
     onApplyRanges,
+    onEditText,
     hasTimedLayers,
     onUndo,
     undoDepth,
@@ -123,7 +126,11 @@ const LessonScript = forwardRef<WordTranscriptHandle, LessonScriptProps>(functio
       if (removed === word.removed && !word.suggested) return word;
       const cached = cache.get(word.idx);
       const clone =
-        cached && cached.removed === removed && cached.text === word.text && cached.start === word.start
+        cached &&
+        cached.removed === removed &&
+        cached.text === word.text &&
+        cached.original_text === word.original_text &&
+        cached.start === word.start
           ? cached
           : { ...word, removed, suggested: null };
       next.set(word.idx, clone);
@@ -385,6 +392,7 @@ const LessonScript = forwardRef<WordTranscriptHandle, LessonScriptProps>(functio
         onPauseAction={handlePauseAction}
         onRemove={handleRemove}
         onRestore={handleRestore}
+        onEditText={onEditText}
         onSeek={onSeek}
       />
     </div>

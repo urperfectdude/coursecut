@@ -3,9 +3,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import Breadcrumbs from "../components/Breadcrumbs";
 import LessonPreviewPlayer, { type LessonPreviewPlayerHandle } from "../components/LessonPreviewPlayer";
 import LessonScript from "../components/LessonScript";
+import VoicePanel, { type LessonVoiceState } from "../components/VoicePanel";
+import { buildVoiceLines } from "../lib/voice-script";
 import type { WordTranscriptHandle } from "../components/WordTranscript";
 import { useVideoProgress } from "../hooks/useVideoProgress";
-import { findPauses, formatLength } from "../lib/transcript-words";
+import { displayWordTexts, findPauses, formatLength, spreadEditedText, wordsInRange } from "../lib/transcript-words";
 import { scriptBlocks, totalLength, type Range } from "../lib/lesson-cuts";
 import SourceVideoPreview from "../components/SourceVideoPreview";
 import RegionsPanel, { useRegionEditor } from "../components/RegionsPanel";
@@ -30,6 +32,7 @@ import {
   queueExport,
   reorderLessonSegments,
   replaceLessonSegments,
+  setTranscriptWordTexts,
   splitLesson,
   updateFrameOverlay,
   updateLesson,
@@ -82,7 +85,7 @@ import { cn } from "@/lib/utils";
  * over a rounding fraction of a second. */
 const RANGE_MATCH_EPSILON_SECS = 0.01;
 
-type EditorTab = "script" | "segments" | "overlays" | "shapes" | "introOutro";
+type EditorTab = "script" | "segments" | "overlays" | "shapes" | "introOutro" | "voice";
 
 const PREVIEW_WIDTH_KEY = "coursecut.lessonEditor.previewWidth";
 const MIN_PREVIEW_WIDTH_PX = 280;
@@ -94,6 +97,7 @@ const EDITOR_TABS: { id: EditorTab; label: string }[] = [
   { id: "overlays", label: "Overlays" },
   { id: "shapes", label: "Blur & cover" },
   { id: "introOutro", label: "Intro/Outro" },
+  { id: "voice", label: "AI voice" },
 ];
 
 /** Short example instructions the floating AI input cycles through as its
@@ -383,6 +387,10 @@ export default function LessonSegmentsView({
   const [transcriptSegments, setTranscriptSegments] = useState<TranscriptSegment[]>([]);
   const [words, setWords] = useState<TranscriptWord[]>([]);
   const [fetchingWords, setFetchingWords] = useState(false);
+  // The AI voice made for this lesson in this visit, and whether the Final
+  // video plays it instead of the recording.
+  const [lessonVoice, setLessonVoice] = useState<LessonVoiceState | null>(null);
+  const [listenToVoice, setListenToVoice] = useState(false);
   const [tab, setTab] = useState<EditorTab>("script");
   const [playerView, setPlayerView] = useState<"final" | "original">("final");
 
@@ -843,12 +851,59 @@ export default function LessonSegmentsView({
     }
   }, [fetchingWords, videoId, clearProgress]);
 
+  /** Script tab "Edit": corrects the selected words' text, spread over
+   * them in order so each keeps its timing. One undo step. Words whose
+   * shown text doesn't change are left alone, so they don't read as edited. */
+  const handleEditWords = useCallback(
+    (idxs: number[], text: string) => {
+      const selected = idxs.map((idx) => words[idx]).filter((word): word is TranscriptWord => word !== undefined);
+      if (selected.length === 0 || !text.trim()) return;
+      // What each selected word shows now (punctuated by its sentence).
+      const shown = new Map<number, string>();
+      for (const segment of transcriptSegments) {
+        if (!selected.some((word) => word.start >= segment.start && word.start < segment.end)) continue;
+        const inSegment = wordsInRange(words, segment.start, segment.end);
+        const texts = displayWordTexts(segment.text, inSegment);
+        inSegment.forEach((word, i) => {
+          if (!shown.has(word.idx)) shown.set(word.idx, texts[i]);
+        });
+      }
+      const parts = spreadEditedText(selected.length, text);
+      const after: { id: string; text: string | null }[] = [];
+      const before: { id: string; text: string | null }[] = [];
+      selected.forEach((word, i) => {
+        if (parts[i] === (shown.get(word.idx) ?? word.text)) return;
+        after.push({ id: word.id, text: parts[i] });
+        // An unedited word goes back to Whisper's text (not edited).
+        before.push({ id: word.id, text: word.original_text === null ? null : word.text });
+      });
+      if (after.length === 0) return;
+      const merge = (rows: TranscriptWord[]) => {
+        const byId = new Map(rows.map((row) => [row.id, row]));
+        setWords((prev) => prev.map((word) => byId.get(word.id) ?? word));
+      };
+      runExclusive(async () => {
+        merge(await setTranscriptWordTexts(videoId, after));
+        pushUndo({
+          undo: async () => merge(await setTranscriptWordTexts(videoId, before)),
+          redo: async () => merge(await setTranscriptWordTexts(videoId, after)),
+        });
+      }).catch((err) => setSegmentsError(err instanceof Error ? err.message : String(err)));
+    },
+    [words, transcriptSegments, videoId, runExclusive, pushUndo],
+  );
+
   // Length now, and before Script cuts: the cut gaps inside each script
   // block (see `scriptBlocks`) are what the Script tab shows as removed.
   const lessonLengthAfter = useMemo(() => totalLength(segments), [segments]);
   const lessonLength = useMemo(
     () => scriptBlocks(segments).reduce((sum, block) => sum + (block.end - block.start), 0),
     [segments],
+  );
+
+  const voiceLines = useMemo(
+    () => (words.length > 0 ? buildVoiceLines(segments, transcriptSegments, words) : []),
+    [segments, transcriptSegments, words],
   );
 
   // The Final player stays mounted (hidden) while Original shows, so its
@@ -1627,6 +1682,7 @@ export default function LessonSegmentsView({
                   fetchDetail={videoProgressMap[videoId]?.detail ?? null}
                   onFetchWords={() => void handleFetchWords()}
                   onApplyRanges={handleApplyScriptRanges}
+                  onEditText={handleEditWords}
                   hasTimedLayers={overlays.length > 0 || regionEditor.previewRegions.length > 0}
                   onUndo={() => void handleUndo()}
                   undoDepth={undoStack.length}
@@ -2184,6 +2240,20 @@ export default function LessonSegmentsView({
               <div role="tabpanel" hidden={tab !== "introOutro"} className="pt-2">
                 <IntroOutroBlock lessonId={lessonId} slidesState={slidesState} videoSize={videoSize} />
               </div>
+
+              <div role="tabpanel" hidden={tab !== "voice"}>
+                <VoicePanel
+                  lessonId={lessonId}
+                  lines={voiceLines}
+                  lessonLength={lessonLengthAfter}
+                  hasWords={words.length > 0}
+                  voice={lessonVoice}
+                  onVoice={setLessonVoice}
+                  listening={listenToVoice}
+                  onListeningChange={setListenToVoice}
+                  onSeek={handleScriptSeek}
+                />
+              </div>
             </div>
 
             {/* Drag to resize the video column; double-click resets it. */}
@@ -2246,6 +2316,7 @@ export default function LessonSegmentsView({
                     drawRect={regionEditor.draft ? { onDraw: regionEditor.setDraftRect } : undefined}
                     outlineRect={regionEditor.draft?.rect ?? null}
                     slides={slidesState.slides}
+                    voiceTrackPath={listenToVoice ? (lessonVoice?.track.path ?? null) : null}
                     onVideoSize={setVideoSize}
                     onTimeUpdate={(time) => {
                       setCurrentTime(time);

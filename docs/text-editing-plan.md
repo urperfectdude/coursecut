@@ -255,10 +255,13 @@ New flow:
 
 **Undo/redo:** one stack per lesson editor covering word edits *and* the existing segment, overlay and shape edits. The user shouldn't have to know which tab an action came from to undo it. Word edits use the in-memory snapshot undo (§8.0); the existing actions keep their current undo entries on the same stack.
 
-### 6.4 Fix spelling
+### 6.4 Fix spelling (built 2026-11-24 as "Edit")
 
-* **Click a word, then Fix spelling,** to get a small inline input. The word's timing stays the same; only its text changes.
-* **The corrected text is used everywhere text is shown:** the transcript, the AI analysis input (if re-run), future captions and the future AI voice.
+* **Select one or more words, then Edit,** to get a small inline input filled with their text. The words keep their timing; only their text changes. Enter saves, Esc cancels. One undo step.
+* **More or fewer words** than selected are spread over the selected words in order (`spreadEditedText`); leftover words become empty (still timed, shown as nothing).
+* **Stored** in `transcript_words.text`, with Whisper's text kept in `original_text` (cleared again when the text goes back to it). Command `set_transcript_word_texts`. Text fixes are per video, like the words; cuts stay per lesson.
+* **Display:** edited words show their own text (with whatever punctuation the user typed) and a dotted blue underline; their neighbours keep the sentence's punctuation (`displayWordTexts` aligns by `original_text`).
+* **Used by:** the Script tab and the AI voice (`docs/hcm-improvements-plan.md` §4), and future captions. **Not yet** the Transcript page or GPT analysis, which still read `transcript_segments.text`.
 
 ### 6.5 Sound quality (automatic, invisible)
 
@@ -524,7 +527,7 @@ Turning every word cut into its own piece would mean hundreds of ffmpeg runs and
 * **Phase 3a** (filler and pause detection, pause decisions, Quick cleanup) is built into this.
 * **Not done from Phase 5:**
   * keeping the playback position when switching Final/Original
-  * Fix spelling
+  * ~~Fix spelling~~ (built 2026-11-24 as Edit, §6.4)
   * first/last words per segment in the Segments tab
   * word-snapped trims
 * **Review (independent-reviewer): nothing blocking.** Fixed:
