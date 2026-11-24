@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
@@ -168,6 +168,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(include_str!("../migrations/0011_video_transcript_source.sql"))
             .map_err(|err| format!("migration 0011_video_transcript_source failed: {err}"))?;
         conn.pragma_update(None, "user_version", 11)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
+    if version < 12 {
+        conn.execute_batch(include_str!("../migrations/0012_lesson_regions.sql"))
+            .map_err(|err| format!("migration 0012_lesson_regions failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 12)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
+    if version < 13 {
+        conn.execute_batch(include_str!("../migrations/0013_lesson_slides.sql"))
+            .map_err(|err| format!("migration 0013_lesson_slides failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 13)
             .map_err(|err| format!("could not update schema version: {err}"))?;
     }
 
@@ -1308,6 +1322,559 @@ pub fn delete_frame_overlay(conn: tauri::State<'_, DbConnection>, id: String) ->
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Lesson regions (0012_lesson_regions.sql): static shape layers (blurred or
+// solid rect / rounded rect / ellipse) between two timestamps, export-only
+// like frame overlays. `start`/`end` are on the same virtual lesson timeline
+// as `frame_overlays`; see `export.rs::regions_for_segment` for the mapping
+// onto lesson segments.
+// ---------------------------------------------------------------------
+
+/// Upper bound for `blur_strength` (boxblur radius in source pixels). The
+/// export additionally caps it per rect so ffmpeg accepts it.
+const MAX_BLUR_STRENGTH: i64 = 100;
+
+const REGION_COLUMNS: &str = "id, lesson_id, start, end, x_percent, y_percent, w_percent, h_percent, \
+     shape, fill, blur_strength, color, created_at";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LessonRegionRow {
+    pub id: String,
+    pub lesson_id: String,
+    pub start: f64,
+    pub end: f64,
+    pub x_percent: f64,
+    pub y_percent: f64,
+    pub w_percent: f64,
+    pub h_percent: f64,
+    /// `"rect"`, `"rounded"` or `"ellipse"`.
+    pub shape: String,
+    /// `"blur"` or `"solid"`.
+    pub fill: String,
+    pub blur_strength: i64,
+    /// `#rrggbb`, used when `fill` is `"solid"`.
+    pub color: String,
+    pub created_at: String,
+}
+
+/// The caller-editable fields of a region, shared by `add_lesson_region`
+/// and `update_lesson_region`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegionInput {
+    pub start: f64,
+    pub end: f64,
+    pub x_percent: f64,
+    pub y_percent: f64,
+    pub w_percent: f64,
+    pub h_percent: f64,
+    pub shape: String,
+    pub fill: String,
+    pub blur_strength: i64,
+    pub color: String,
+}
+
+fn row_to_lesson_region(row: &rusqlite::Row<'_>) -> rusqlite::Result<LessonRegionRow> {
+    Ok(LessonRegionRow {
+        id: row.get("id")?,
+        lesson_id: row.get("lesson_id")?,
+        start: row.get("start")?,
+        end: row.get("end")?,
+        x_percent: row.get("x_percent")?,
+        y_percent: row.get("y_percent")?,
+        w_percent: row.get("w_percent")?,
+        h_percent: row.get("h_percent")?,
+        shape: row.get("shape")?,
+        fill: row.get("fill")?,
+        blur_strength: row.get("blur_strength")?,
+        color: row.get("color")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn is_hex_color(value: &str) -> bool {
+    value.len() == 7 && value.starts_with('#') && value[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Field-level checks for a region's caller-editable fields.
+fn validate_region(region: &RegionInput) -> Result<(), String> {
+    if !region.start.is_finite() || region.start < 0.0 {
+        return Err(format!("invalid region start: {} must be 0 or greater", region.start));
+    }
+    if !region.end.is_finite() || region.start >= region.end {
+        return Err(format!(
+            "invalid region range: start ({}) must be before end ({})",
+            region.start, region.end
+        ));
+    }
+    // Rounding slack for a rect dragged right up to the frame edge.
+    let in_frame = |pos: f64, size: f64| pos.is_finite() && size.is_finite() && pos >= 0.0 && size > 0.0 && pos + size <= 100.0 + 1e-6;
+    if !in_frame(region.x_percent, region.w_percent) || !in_frame(region.y_percent, region.h_percent) {
+        return Err("invalid region rect: it must have a size and lie inside the frame (0-100%)".to_string());
+    }
+    if !matches!(region.shape.as_str(), "rect" | "rounded" | "ellipse") {
+        return Err(format!(
+            "invalid region shape {:?}: must be \"rect\", \"rounded\" or \"ellipse\"",
+            region.shape
+        ));
+    }
+    if !matches!(region.fill.as_str(), "blur" | "solid") {
+        return Err(format!("invalid region fill {:?}: must be \"blur\" or \"solid\"", region.fill));
+    }
+    if !(1..=MAX_BLUR_STRENGTH).contains(&region.blur_strength) {
+        return Err(format!(
+            "invalid blur strength {}: must be between 1 and {MAX_BLUR_STRENGTH}",
+            region.blur_strength
+        ));
+    }
+    if !is_hex_color(&region.color) {
+        return Err(format!("invalid region colour {:?}: must be #rrggbb", region.color));
+    }
+    Ok(())
+}
+
+/// Every region of `lesson_id`, in start-time order.
+pub(crate) fn query_lesson_regions(conn: &Connection, lesson_id: &str) -> Result<Vec<LessonRegionRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {REGION_COLUMNS} FROM lesson_regions WHERE lesson_id = ?1 ORDER BY start, created_at, id"
+        ))
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map(params![lesson_id], row_to_lesson_region)
+        .map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
+}
+
+fn query_lesson_region(conn: &Connection, id: &str) -> Result<LessonRegionRow, String> {
+    conn.query_row(
+        &format!("SELECT {REGION_COLUMNS} FROM lesson_regions WHERE id = ?1"),
+        params![id],
+        row_to_lesson_region,
+    )
+    .map_err(|err| match err {
+        rusqlite::Error::QueryReturnedNoRows => format!("region {id} does not exist"),
+        other => other.to_string(),
+    })
+}
+
+fn add_lesson_region_conn(conn: &Connection, lesson_id: &str, region: &RegionInput) -> Result<LessonRegionRow, String> {
+    let lesson_exists: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM lessons WHERE id = ?1)", params![lesson_id], |row| {
+            row.get(0)
+        })
+        .map_err(|err| err.to_string())?;
+    if !lesson_exists {
+        return Err(format!("lesson {lesson_id} does not exist"));
+    }
+    validate_region(region)?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO lesson_regions (id, lesson_id, start, end, x_percent, y_percent, w_percent, h_percent,
+                                     shape, fill, blur_strength, color, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            id,
+            lesson_id,
+            region.start,
+            region.end,
+            region.x_percent,
+            region.y_percent,
+            region.w_percent,
+            region.h_percent,
+            region.shape,
+            region.fill,
+            region.blur_strength,
+            region.color,
+            now
+        ],
+    )
+    .map_err(|err| err.to_string())?;
+    query_lesson_region(conn, &id)
+}
+
+fn update_lesson_region_conn(conn: &Connection, id: &str, region: &RegionInput) -> Result<LessonRegionRow, String> {
+    query_lesson_region(conn, id)?;
+    validate_region(region)?;
+    conn.execute(
+        "UPDATE lesson_regions SET start = ?1, end = ?2, x_percent = ?3, y_percent = ?4, w_percent = ?5,
+                h_percent = ?6, shape = ?7, fill = ?8, blur_strength = ?9, color = ?10
+         WHERE id = ?11",
+        params![
+            region.start,
+            region.end,
+            region.x_percent,
+            region.y_percent,
+            region.w_percent,
+            region.h_percent,
+            region.shape,
+            region.fill,
+            region.blur_strength,
+            region.color,
+            id
+        ],
+    )
+    .map_err(|err| err.to_string())?;
+    query_lesson_region(conn, id)
+}
+
+#[tauri::command]
+pub fn list_lesson_regions(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+) -> Result<Vec<LessonRegionRow>, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    query_lesson_regions(&conn, &lesson_id)
+}
+
+#[tauri::command]
+pub fn add_lesson_region(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+    region: RegionInput,
+) -> Result<LessonRegionRow, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    add_lesson_region_conn(&conn, &lesson_id, &region)
+}
+
+#[tauri::command]
+pub fn update_lesson_region(
+    conn: tauri::State<'_, DbConnection>,
+    id: String,
+    region: RegionInput,
+) -> Result<LessonRegionRow, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    update_lesson_region_conn(&conn, &id, &region)
+}
+
+#[tauri::command]
+pub fn delete_lesson_region(conn: tauri::State<'_, DbConnection>, id: String) -> Result<(), String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    conn.execute("DELETE FROM lesson_regions WHERE id = ?1", params![id])
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Lesson slides (0013_lesson_slides.sql): at most one intro and one outro
+// per lesson, each an image or a frontend-rendered title card, either
+// inserted as its own piece of video or overlaid on the first/last seconds
+// of the lesson. See `export.rs` for how each mode is exported.
+// ---------------------------------------------------------------------
+
+const SLIDE_COLUMNS: &str = "id, lesson_id, position, mode, duration, kind, image_path, title, subtitle, \
+     bg_color, text_color, mute_audio, created_at";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LessonSlideRow {
+    pub id: String,
+    pub lesson_id: String,
+    /// `"intro"` or `"outro"`.
+    pub position: String,
+    /// `"insert"` or `"overlay"`.
+    pub mode: String,
+    pub duration: f64,
+    /// `"image"` or `"title"`.
+    pub kind: String,
+    pub image_path: String,
+    pub title: String,
+    pub subtitle: String,
+    pub bg_color: String,
+    pub text_color: String,
+    pub mute_audio: bool,
+    pub created_at: String,
+}
+
+/// The caller-editable fields of a slide. `position` is the upsert key: a
+/// lesson has at most one slide per position.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlideInput {
+    pub position: String,
+    pub mode: String,
+    pub duration: f64,
+    pub kind: String,
+    pub image_path: String,
+    pub title: String,
+    pub subtitle: String,
+    pub bg_color: String,
+    pub text_color: String,
+    pub mute_audio: bool,
+}
+
+fn row_to_lesson_slide(row: &rusqlite::Row<'_>) -> rusqlite::Result<LessonSlideRow> {
+    Ok(LessonSlideRow {
+        id: row.get("id")?,
+        lesson_id: row.get("lesson_id")?,
+        position: row.get("position")?,
+        mode: row.get("mode")?,
+        duration: row.get("duration")?,
+        kind: row.get("kind")?,
+        image_path: row.get("image_path")?,
+        title: row.get("title")?,
+        subtitle: row.get("subtitle")?,
+        bg_color: row.get("bg_color")?,
+        text_color: row.get("text_color")?,
+        mute_audio: row.get("mute_audio")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn validate_slide(slide: &SlideInput) -> Result<(), String> {
+    if !matches!(slide.position.as_str(), "intro" | "outro") {
+        return Err(format!("invalid slide position {:?}: must be \"intro\" or \"outro\"", slide.position));
+    }
+    if !matches!(slide.mode.as_str(), "insert" | "overlay") {
+        return Err(format!("invalid slide mode {:?}: must be \"insert\" or \"overlay\"", slide.mode));
+    }
+    if !matches!(slide.kind.as_str(), "image" | "title") {
+        return Err(format!("invalid slide kind {:?}: must be \"image\" or \"title\"", slide.kind));
+    }
+    if !slide.duration.is_finite() || slide.duration <= 0.0 {
+        return Err(format!("invalid slide duration {}: must be greater than 0", slide.duration));
+    }
+    if slide.image_path.trim().is_empty() {
+        return Err("a slide needs an image".to_string());
+    }
+    if slide.kind == "title" && slide.title.trim().is_empty() {
+        return Err("a title card needs a title".to_string());
+    }
+    if !is_hex_color(&slide.bg_color) || !is_hex_color(&slide.text_color) {
+        return Err(format!(
+            "invalid slide colours {:?}/{:?}: must be #rrggbb",
+            slide.bg_color, slide.text_color
+        ));
+    }
+    Ok(())
+}
+
+/// Every slide of `lesson_id` (intro first).
+pub(crate) fn query_lesson_slides(conn: &Connection, lesson_id: &str) -> Result<Vec<LessonSlideRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SLIDE_COLUMNS} FROM lesson_slides WHERE lesson_id = ?1
+             ORDER BY CASE position WHEN 'intro' THEN 0 ELSE 1 END"
+        ))
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map(params![lesson_id], row_to_lesson_slide)
+        .map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
+}
+
+/// Inserts the lesson's slide at `slide.position`, or replaces the fields of
+/// the one already there (keeping its id).
+fn upsert_lesson_slide_conn(conn: &Connection, lesson_id: &str, slide: &SlideInput) -> Result<LessonSlideRow, String> {
+    let lesson_exists: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM lessons WHERE id = ?1)", params![lesson_id], |row| {
+            row.get(0)
+        })
+        .map_err(|err| err.to_string())?;
+    if !lesson_exists {
+        return Err(format!("lesson {lesson_id} does not exist"));
+    }
+    validate_slide(slide)?;
+
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM lesson_slides WHERE lesson_id = ?1 AND position = ?2",
+            params![lesson_id, slide.position],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+
+    let id = match existing {
+        Some(id) => {
+            conn.execute(
+                "UPDATE lesson_slides SET mode = ?1, duration = ?2, kind = ?3, image_path = ?4, title = ?5,
+                        subtitle = ?6, bg_color = ?7, text_color = ?8, mute_audio = ?9
+                 WHERE id = ?10",
+                params![
+                    slide.mode,
+                    slide.duration,
+                    slide.kind,
+                    slide.image_path,
+                    slide.title,
+                    slide.subtitle,
+                    slide.bg_color,
+                    slide.text_color,
+                    slide.mute_audio,
+                    id
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+            id
+        }
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO lesson_slides (id, lesson_id, position, mode, duration, kind, image_path, title,
+                                            subtitle, bg_color, text_color, mute_audio, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    id,
+                    lesson_id,
+                    slide.position,
+                    slide.mode,
+                    slide.duration,
+                    slide.kind,
+                    slide.image_path,
+                    slide.title,
+                    slide.subtitle,
+                    slide.bg_color,
+                    slide.text_color,
+                    slide.mute_audio,
+                    now
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+            id
+        }
+    };
+
+    conn.query_row(
+        &format!("SELECT {SLIDE_COLUMNS} FROM lesson_slides WHERE id = ?1"),
+        params![id],
+        row_to_lesson_slide,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// Rendered title cards live in `<cache_dir>/slides/<uuid>.png`: inside the
+/// asset-protocol scope (`$APPCACHE/**`), so the preview can show them.
+fn slides_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("slides")
+}
+
+fn app_slides_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|err| format!("could not resolve app cache dir: {err}"))?;
+    Ok(slides_dir(&cache_dir))
+}
+
+/// Whether `path` is one of this app's own rendered title cards (a `.png`
+/// directly inside `slides_dir`), as opposed to a user's own image, which
+/// must never be deleted.
+fn is_own_title_card(slides_dir: &Path, path: &str) -> bool {
+    let candidate = Path::new(path);
+    candidate.parent() == Some(slides_dir)
+        && candidate
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+}
+
+/// Startup cleanup: deletes every rendered title card no slide row points
+/// at any more. This is the *only* place title cards are deleted: an edit
+/// (which re-renders to a new file) or a delete leaves the old PNG on disk,
+/// because an export that read the slide row before the edit may still be
+/// about to encode from it (the outro piece is encoded last). No export is
+/// running at startup (`reconcile_interrupted_exports` resets them), so
+/// anything unreferenced here is safe to remove: replaced or deleted cards,
+/// cards of deleted lessons (rows cascade, files don't), and a card saved by
+/// `save_title_card_png` whose upsert then failed. Best-effort per file.
+pub fn sweep_orphan_title_cards(conn: &Connection, cache_dir: &Path) -> Result<(), String> {
+    let dir = slides_dir(cache_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    let mut stmt = conn
+        .prepare("SELECT image_path FROM lesson_slides")
+        .map_err(|err| err.to_string())?;
+    let used: HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|err| err.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(path_str) = path.to_str() else { continue };
+        if is_own_title_card(&dir, path_str) && !used.contains(path_str) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+/// Re-allows every image slide's user-picked file in the asset-protocol
+/// scope at startup, same reason as `allow_existing_video_playback`. Title
+/// cards are in the app cache dir, which is always in scope.
+pub fn allow_existing_slide_images(app: &AppHandle, conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT image_path FROM lesson_slides WHERE kind = 'image'")
+        .map_err(|err| err.to_string())?;
+    let paths = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| err.to_string())?;
+    for path in paths {
+        allow_video_playback(app, &path.map_err(|err| err.to_string())?);
+    }
+    Ok(())
+}
+
+/// Writes a title card PNG, rendered by the frontend's `<canvas>`, into the
+/// app cache's `slides` dir and returns its path for the slide's
+/// `image_path`. The bytes arrive as the raw IPC body, not JSON. Local only.
+#[tauri::command]
+pub fn save_title_card_png(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected raw PNG bytes".to_string());
+    };
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("title card is not a PNG".to_string());
+    }
+    let dir = app_slides_dir(&app)?;
+    std::fs::create_dir_all(&dir).map_err(|err| format!("could not create slides dir: {err}"))?;
+    let path = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+    std::fs::write(&path, bytes).map_err(|err| format!("could not save title card: {err}"))?;
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "title card path is not valid UTF-8".to_string())
+}
+
+#[tauri::command]
+pub fn list_lesson_slides(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+) -> Result<Vec<LessonSlideRow>, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    query_lesson_slides(&conn, &lesson_id)
+}
+
+/// Creates or replaces the lesson's intro or outro (`slide.position`). A
+/// replaced title card PNG is left on disk for a running export; see
+/// `sweep_orphan_title_cards`.
+#[tauri::command]
+pub fn upsert_lesson_slide(
+    app: AppHandle,
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+    slide: SlideInput,
+) -> Result<LessonSlideRow, String> {
+    let row = {
+        let conn = conn.0.lock().map_err(|err| err.to_string())?;
+        upsert_lesson_slide_conn(&conn, &lesson_id, &slide)?
+    };
+    if row.kind == "image" {
+        allow_video_playback(&app, &row.image_path);
+    }
+    Ok(row)
+}
+
+/// Deletes a slide row. Its title card PNG, if any, is reclaimed by the next
+/// startup's `sweep_orphan_title_cards`, not here.
+#[tauri::command]
+pub fn delete_lesson_slide(conn: tauri::State<'_, DbConnection>, id: String) -> Result<(), String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    conn.execute("DELETE FROM lesson_slides WHERE id = ?1", params![id])
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 /// One `{start, end}` range. Originally just the frontend's Create Lesson
 /// modal's input shape (already collapsed from a transcript-segment
 /// checkbox selection into contiguous runs, see
@@ -2296,5 +2863,319 @@ mod lesson_editing_tests {
         let err = create_lesson_tx(&tx, "v1", "Title", &[SegmentRange { start: 5.0, end: 5.0 }])
             .unwrap_err();
         assert!(err.contains("must be before"));
+    }
+}
+
+#[cfg(test)]
+mod lesson_region_tests {
+    use super::*;
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Test', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO videos (id, project_id, file_path, created_at, updated_at)
+             VALUES ('v1', 'p1', '/tmp/video.mp4', 't', 't')",
+            [],
+        )
+        .unwrap();
+        for id in ["l1", "l2"] {
+            conn.execute(
+                "INSERT INTO lessons (id, video_id, title, start, end) VALUES (?1, 'v1', 'Lesson', 0, 60)",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn input(start: f64, end: f64) -> RegionInput {
+        RegionInput {
+            start,
+            end,
+            x_percent: 10.0,
+            y_percent: 10.0,
+            w_percent: 50.0,
+            h_percent: 50.0,
+            shape: "rect".into(),
+            fill: "blur".into(),
+            blur_strength: 20,
+            color: "#000000".into(),
+        }
+    }
+
+    #[test]
+    fn add_and_list_round_trips_every_field() {
+        let conn = seeded_conn();
+        let mut region = input(1.0, 4.0);
+        region.shape = "ellipse".into();
+        region.fill = "solid".into();
+        region.color = "#ff00AA".into();
+        region.w_percent = 30.0;
+        let added = add_lesson_region_conn(&conn, "l1", &region).unwrap();
+        let listed = query_lesson_regions(&conn, "l1").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, added.id);
+        assert_eq!(listed[0].shape, "ellipse");
+        assert_eq!(listed[0].fill, "solid");
+        assert_eq!(listed[0].color, "#ff00AA");
+        assert_eq!(listed[0].w_percent, 30.0);
+        assert_eq!(listed[0].h_percent, 50.0);
+        assert!(query_lesson_regions(&conn, "l2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlapping_shapes_are_allowed() {
+        let conn = seeded_conn();
+        add_lesson_region_conn(&conn, "l1", &input(5.0, 10.0)).unwrap();
+        add_lesson_region_conn(&conn, "l1", &input(6.0, 9.0)).unwrap();
+        add_lesson_region_conn(&conn, "l1", &input(6.0, 9.0)).unwrap();
+        assert_eq!(query_lesson_regions(&conn, "l1").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn update_changes_fields_and_validates() {
+        let conn = seeded_conn();
+        let first = add_lesson_region_conn(&conn, "l1", &input(0.0, 5.0)).unwrap();
+        let updated = update_lesson_region_conn(
+            &conn,
+            &first.id,
+            &RegionInput { shape: "rounded".into(), w_percent: 20.0, ..input(1.0, 6.0) },
+        )
+        .unwrap();
+        assert_eq!(updated.start, 1.0);
+        assert_eq!(updated.shape, "rounded");
+        assert_eq!(updated.w_percent, 20.0);
+        assert!(update_lesson_region_conn(&conn, &first.id, &input(6.0, 1.0)).is_err());
+        assert!(update_lesson_region_conn(&conn, "missing", &input(0.0, 1.0)).is_err());
+    }
+
+    #[test]
+    fn invalid_fields_are_rejected() {
+        let conn = seeded_conn();
+        let cases: Vec<RegionInput> = vec![
+            input(5.0, 5.0),
+            input(-1.0, 5.0),
+            RegionInput { x_percent: 60.0, ..input(0.0, 1.0) },
+            RegionInput { w_percent: 0.0, ..input(0.0, 1.0) },
+            RegionInput { shape: "star".into(), ..input(0.0, 1.0) },
+            RegionInput { fill: "pixelate".into(), ..input(0.0, 1.0) },
+            RegionInput { blur_strength: 0, ..input(0.0, 1.0) },
+            RegionInput { color: "red".into(), ..input(0.0, 1.0) },
+        ];
+        for region in cases {
+            assert!(
+                add_lesson_region_conn(&conn, "l1", &region).is_err(),
+                "expected rejection for {region:?}"
+            );
+        }
+        assert!(add_lesson_region_conn(&conn, "missing", &input(0.0, 1.0)).is_err());
+        assert!(query_lesson_regions(&conn, "l1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_the_lesson_cascades_to_its_regions() {
+        let conn = seeded_conn();
+        add_lesson_region_conn(&conn, "l1", &input(0.0, 1.0)).unwrap();
+        conn.execute("DELETE FROM lessons WHERE id = 'l1'", []).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lesson_regions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+/// Test-only access to the validated insert, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn add_lesson_region_for_test(
+    conn: &Connection,
+    lesson_id: &str,
+    region: &RegionInput,
+) -> Result<LessonRegionRow, String> {
+    add_lesson_region_conn(conn, lesson_id, region)
+}
+
+#[cfg(test)]
+mod lesson_slide_tests {
+    use super::*;
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Test', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO videos (id, project_id, file_path, created_at, updated_at)
+             VALUES ('v1', 'p1', '/tmp/video.mp4', 't', 't')",
+            [],
+        )
+        .unwrap();
+        for id in ["l1", "l2"] {
+            conn.execute(
+                "INSERT INTO lessons (id, video_id, title, start, end) VALUES (?1, 'v1', 'Lesson', 0, 60)",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn input(position: &str) -> SlideInput {
+        SlideInput {
+            position: position.into(),
+            mode: "insert".into(),
+            duration: 4.0,
+            kind: "image".into(),
+            image_path: "/tmp/slide.png".into(),
+            title: String::new(),
+            subtitle: String::new(),
+            bg_color: "#111827".into(),
+            text_color: "#ffffff".into(),
+            mute_audio: false,
+        }
+    }
+
+    #[test]
+    fn upsert_inserts_then_replaces_by_position() {
+        let conn = seeded_conn();
+        let intro = upsert_lesson_slide_conn(&conn, "l1", &input("intro")).unwrap();
+        let outro = upsert_lesson_slide_conn(&conn, "l1", &input("outro")).unwrap();
+        assert_ne!(intro.id, outro.id);
+
+        let edited = SlideInput {
+            mode: "overlay".into(),
+            duration: 2.5,
+            kind: "title".into(),
+            image_path: "/cache/slides/new.png".into(),
+            title: "Welcome".into(),
+            subtitle: "Module 1".into(),
+            mute_audio: true,
+            ..input("intro")
+        };
+        let updated = upsert_lesson_slide_conn(&conn, "l1", &edited).unwrap();
+        assert_eq!(updated.id, intro.id, "same position keeps the row");
+        assert_eq!(updated.image_path, "/cache/slides/new.png");
+        assert_eq!(
+            (updated.mode.as_str(), updated.duration, updated.kind.as_str(), updated.mute_audio),
+            ("overlay", 2.5, "title", true)
+        );
+        assert_eq!((updated.title.as_str(), updated.subtitle.as_str()), ("Welcome", "Module 1"));
+
+        let listed = query_lesson_slides(&conn, "l1").unwrap();
+        assert_eq!(
+            listed.iter().map(|slide| slide.position.as_str()).collect::<Vec<_>>(),
+            ["intro", "outro"]
+        );
+        assert!(query_lesson_slides(&conn, "l2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_database_enforces_one_slide_per_position() {
+        let conn = seeded_conn();
+        upsert_lesson_slide_conn(&conn, "l1", &input("intro")).unwrap();
+        let duplicate = conn.execute(
+            "INSERT INTO lesson_slides (id, lesson_id, position, mode, duration, kind, image_path, created_at)
+             VALUES ('dup', 'l1', 'intro', 'insert', 3, 'image', '/tmp/x.png', 't')",
+            [],
+        );
+        assert!(duplicate.is_err());
+        // The other lesson may have its own intro.
+        upsert_lesson_slide_conn(&conn, "l2", &input("intro")).unwrap();
+    }
+
+    #[test]
+    fn invalid_fields_are_rejected() {
+        let conn = seeded_conn();
+        let cases = vec![
+            SlideInput { position: "middle".into(), ..input("intro") },
+            SlideInput { mode: "replace".into(), ..input("intro") },
+            SlideInput { kind: "video".into(), ..input("intro") },
+            SlideInput { duration: 0.0, ..input("intro") },
+            SlideInput { duration: -1.0, ..input("intro") },
+            SlideInput { duration: f64::NAN, ..input("intro") },
+            SlideInput { image_path: " ".into(), ..input("intro") },
+            SlideInput { kind: "title".into(), title: " ".into(), ..input("intro") },
+            SlideInput { bg_color: "black".into(), ..input("intro") },
+            SlideInput { text_color: "#fff".into(), ..input("intro") },
+            SlideInput { text_color: "#gggggg".into(), ..input("intro") },
+        ];
+        for slide in cases {
+            assert!(
+                upsert_lesson_slide_conn(&conn, "l1", &slide).is_err(),
+                "expected rejection for {slide:?}"
+            );
+        }
+        assert!(upsert_lesson_slide_conn(&conn, "missing", &input("intro")).is_err());
+        assert!(query_lesson_slides(&conn, "l1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_the_lesson_cascades_to_its_slides() {
+        let conn = seeded_conn();
+        upsert_lesson_slide_conn(&conn, "l1", &input("outro")).unwrap();
+        conn.execute("DELETE FROM lessons WHERE id = 'l1'", []).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lesson_slides", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Replacing or deleting a title card leaves its PNG on disk (an export
+    /// may still be about to read it); the startup sweep reclaims it once
+    /// no row points at it, and keeps the one still in use.
+    #[test]
+    fn replaced_title_cards_stay_until_the_startup_sweep() {
+        let cache_dir = std::env::temp_dir().join(format!("coursecut-slides-test-{}", uuid::Uuid::new_v4()));
+        let dir = slides_dir(&cache_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let used = dir.join("used.png");
+        let orphan = dir.join("orphan.png");
+        let other = dir.join("notes.txt");
+        for path in [&used, &orphan, &other] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        assert!(is_own_title_card(&dir, used.to_str().unwrap()));
+        assert!(!is_own_title_card(&dir, other.to_str().unwrap()));
+        assert!(!is_own_title_card(&dir, "/Users/someone/Desktop/slide.png"));
+        assert!(!is_own_title_card(&dir, dir.join("nested/x.png").to_str().unwrap()));
+
+        let conn = seeded_conn();
+        let card = |path: &std::path::Path| SlideInput {
+            kind: "title".into(),
+            title: "Hi".into(),
+            image_path: path.to_str().unwrap().into(),
+            ..input("intro")
+        };
+        // The intro was the "orphan" card, then got re-rendered to `used`.
+        upsert_lesson_slide_conn(&conn, "l1", &card(&orphan)).unwrap();
+        upsert_lesson_slide_conn(&conn, "l1", &card(&used)).unwrap();
+        assert!(orphan.exists(), "an edit doesn't delete the old card");
+        // An outro card, then the outro deleted.
+        let gone = dir.join("deleted-outro.png");
+        std::fs::write(&gone, b"x").unwrap();
+        let outro = upsert_lesson_slide_conn(&conn, "l1", &SlideInput { position: "outro".into(), ..card(&gone) }).unwrap();
+        conn.execute("DELETE FROM lesson_slides WHERE id = ?1", params![outro.id]).unwrap();
+        assert!(gone.exists(), "a delete doesn't delete the card");
+
+        sweep_orphan_title_cards(&conn, &cache_dir).unwrap();
+        assert!(used.exists());
+        assert!(!orphan.exists());
+        assert!(!gone.exists());
+        assert!(other.exists(), "only PNGs are swept");
+
+        // A missing slides dir is fine.
+        sweep_orphan_title_cards(&conn, &cache_dir.join("nope")).unwrap();
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }

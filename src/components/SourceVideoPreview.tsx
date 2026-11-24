@@ -5,6 +5,7 @@ import type { LessonSegment } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
 import { useContainedVideoRect } from "../lib/useContainedVideoRect";
 import SegmentedScrubber from "./SegmentedScrubber";
+import { activeRegions, ShapeLayers, type PreviewRegion } from "./RegionLayers";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Kbd, KbdGroup } from "@/components/ui/kbd";
@@ -45,6 +46,11 @@ interface SourceVideoPreviewProps {
    * pixel-accurate render). Video-scoped like the overlays themselves, not
    * tied to `selectedLessonSegments`. */
   overlayMarkers?: { id: string; image_path: string; start: number; end: number; scale_percent: number }[];
+  /** The selected lesson's shape layers, already mapped from virtual
+   * onto *source* seconds by the caller (see `virtualRangeToSourceRanges`):
+   * previewed live the same way `LessonPreviewPlayer` does, and drawn as a
+   * band on the scrubber. */
+  regions?: PreviewRegion[];
   /** Whether a lesson is currently selected — gates the Mark In/Out/Add
    * Segment controls, since a segment always needs a target lesson. Unused
    * in `"minimal"` layout, which doesn't render those controls at all. */
@@ -133,6 +139,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
       filePath,
       selectedLessonSegments = [],
       overlayMarkers = [],
+      regions = [],
       hasSelectedLesson = false,
       onTimeUpdate,
       onAddSegment,
@@ -195,6 +202,8 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     // intrinsic dimensions are now readable — see that hook.
     const [metadataVersion, setMetadataVersion] = useState(0);
     const contentRect = useContainedVideoRect(videoRef, overlayContainerRef, metadataVersion);
+    // The video's intrinsic width, to scale the blur preview to source pixels.
+    const [videoWidth, setVideoWidth] = useState(0);
     // Native `<video controls>` is gone (see the module doc above), so this
     // component now owns play/pause state itself for the custom control
     // row's button label — driven by the video element's own `onPlay`/
@@ -337,6 +346,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     const activeOverlayMarkers = overlayMarkers.filter(
       (marker) => currentTime >= marker.start && currentTime < marker.end,
     );
+    const currentRegions = activeRegions(regions, currentTime);
 
     return (
       <div
@@ -387,11 +397,17 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
                 onLoadedMetadata={(event) => {
                   setDuration(event.currentTarget.duration || 0);
                   setMetadataVersion((v) => v + 1);
+                  setVideoWidth(event.currentTarget.videoWidth);
                 }}
                 onTimeUpdate={handleTimeUpdate}
                 onPlay={() => setIsPaused(false)}
                 onPause={() => setIsPaused(true)}
               />
+              {/* Shape layers before the overlay images, matching the
+                 export's chain order (shapes -> image overlays). */}
+              {contentRect && videoWidth > 0 && (
+                <ShapeLayers rect={contentRect} regions={currentRegions} pixelScale={contentRect.width / videoWidth} />
+              )}
               {/* Positioned against `contentRect` (the video's actual
                  letterboxed content area — see `useContainedVideoRect`), not
                  this wrapper's raw box, so the overlay's own box matches the
@@ -472,6 +488,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
               aria-label="Scrub source video"
               segments={selectedLessonSegments}
               markers={overlayMarkers}
+              regionMarkers={regions}
               duration={duration}
             />
           </div>

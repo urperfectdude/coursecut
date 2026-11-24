@@ -12,9 +12,9 @@ Client asks:
 
 | # | Feature | Status on branch |
 |---|---|---|
-| 1 | Intro/outro: **overlay** or **insert** mode | Not started (an earlier draft is saved outside the repo) |
+| 1 | Intro/outro: **overlay** or **insert** mode | **Built** (`0013_lesson_slides`, `IntroOutroPanel`, title cards via `titleCard.ts`); needs a hands-on test |
 | 2 | Shape layers (blur / solid cover) | **Built** (`0012_lesson_regions`); crop removed 2026-11-23, so it needs a fresh review, and the in-app editor still needs a hands-on test |
-| 3 | Rescript-style silence and filler removal, with word correction | Not started |
+| 3 | Rescript-style silence and filler removal, with word correction | In progress: see `docs/text-editing-plan.md` |
 | 4 | AI studio voice from the (corrected) transcript | Not started |
 
 Build order: 2 → 1 → 3 → 4. The voice comes last because it should read the corrected transcript and fit the cut timeline.

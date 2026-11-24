@@ -703,6 +703,185 @@ fn overlays_for_segment(
     Ok(overlays)
 }
 
+/// The `lesson_regions` rows (shape layers) that intersect one segment's
+/// slice of the lesson's virtual timeline, translated into that segment's
+/// own cut-relative seconds and clipped to the overlap — exactly the mapping
+/// `overlays_for_segment` does for overlays (see its doc; same
+/// `segment_offset`/`segment_length` meaning). Ordered by start, so the
+/// export chain's shape stacking order is stable.
+fn regions_for_segment(
+    conn: &Connection,
+    lesson_id: &str,
+    segment_offset: f64,
+    segment_length: f64,
+) -> Result<Vec<crate::ffmpeg::SegmentRegion>, String> {
+    use crate::ffmpeg::{RegionFill, RegionShape, SegmentRegion};
+
+    let segment_virtual_end = segment_offset + segment_length;
+    let rows: Vec<crate::db::LessonRegionRow> = crate::db::query_lesson_regions(conn, lesson_id)?
+        .into_iter()
+        .filter(|row| row.start < segment_virtual_end && row.end > segment_offset)
+        .collect();
+
+    let mut regions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let local_start = (row.start - segment_offset).max(0.0);
+        let local_end = (row.end - segment_offset).min(segment_length);
+        if local_end <= local_start {
+            continue;
+        }
+        let shape = match row.shape.as_str() {
+            "rect" => RegionShape::Rect,
+            "rounded" => RegionShape::Rounded,
+            "ellipse" => RegionShape::Ellipse,
+            other => return Err(format!("region {} has an unknown shape {other:?}", row.id)),
+        };
+        let fill = match row.fill.as_str() {
+            "blur" => RegionFill::Blur,
+            "solid" => RegionFill::Solid(row.color.clone()),
+            other => return Err(format!("region {} has an unknown fill {other:?}", row.id)),
+        };
+        regions.push(SegmentRegion {
+            shape,
+            fill,
+            start: local_start,
+            end: local_end,
+            x_percent: row.x_percent,
+            y_percent: row.y_percent,
+            w_percent: row.w_percent,
+            h_percent: row.h_percent,
+            blur_strength: row.blur_strength,
+        });
+    }
+    Ok(regions)
+}
+
+/// One piece of an export's output, in play order. Each is encoded to its
+/// own file, and the files are joined by the stream-copy `concat_videos`.
+#[derive(Debug, Clone, PartialEq)]
+enum ExportPiece {
+    /// Lesson segment `index` (`[start, end)` of the source). `virtual_offset`
+    /// is where it starts on the lesson's virtual timeline, which overlays,
+    /// shapes and overlay-mode slides are positioned on.
+    Segment {
+        index: usize,
+        start: f64,
+        end: f64,
+        virtual_offset: f64,
+    },
+    /// An inserted intro or outro slide (`position`). It takes no virtual
+    /// time, so it doesn't move anything on the virtual timeline.
+    Slide {
+        position: String,
+        image_path: String,
+        duration: f64,
+    },
+}
+
+impl ExportPiece {
+    fn duration(&self) -> f64 {
+        match self {
+            ExportPiece::Segment { start, end, .. } => (end - start).max(0.0),
+            ExportPiece::Slide { duration, .. } => *duration,
+        }
+    }
+}
+
+/// The lesson's pieces in play order: an inserted intro, every segment,
+/// then an inserted outro. Overlay-mode slides aren't pieces (see
+/// `overlay_slide_windows`).
+fn build_export_pieces(segments: &[SegmentBounds], slides: &[db::LessonSlideRow]) -> Vec<ExportPiece> {
+    let inserted = |position: &str| {
+        slides
+            .iter()
+            .find(|slide| slide.mode == "insert" && slide.position == position)
+            .map(|slide| ExportPiece::Slide {
+                position: slide.position.clone(),
+                image_path: slide.image_path.clone(),
+                duration: slide.duration,
+            })
+    };
+    let mut pieces: Vec<ExportPiece> = inserted("intro").into_iter().collect();
+    let mut virtual_offset = 0.0;
+    for (index, segment) in segments.iter().enumerate() {
+        pieces.push(ExportPiece::Segment {
+            index,
+            start: segment.start,
+            end: segment.end,
+            virtual_offset,
+        });
+        virtual_offset += (segment.end - segment.start).max(0.0);
+    }
+    pieces.extend(inserted("outro"));
+    pieces
+}
+
+/// An overlay-mode slide's window on the virtual timeline.
+#[derive(Debug, Clone, PartialEq)]
+struct SlideWindow {
+    image_path: String,
+    start: f64,
+    end: f64,
+    mute: bool,
+}
+
+/// Where each overlay-mode slide shows on a lesson `lesson_length` seconds
+/// long: an intro covers `[0, N)`, an outro `[L - N, L)`, with `N` clamped
+/// to the lesson's length.
+fn overlay_slide_windows(slides: &[db::LessonSlideRow], lesson_length: f64) -> Vec<SlideWindow> {
+    if lesson_length <= 0.0 {
+        return Vec::new();
+    }
+    slides
+        .iter()
+        .filter(|slide| slide.mode == "overlay")
+        .map(|slide| {
+            let length = slide.duration.min(lesson_length);
+            let (start, end) = if slide.position == "intro" {
+                (0.0, length)
+            } else {
+                (lesson_length - length, lesson_length)
+            };
+            SlideWindow {
+                image_path: slide.image_path.clone(),
+                start,
+                end,
+                mute: slide.mute_audio,
+            }
+        })
+        .collect()
+}
+
+/// The overlay-mode slides and mute windows that fall in one segment's
+/// slice of the virtual timeline, translated to cut-relative seconds and
+/// clipped, the same mapping `overlays_for_segment` does (an outro can
+/// span segment boundaries). Mutes are dropped when the source has no
+/// audio, since there's nothing to filter.
+fn slides_for_segment(
+    windows: &[SlideWindow],
+    segment_offset: f64,
+    segment_length: f64,
+    source_has_audio: bool,
+) -> crate::ffmpeg::CutExtras {
+    let mut extras = crate::ffmpeg::CutExtras::default();
+    for window in windows {
+        let local_start = (window.start - segment_offset).max(0.0);
+        let local_end = (window.end - segment_offset).min(segment_length);
+        if local_end <= local_start {
+            continue;
+        }
+        extras.slides.push(crate::ffmpeg::SegmentSlide {
+            image_path: window.image_path.clone(),
+            start: local_start,
+            end: local_end,
+        });
+        if window.mute && source_has_audio {
+            extras.mute_windows.push((local_start, local_end));
+        }
+    }
+    extras
+}
+
 /// Atomically claims `id` for running: `queued` -> `running`, guarded by
 /// `AND status = 'queued'` so this can't clobber a `cancel_export` that runs
 /// in the narrow window between `next_queued_export` picking this row and
@@ -883,20 +1062,29 @@ fn progress_closure(
 /// a multi-segment lesson exports as one concatenated video, not one file
 /// per segment).
 ///
-/// A single-segment lesson (the common case — one segment per lesson unless
-/// the user has explicitly built a multi-segment one) takes a fast path:
-/// `export_lesson` cuts straight to `job.output_path`, with no intermediate
-/// temp file and no concat step, so it produces exactly the same output as
-/// before multi-segment export existed (no extra re-mux/quality loss).
+/// A single-segment lesson with no inserted slide (the common case) takes a
+/// fast path: `export_lesson` cuts straight to `job.output_path`, with no
+/// intermediate temp file and no concat step, so it produces exactly the
+/// same output as before multi-segment export existed (no extra
+/// re-mux/quality loss).
 ///
-/// A multi-segment lesson cuts each segment to its own temp file under
-/// `segment_temp_dir`, then concatenates them via
-/// `ffmpeg::concat_videos` (safe as a stream-copy concat, since every temp
-/// file was just encoded by the same `export_lesson`/libx264/aac settings).
+/// Otherwise the lesson is laid out as pieces (`build_export_pieces`): an
+/// inserted intro, each segment, an inserted outro. Each piece is encoded to
+/// its own temp file under `segment_temp_dir`, then they're concatenated
+/// via `ffmpeg::concat_videos` (a stream-copy concat: every segment piece is
+/// encoded by the same `export_lesson`/libx264/aac settings, and when there
+/// is an inserted slide every piece, slide or segment, also gets the
+/// source's probed `StreamParams` pinned so the slide pieces match).
 /// Temp files (and their directory) are removed once the concat succeeds,
 /// and also on a mid-job failure/cancellation — the loop below cleans up
-/// whatever was cut so far before returning `Err`, so a failed or cancelled
-/// multi-segment export never leaves stray per-segment files behind.
+/// whatever was encoded so far before returning `Err`, so a failed or
+/// cancelled export never leaves stray piece files behind.
+///
+/// Overlay-mode slides aren't pieces: each segment gets the slice of their
+/// windows that falls inside it (`slides_for_segment`), composited
+/// full-frame on top of everything, with the lecture audio muted there if
+/// asked. With no slides at all, nothing here is probed and every ffmpeg
+/// invocation is exactly what it was before slides existed.
 async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
     if job.segments.is_empty() {
         return Err(format!(
@@ -905,15 +1093,42 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
         ));
     }
 
-    if job.segments.len() == 1 {
+    let slides = {
+        let conn = app.state::<DbConnection>();
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        db::query_lesson_slides(&guard, &job.lesson_id)?
+    };
+    let has_inserted_slide = slides.iter().any(|slide| slide.mode == "insert");
+    // Only probed when there are slides: whether there's audio to mute, and
+    // the params inserted slide pieces must match.
+    let stream = if slides.is_empty() {
+        None
+    } else {
+        Some(crate::ffmpeg::probe_stream_params(app, &job.video_path).await?)
+    };
+    let source_has_audio = stream.as_ref().is_some_and(|stream| stream.audio.is_some());
+    let lesson_length: f64 = job
+        .segments
+        .iter()
+        .map(|segment| (segment.end - segment.start).max(0.0))
+        .sum();
+    let windows = overlay_slide_windows(&slides, lesson_length);
+
+    if job.segments.len() == 1 && !has_inserted_slide {
         let segment = &job.segments[0];
-        let overlays = {
+        let (overlays, regions) = {
             let conn = app.state::<DbConnection>();
             let guard = conn.0.lock().map_err(|err| err.to_string())?;
             // A single-segment lesson's one segment starts at virtual t=0 —
             // it *is* the whole lesson's timeline.
-            overlays_for_segment(&guard, &job.lesson_id, 0.0, (segment.end - segment.start).max(0.0))?
+            let length = (segment.end - segment.start).max(0.0);
+            (
+                overlays_for_segment(&guard, &job.lesson_id, 0.0, length)?,
+                regions_for_segment(&guard, &job.lesson_id, 0.0, length)?,
+            )
         };
+        let mut extras = slides_for_segment(&windows, 0.0, lesson_length, source_has_audio);
+        extras.single_audio = !slides.is_empty();
         let register_child = register_child_closure(app, &job.id);
         let on_progress = progress_closure(app, &job.id, 0.0, 1.0, 1.0);
         let result = crate::ffmpeg::export_lesson(
@@ -923,6 +1138,8 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
             segment.end,
             &job.output_path,
             &overlays,
+            &regions,
+            &extras,
             register_child,
             on_progress,
         )
@@ -931,73 +1148,62 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
         return result;
     }
 
-    let total_duration: f64 = job
-        .segments
-        .iter()
-        .map(|segment| (segment.end - segment.start).max(0.0))
-        .sum();
+    // Inserted slide pieces are fitted to the lecture's frame and encoded
+    // with its stream params; segment pieces get the same params pinned.
+    let insert_params = match (&stream, has_inserted_slide) {
+        (Some(stream), true) => Some((
+            stream.clone(),
+            crate::ffmpeg::probe_dimensions(app, &job.video_path).await?,
+        )),
+        _ => None,
+    };
+    let pieces = build_export_pieces(&job.segments, &slides);
+    let total_duration: f64 = pieces.iter().map(ExportPiece::duration).sum();
     let temp_dir = segment_temp_dir(app, &job.id)?;
     let mut temp_paths: Vec<String> = Vec::new();
+    // Output seconds encoded so far, slides included (for progress).
     let mut elapsed = 0.0;
 
-    for (index, segment) in job.segments.iter().enumerate() {
+    for piece in &pieces {
         if is_cancelled(app, &job.id) {
             cleanup_segment_temp_files(&temp_dir, &temp_paths);
             return Err("export cancelled".to_string());
         }
 
-        let temp_path = temp_dir.join(format!("segment-{index}.mp4"));
+        let file_name = match piece {
+            ExportPiece::Segment { index, .. } => format!("segment-{index}.mp4"),
+            ExportPiece::Slide { position, .. } => format!("{position}.mp4"),
+        };
+        let temp_path = temp_dir.join(file_name);
         let Some(temp_path_str) = temp_path.to_str().map(str::to_string) else {
             cleanup_segment_temp_files(&temp_dir, &temp_paths);
             return Err("segment temp path is not valid UTF-8".to_string());
         };
-        let segment_duration = (segment.end - segment.start).max(0.0);
-        let overlays = {
-            let conn = app.state::<DbConnection>();
-            let guard = match conn.0.lock() {
-                Ok(guard) => guard,
-                Err(err) => {
-                    cleanup_segment_temp_files(&temp_dir, &temp_paths);
-                    return Err(err.to_string());
-                }
-            };
-            // `elapsed` is this segment's own cumulative virtual-timeline
-            // offset — the summed duration of every segment already cut in
-            // this loop, before this iteration adds its own.
-            match overlays_for_segment(&guard, &job.lesson_id, elapsed, segment_duration) {
-                Ok(overlays) => overlays,
-                Err(err) => {
-                    cleanup_segment_temp_files(&temp_dir, &temp_paths);
-                    return Err(err);
-                }
-            }
-        };
-        let register_child = register_child_closure(app, &job.id);
-        let on_progress = progress_closure(app, &job.id, elapsed, segment_duration, total_duration);
-
-        let result = crate::ffmpeg::export_lesson(
+        let piece_duration = piece.duration();
+        let result = encode_piece(
             app,
-            &job.video_path,
-            segment.start,
-            segment.end,
+            job,
+            piece,
             &temp_path_str,
-            &overlays,
-            register_child,
-            on_progress,
+            &windows,
+            source_has_audio,
+            !slides.is_empty(),
+            insert_params.as_ref(),
+            progress_closure(app, &job.id, elapsed, piece_duration, total_duration),
         )
         .await;
         deregister_child(app, &job.id);
 
         if let Err(err) = result {
-            // This segment's own (possibly partial) temp file too, not just
-            // the ones from prior segments.
+            // This piece's own (possibly partial) temp file too, not just
+            // the ones from prior pieces.
             let _ = std::fs::remove_file(&temp_path_str);
             cleanup_segment_temp_files(&temp_dir, &temp_paths);
             return Err(err);
         }
 
         temp_paths.push(temp_path_str);
-        elapsed += segment_duration;
+        elapsed += piece_duration;
     }
 
     if is_cancelled(app, &job.id) {
@@ -1013,6 +1219,81 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
     cleanup_segment_temp_files(&temp_dir, &temp_paths);
 
     concat_result
+}
+
+/// Encodes one `ExportPiece` of a concatenated export to `temp_path`. A
+/// segment piece gets the overlays, shapes and overlay-mode slides of its
+/// own slice of the virtual timeline (`virtual_offset`, which doesn't count
+/// inserted slides), plus `insert_params`' stream params when the export has
+/// an inserted slide; `any_slides` maps only the first audio track (see
+/// `CutExtras::single_audio`). A slide piece needs `insert_params`, which is
+/// set whenever one exists.
+#[allow(clippy::too_many_arguments)]
+async fn encode_piece(
+    app: &AppHandle,
+    job: &PendingExport,
+    piece: &ExportPiece,
+    temp_path: &str,
+    windows: &[SlideWindow],
+    source_has_audio: bool,
+    any_slides: bool,
+    insert_params: Option<&(crate::ffmpeg::StreamParams, (u32, u32))>,
+    on_progress: impl FnMut(f64) + Send,
+) -> Result<(), String> {
+    let register_child = register_child_closure(app, &job.id);
+    match piece {
+        ExportPiece::Segment {
+            start,
+            end,
+            virtual_offset,
+            ..
+        } => {
+            let length = (end - start).max(0.0);
+            let (overlays, regions) = {
+                let conn = app.state::<DbConnection>();
+                let guard = conn.0.lock().map_err(|err| err.to_string())?;
+                (
+                    overlays_for_segment(&guard, &job.lesson_id, *virtual_offset, length)?,
+                    regions_for_segment(&guard, &job.lesson_id, *virtual_offset, length)?,
+                )
+            };
+            let mut extras = slides_for_segment(windows, *virtual_offset, length, source_has_audio);
+            extras.stream = insert_params.map(|(stream, _)| stream.clone());
+            extras.single_audio = any_slides;
+            crate::ffmpeg::export_lesson(
+                app,
+                &job.video_path,
+                *start,
+                *end,
+                temp_path,
+                &overlays,
+                &regions,
+                &extras,
+                register_child,
+                on_progress,
+            )
+            .await
+        }
+        ExportPiece::Slide {
+            image_path,
+            duration,
+            ..
+        } => {
+            let (stream, main_dims) =
+                insert_params.expect("an inserted slide piece always comes with insert params");
+            crate::ffmpeg::export_slide_piece(
+                app,
+                image_path,
+                *duration,
+                temp_path,
+                *main_dims,
+                stream,
+                register_child,
+                on_progress,
+            )
+            .await
+        }
+    }
 }
 
 /// Writes the final status for a finished job, unless `cancel_export`
@@ -1416,5 +1697,408 @@ mod overlays_for_segment_tests {
         let overlays = overlays_for_segment(&conn, "l1", SEGMENT_OFFSET, SEGMENT_LENGTH).unwrap();
 
         assert!(overlays.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod regions_for_segment_tests {
+    use super::*;
+    use crate::ffmpeg::{RegionFill, RegionShape};
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Test', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO videos (id, project_id, file_path, created_at, updated_at)
+             VALUES ('v1', 'p1', '/tmp/video.mp4', 't', 't')",
+            [],
+        )
+        .unwrap();
+        for id in ["l1", "l2"] {
+            conn.execute(
+                "INSERT INTO lessons (id, video_id, title, start, end) VALUES (?1, 'v1', 'Lesson', 0, 0)",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn insert_region(conn: &Connection, id: &str, lesson: &str, start: f64, end: f64, shape: &str, fill: &str) {
+        conn.execute(
+            "INSERT INTO lesson_regions (id, lesson_id, start, end, x_percent, y_percent, w_percent, h_percent,
+                                         shape, fill, blur_strength, color, created_at)
+             VALUES (?1, ?2, ?3, ?4, 10, 20, 30, 40, ?5, ?6, 15, '#ff0000', 't')",
+            params![id, lesson, start, end, shape, fill],
+        )
+        .unwrap();
+    }
+
+    // Segment whose virtual slice is [10, 20).
+    const OFFSET: f64 = 10.0;
+    const LENGTH: f64 = 10.0;
+
+    #[test]
+    fn region_inside_the_segment_is_translated_and_parsed() {
+        let conn = seeded_conn();
+        insert_region(&conn, "r1", "l1", 12.0, 15.0, "ellipse", "solid");
+        let regions = regions_for_segment(&conn, "l1", OFFSET, LENGTH).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!((regions[0].start, regions[0].end), (2.0, 5.0));
+        assert_eq!(regions[0].shape, RegionShape::Ellipse);
+        assert_eq!(regions[0].fill, RegionFill::Solid("#ff0000".into()));
+        assert_eq!(
+            (regions[0].x_percent, regions[0].y_percent, regions[0].w_percent, regions[0].h_percent),
+            (10.0, 20.0, 30.0, 40.0)
+        );
+        assert_eq!(regions[0].blur_strength, 15);
+    }
+
+    #[test]
+    fn region_spanning_two_segments_is_clipped_per_segment() {
+        let conn = seeded_conn();
+        insert_region(&conn, "r1", "l1", 7.0, 13.0, "rounded", "blur");
+        // First segment: virtual [0, 10).
+        let first = regions_for_segment(&conn, "l1", 0.0, 10.0).unwrap();
+        assert_eq!((first[0].start, first[0].end), (7.0, 10.0));
+        assert_eq!((first[0].shape, &first[0].fill), (RegionShape::Rounded, &RegionFill::Blur));
+        // Second segment: virtual [10, 20) -> local [0, 3).
+        let second = regions_for_segment(&conn, "l1", OFFSET, LENGTH).unwrap();
+        assert_eq!((second[0].start, second[0].end), (0.0, 3.0));
+    }
+
+    #[test]
+    fn regions_outside_the_segment_or_in_other_lessons_are_excluded() {
+        let conn = seeded_conn();
+        insert_region(&conn, "before", "l1", 2.0, 10.0, "rect", "blur"); // ends exactly at the start
+        insert_region(&conn, "after", "l1", 20.0, 25.0, "rect", "blur"); // starts exactly at the end
+        insert_region(&conn, "other", "l2", 12.0, 15.0, "rect", "blur");
+        assert!(regions_for_segment(&conn, "l1", OFFSET, LENGTH).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_enum_values_are_an_error_not_a_silent_skip() {
+        let conn = seeded_conn();
+        insert_region(&conn, "r1", "l1", 12.0, 15.0, "star", "blur");
+        assert!(regions_for_segment(&conn, "l1", OFFSET, LENGTH).is_err());
+        let conn = seeded_conn();
+        insert_region(&conn, "r1", "l1", 12.0, 15.0, "rect", "pixelate");
+        assert!(regions_for_segment(&conn, "l1", OFFSET, LENGTH).is_err());
+    }
+
+    /// Not a real test: dumps the exact per-segment ffmpeg arg lists
+    /// `do_export` would run for a 2-segment lesson with a blurred ellipse
+    /// crossing the segment boundary, a solid rounded rect and an image
+    /// overlay, so they can be run against the real sidecar ffmpeg. Run with
+    /// `CC_VIDEO=... CC_IMAGE=... CC_OUT=<dir> cargo test --lib dump_cli_check_args -- --ignored`.
+    /// Dimensions are passed in (`CC_DIMS=1440x774`, `CC_IMAGE_DIMS=WxH`)
+    /// since there's no AppHandle to probe with here.
+    #[test]
+    #[ignore]
+    fn dump_cli_check_args() {
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("set {key}"));
+        let dims = |value: String| -> (u32, u32) {
+            let (w, h) = value.split_once('x').unwrap();
+            (w.parse().unwrap(), h.parse().unwrap())
+        };
+        let (video, image, out_dir) = (env("CC_VIDEO"), env("CC_IMAGE"), env("CC_OUT"));
+        let (main_dims, image_dims) = (dims(env("CC_DIMS")), dims(env("CC_IMAGE_DIMS")));
+
+        let conn = seeded_conn();
+        let region = |start: f64, end: f64, rect: (f64, f64, f64, f64), shape: &str, fill: &str, color: &str| {
+            let input = crate::db::RegionInput {
+                start,
+                end,
+                x_percent: rect.0,
+                y_percent: rect.1,
+                w_percent: rect.2,
+                h_percent: rect.3,
+                shape: shape.into(),
+                fill: fill.into(),
+                blur_strength: 25,
+                color: color.into(),
+            };
+            crate::db::add_lesson_region_for_test(&conn, "l1", &input).unwrap();
+        };
+        // Virtual timeline: segment A = source [30, 40) -> virtual [0, 10),
+        // segment B = source [100, 110) -> virtual [10, 20).
+        region(5.0, 13.0, (5.0, 5.0, 40.0, 30.0), "ellipse", "blur", "#000000");
+        region(14.0, 18.0, (55.0, 10.0, 35.0, 25.0), "rounded", "solid", "#e11d48");
+        conn.execute(
+            "INSERT INTO frame_overlays (id, video_id, lesson_id, image_path, start, end, scale_percent, x_percent, y_percent, created_at)
+             VALUES ('o1', 'v1', 'l1', ?1, 16.0, 19.0, 30, 100, 100, 't')",
+            params![image],
+        )
+        .unwrap();
+
+        let mut offset = 0.0;
+        let mut lines = Vec::new();
+        for (index, (start, end)) in [(30.0, 40.0), (100.0, 110.0)].into_iter().enumerate() {
+            let length: f64 = end - start;
+            let overlays = overlays_for_segment(&conn, "l1", offset, length).unwrap();
+            let regions = regions_for_segment(&conn, "l1", offset, length).unwrap();
+            let overlay_dims = vec![image_dims; overlays.len()];
+            let output = format!("{out_dir}/segment-{index}.mp4");
+            let args = crate::ffmpeg::lesson_cut_args(
+                &video,
+                start,
+                end,
+                &output,
+                &overlays,
+                &overlay_dims,
+                &regions,
+                main_dims,
+                &crate::ffmpeg::CutExtras::default(),
+                &[],
+            );
+            lines.push(serde_json::to_string(&args).unwrap());
+            offset += length;
+        }
+        std::fs::write(format!("{out_dir}/args.jsonl"), lines.join("\n") + "\n").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod slide_export_tests {
+    use super::*;
+    use crate::ffmpeg::SegmentSlide;
+
+    fn slide(position: &str, mode: &str, duration: f64, mute: bool) -> db::LessonSlideRow {
+        db::LessonSlideRow {
+            id: format!("{position}-id"),
+            lesson_id: "l1".into(),
+            position: position.into(),
+            mode: mode.into(),
+            duration,
+            kind: "image".into(),
+            image_path: format!("/img/{position}.png"),
+            title: String::new(),
+            subtitle: String::new(),
+            bg_color: "#111827".into(),
+            text_color: "#ffffff".into(),
+            mute_audio: mute,
+            created_at: "t".into(),
+        }
+    }
+
+    fn segments() -> Vec<SegmentBounds> {
+        // Virtual [0, 10) then [10, 15).
+        vec![SegmentBounds { start: 30.0, end: 40.0 }, SegmentBounds { start: 100.0, end: 105.0 }]
+    }
+
+    fn segment_piece(index: usize, start: f64, end: f64, virtual_offset: f64) -> ExportPiece {
+        ExportPiece::Segment {
+            index,
+            start,
+            end,
+            virtual_offset,
+        }
+    }
+
+    fn slide_piece(position: &str, duration: f64) -> ExportPiece {
+        ExportPiece::Slide {
+            position: position.into(),
+            image_path: format!("/img/{position}.png"),
+            duration,
+        }
+    }
+
+    #[test]
+    fn no_slides_is_one_piece_per_segment() {
+        assert_eq!(
+            build_export_pieces(&segments(), &[]),
+            [segment_piece(0, 30.0, 40.0, 0.0), segment_piece(1, 100.0, 105.0, 10.0)]
+        );
+    }
+
+    /// Intro, then the segments, then the outro, whatever order the rows
+    /// come in. Inserted slides take no virtual time: the segments keep
+    /// their offsets.
+    #[test]
+    fn inserted_slides_wrap_the_segments() {
+        let slides = [slide("outro", "insert", 2.0, false), slide("intro", "insert", 3.0, false)];
+        let pieces = build_export_pieces(&segments(), &slides);
+        assert_eq!(
+            pieces,
+            [
+                slide_piece("intro", 3.0),
+                segment_piece(0, 30.0, 40.0, 0.0),
+                segment_piece(1, 100.0, 105.0, 10.0),
+                slide_piece("outro", 2.0),
+            ]
+        );
+        let total: f64 = pieces.iter().map(ExportPiece::duration).sum();
+        assert_eq!(total, 3.0 + 15.0 + 2.0, "progress counts the slide seconds");
+    }
+
+    #[test]
+    fn overlay_slides_are_not_pieces() {
+        let slides = [slide("intro", "overlay", 3.0, true), slide("outro", "insert", 2.0, false)];
+        assert_eq!(
+            build_export_pieces(&segments(), &slides),
+            [segment_piece(0, 30.0, 40.0, 0.0), segment_piece(1, 100.0, 105.0, 10.0), slide_piece("outro", 2.0)]
+        );
+    }
+
+    #[test]
+    fn overlay_windows_sit_at_the_ends_and_clamp() {
+        let slides = [
+            slide("intro", "overlay", 4.0, true),
+            slide("outro", "overlay", 6.0, false),
+            slide("intro", "insert", 3.0, false),
+        ];
+        let windows = overlay_slide_windows(&slides, 15.0);
+        assert_eq!(windows.len(), 2, "inserted slides have no window");
+        assert_eq!((windows[0].start, windows[0].end, windows[0].mute), (0.0, 4.0, true));
+        assert_eq!((windows[1].start, windows[1].end, windows[1].mute), (9.0, 15.0, false));
+
+        // Longer than the lesson: the whole lesson.
+        let long = [slide("intro", "overlay", 40.0, false), slide("outro", "overlay", 40.0, false)];
+        let windows = overlay_slide_windows(&long, 15.0);
+        assert_eq!((windows[0].start, windows[0].end), (0.0, 15.0));
+        assert_eq!((windows[1].start, windows[1].end), (0.0, 15.0));
+
+        assert!(overlay_slide_windows(&long, 0.0).is_empty());
+    }
+
+    #[test]
+    fn intro_window_maps_onto_the_first_segment_only() {
+        let windows = overlay_slide_windows(&[slide("intro", "overlay", 4.0, true)], 15.0);
+        let first = slides_for_segment(&windows, 0.0, 10.0, true);
+        assert_eq!(
+            first.slides,
+            [SegmentSlide { image_path: "/img/intro.png".into(), start: 0.0, end: 4.0 }]
+        );
+        assert_eq!(first.mute_windows, [(0.0, 4.0)]);
+        assert!(first.stream.is_none());
+        let second = slides_for_segment(&windows, 10.0, 5.0, true);
+        assert!(second.slides.is_empty() && second.mute_windows.is_empty());
+    }
+
+    /// A 6 s outro on a 10 s + 5 s lesson covers virtual [9, 15): the last
+    /// second of segment 0 and all of segment 1.
+    #[test]
+    fn outro_window_spans_a_segment_boundary() {
+        let windows = overlay_slide_windows(&[slide("outro", "overlay", 6.0, true)], 15.0);
+        let first = slides_for_segment(&windows, 0.0, 10.0, true);
+        assert_eq!((first.slides[0].start, first.slides[0].end), (9.0, 10.0));
+        assert_eq!(first.mute_windows, [(9.0, 10.0)]);
+        let second = slides_for_segment(&windows, 10.0, 5.0, true);
+        assert_eq!((second.slides[0].start, second.slides[0].end), (0.0, 5.0));
+        assert_eq!(second.mute_windows, [(0.0, 5.0)]);
+    }
+
+    #[test]
+    fn mute_is_dropped_without_source_audio_and_absent_unless_asked() {
+        let muted = overlay_slide_windows(&[slide("intro", "overlay", 4.0, true)], 15.0);
+        let extras = slides_for_segment(&muted, 0.0, 10.0, false);
+        assert_eq!(extras.slides.len(), 1);
+        assert!(extras.mute_windows.is_empty());
+
+        let unmuted = overlay_slide_windows(&[slide("intro", "overlay", 4.0, false)], 15.0);
+        assert!(slides_for_segment(&unmuted, 0.0, 10.0, true).mute_windows.is_empty());
+    }
+
+    /// Not a real test: dumps the exact ffmpeg arg lists `do_export` would
+    /// run for the two CLI verification cases of the intro/outro feature.
+    /// (a) a 2-segment lesson with an inserted image intro, an inserted
+    /// title-card outro and a blurred shape crossing the segment boundary;
+    /// (b) a single-segment lesson with a muted overlay-mode intro. Run with
+    /// `CC_VIDEO=... CC_INTRO=... CC_OUTRO=... CC_STREAM_JSON=<ffprobe json>
+    /// CC_DIMS=WxH CC_INTRO_DIMS=WxH CC_OUTRO_DIMS=WxH CC_OUT=<dir> cargo test
+    /// --lib dump_slide_cli_args -- --ignored`. Writes `<dir>/a.jsonl` and
+    /// `<dir>/b.jsonl`, one `[name, args]` per piece in order.
+    #[test]
+    #[ignore]
+    fn dump_slide_cli_args() {
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("set {key}"));
+        let dims = |value: String| -> (u32, u32) {
+            let (w, h) = value.split_once('x').unwrap();
+            (w.parse().unwrap(), h.parse().unwrap())
+        };
+        let (video, intro, outro, out_dir) = (env("CC_VIDEO"), env("CC_INTRO"), env("CC_OUTRO"), env("CC_OUT"));
+        let main_dims = dims(env("CC_DIMS"));
+        let image_dims = |path: &str| if path == intro { dims(env("CC_INTRO_DIMS")) } else { dims(env("CC_OUTRO_DIMS")) };
+        let stream = crate::ffmpeg::parse_stream_params(&std::fs::read_to_string(env("CC_STREAM_JSON")).unwrap()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        db::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'T', 't', 't');
+             INSERT INTO videos (id, project_id, file_path, created_at, updated_at) VALUES ('v1', 'p1', '/v', 't', 't');
+             INSERT INTO lessons (id, video_id, title, start, end) VALUES ('la', 'v1', 'A', 0, 0);
+             INSERT INTO lessons (id, video_id, title, start, end) VALUES ('lb', 'v1', 'B', 0, 0);",
+        )
+        .unwrap();
+        let insert_slide = |lesson: &str, position: &str, mode: &str, duration: f64, kind: &str, path: &str, mute: bool| {
+            conn.execute(
+                "INSERT INTO lesson_slides (id, lesson_id, position, mode, duration, kind, image_path, title, mute_audio, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'T', ?8, 't')",
+                params![format!("{lesson}-{position}"), lesson, position, mode, duration, kind, path, mute],
+            )
+            .unwrap();
+        };
+        insert_slide("la", "intro", "insert", 3.0, "image", &intro, false);
+        insert_slide("la", "outro", "insert", 3.0, "title", &outro, false);
+        insert_slide("lb", "intro", "overlay", 4.0, "title", &outro, true);
+        // Case (a)'s shape: a blurred rect over virtual [5, 13), crossing the
+        // boundary between segment A (virtual [0, 10)) and B ([10, 20)).
+        conn.execute(
+            "INSERT INTO lesson_regions (id, lesson_id, start, end, x_percent, y_percent, w_percent, h_percent,
+                                         shape, fill, blur_strength, color, created_at)
+             VALUES ('r1', 'la', 5, 13, 5, 5, 40, 30, 'rect', 'blur', 25, '#000000', 't')",
+            [],
+        )
+        .unwrap();
+
+        let cases: [(&str, Vec<SegmentBounds>); 2] = [
+            ("a", vec![SegmentBounds { start: 30.0, end: 40.0 }, SegmentBounds { start: 100.0, end: 110.0 }]),
+            ("b", vec![SegmentBounds { start: 60.0, end: 75.0 }]),
+        ];
+        for (name, segments) in cases {
+            let lesson = format!("l{name}");
+            let slides = db::query_lesson_slides(&conn, &lesson).unwrap();
+            let has_inserted = slides.iter().any(|slide| slide.mode == "insert");
+            let lesson_length: f64 = segments.iter().map(|segment| segment.end - segment.start).sum();
+            let windows = overlay_slide_windows(&slides, lesson_length);
+            let has_audio = stream.audio.is_some();
+            let single = segments.len() == 1 && !has_inserted;
+            let mut lines = Vec::new();
+            for piece in build_export_pieces(&segments, &slides) {
+                let (file, args) = match &piece {
+                    ExportPiece::Segment { index, start, end, virtual_offset } => {
+                        let length = end - start;
+                        let overlays = overlays_for_segment(&conn, &lesson, *virtual_offset, length).unwrap();
+                        let regions = regions_for_segment(&conn, &lesson, *virtual_offset, length).unwrap();
+                        let mut extras = slides_for_segment(&windows, *virtual_offset, length, has_audio);
+                        extras.stream = has_inserted.then(|| stream.clone());
+                        extras.single_audio = !slides.is_empty();
+                        let slide_dims: Vec<(u32, u32)> =
+                            extras.slides.iter().map(|slide| image_dims(&slide.image_path)).collect();
+                        let file = if single { format!("{out_dir}/{name}.mp4") } else { format!("{out_dir}/{name}-segment-{index}.mp4") };
+                        let args = crate::ffmpeg::lesson_cut_args(
+                            &video, *start, *end, &file, &overlays, &[], &regions, main_dims, &extras, &slide_dims,
+                        );
+                        (file, args)
+                    }
+                    ExportPiece::Slide { position, image_path, duration } => {
+                        let (image_w, image_h) = image_dims(image_path);
+                        let fit = crate::ffmpeg::fit_full_frame(main_dims.0, main_dims.1, image_w, image_h);
+                        let file = format!("{out_dir}/{name}-{position}.mp4");
+                        let args = crate::ffmpeg::slide_piece_args(image_path, *duration, &file, fit, main_dims, &stream);
+                        (file, args)
+                    }
+                };
+                lines.push(serde_json::to_string(&(file, args)).unwrap());
+            }
+            std::fs::write(format!("{out_dir}/{name}.jsonl"), lines.join("\n") + "\n").unwrap();
+        }
     }
 }

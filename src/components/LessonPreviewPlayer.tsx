@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Maximize, Minimize2, Pause, Play } from "lucide-react";
-import type { LessonSegment } from "../db";
+import type { LessonSegment, LessonSlide } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
 import { useContainedVideoRect } from "../lib/useContainedVideoRect";
 import SegmentedScrubber from "./SegmentedScrubber";
+import { activeRegions, RectOutline, ShapeLayers, type PercentRect, type PreviewRegion } from "./RegionLayers";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -48,7 +49,25 @@ interface LessonPreviewPlayerProps {
     x_percent: number;
     y_percent: number;
   }[];
+  /** Shape layers (`lesson_regions`) in virtual seconds: previewed live as
+   * blurred/solid boxes and drawn as a band on the scrubber. */
+  regions?: PreviewRegion[];
+  /** When set, dragging on the frame draws a rect (percent of the frame)
+   * and reports it via `onDraw`. */
+  drawRect?: { onDraw: (rect: PercentRect) => void };
+  /** A dashed outline over the frame, e.g. the region being edited. */
+  outlineRect?: PercentRect | null;
+  /** The lesson's intro/outro slides. Overlay-mode ones show full-frame over
+   * the first/last `duration` virtual seconds (muting the video there if
+   * `mute_audio`) and get a scrubber band. Inserted ones take no virtual
+   * time: the intro is held on screen for its duration when Play is pressed
+   * at the start, the outro once playback reaches the end. */
+  slides?: Pick<LessonSlide, "id" | "position" | "mode" | "duration" | "image_path" | "mute_audio">[];
+  /** Reports the video's pixel size once its metadata has loaded. */
+  onVideoSize?: (size: { width: number; height: number }) => void;
 }
+
+type PreviewSlide = NonNullable<LessonPreviewPlayerProps["slides"]>[number];
 
 /** The lesson-preview video + its custom controls — factored out of
  * `LessonCard` so the same "virtually stitch this lesson's segments
@@ -63,6 +82,11 @@ export default function LessonPreviewPlayer({
   onTimeUpdate,
   onVirtualTimeUpdate,
   overlays = [],
+  regions = [],
+  drawRect,
+  outlineRect = null,
+  slides = [],
+  onVideoSize,
 }: LessonPreviewPlayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayContainerRef = useRef<HTMLDivElement | null>(null);
@@ -71,6 +95,12 @@ export default function LessonPreviewPlayer({
   // intrinsic dimensions are now readable — see that hook.
   const [metadataVersion, setMetadataVersion] = useState(0);
   const contentRect = useContainedVideoRect(videoRef, overlayContainerRef, metadataVersion);
+  // The video's intrinsic width, to scale the blur preview to source pixels.
+  const [videoWidth, setVideoWidth] = useState(0);
+  // Drag state while drawing a rect (`drawRect`): anchor and current rect,
+  // both in percent of the frame.
+  const [dragAnchor, setDragAnchor] = useState<{ x: number; y: number } | null>(null);
+  const [dragRect, setDragRect] = useState<PercentRect | null>(null);
   const [isPaused, setIsPaused] = useState(true);
   const [playbackRate, setPlaybackRate] = useState(1);
   // A CSS-driven full-viewport overlay rather than the native browser
@@ -90,6 +120,10 @@ export default function LessonPreviewPlayer({
   // a caller-side refetch, since that shouldn't snap the playhead back to
   // the first segment's start out from under the user's current position.
   const pendingAutoSeekRef = useRef(false);
+  // An inserted intro/outro currently held on screen in place of the video
+  // (see `startHold`), and the timer that ends the hold.
+  const [hold, setHold] = useState<PreviewSlide | null>(null);
+  const holdTimerRef = useRef<number | null>(null);
 
   function setActiveIndex(index: number) {
     activeIndexRef.current = index;
@@ -180,6 +214,82 @@ export default function LessonPreviewPlayer({
     (overlay) => virtualCurrentTime >= overlay.start && virtualCurrentTime < overlay.end,
   );
 
+  const currentRegions = activeRegions(regions, virtualCurrentTime);
+
+  // Overlay-mode slides' windows on the virtual timeline, clamped to the
+  // lesson's length, same as the export's `overlay_slide_windows`.
+  const overlaySlideWindows = useMemo(() => {
+    if (totalVirtualDuration <= 0) return [];
+    return slides
+      .filter((slide) => slide.mode === "overlay")
+      .map((slide) => {
+        const length = Math.min(slide.duration, totalVirtualDuration);
+        const start = slide.position === "intro" ? 0 : totalVirtualDuration - length;
+        return { ...slide, start, end: start + length };
+      });
+  }, [slides, totalVirtualDuration]);
+  const activeOverlaySlides = overlaySlideWindows.filter(
+    (slide) => virtualCurrentTime >= slide.start && virtualCurrentTime < slide.end,
+  );
+  const overlaySlideMuted = activeOverlaySlides.some((slide) => slide.mute_audio);
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.muted = overlaySlideMuted;
+  }, [overlaySlideMuted]);
+
+  const insertedIntro = slides.find((slide) => slide.mode === "insert" && slide.position === "intro") ?? null;
+  const insertedOutro = slides.find((slide) => slide.mode === "insert" && slide.position === "outro") ?? null;
+
+  function clearHold() {
+    if (holdTimerRef.current !== null) window.clearTimeout(holdTimerRef.current);
+    holdTimerRef.current = null;
+    setHold(null);
+  }
+
+  useEffect(
+    () => () => {
+      if (holdTimerRef.current !== null) window.clearTimeout(holdTimerRef.current);
+    },
+    [],
+  );
+
+  // Pauses the video and shows `slide` in its place for its duration (scaled
+  // by the playback speed), then runs `then`.
+  function startHold(slide: PreviewSlide, then: () => void) {
+    videoRef.current?.pause();
+    if (holdTimerRef.current !== null) window.clearTimeout(holdTimerRef.current);
+    setHold(slide);
+    holdTimerRef.current = window.setTimeout(() => {
+      holdTimerRef.current = null;
+      setHold(null);
+      then();
+    }, (slide.duration * 1000) / playbackRate);
+  }
+
+  function playVideo() {
+    void videoRef.current?.play();
+  }
+
+  // Pointer position over the content rect, in percent of the frame.
+  function pointerPercent(event: React.PointerEvent<HTMLDivElement>) {
+    const box = event.currentTarget.getBoundingClientRect();
+    const clamp = (value: number) => Math.min(100, Math.max(0, value));
+    return {
+      x: clamp(((event.clientX - box.left) / box.width) * 100),
+      y: clamp(((event.clientY - box.top) / box.height) * 100),
+    };
+  }
+
+  // The rect spanned by the drag anchor and the pointer.
+  function rectFromDrag(anchor: { x: number; y: number }, point: { x: number; y: number }): PercentRect {
+    return {
+      x: Math.min(anchor.x, point.x),
+      y: Math.min(anchor.y, point.y),
+      w: Math.abs(point.x - anchor.x),
+      h: Math.abs(point.y - anchor.y),
+    };
+  }
+
   function handleTimeUpdate(event: React.SyntheticEvent<HTMLVideoElement>) {
     const time = event.currentTarget.currentTime;
     setCurrentTime(time);
@@ -191,14 +301,26 @@ export default function LessonPreviewPlayer({
       const nextIndex = (activeIndexRef.current + 1) % segments.length;
       setActiveIndex(nextIndex);
       event.currentTarget.currentTime = segments[nextIndex].start;
+      // Wrapping back to the start: play the inserted outro first, then the
+      // intro, as the exported file would end and (on replay) begin.
+      if (nextIndex === 0 && insertedOutro && !event.currentTarget.paused) {
+        startHold(insertedOutro, () => (insertedIntro ? startHold(insertedIntro, playVideo) : playVideo()));
+      }
     }
   }
 
   function togglePlayPause() {
     const video = videoRef.current;
     if (!video) return;
-    if (video.paused) void video.play();
-    else video.pause();
+    if (hold) {
+      clearHold();
+      return;
+    }
+    if (video.paused) {
+      const atStart = activeIndexRef.current === 0 && virtualCurrentTime < 0.05;
+      if (insertedIntro && atStart) startHold(insertedIntro, playVideo);
+      else playVideo();
+    } else video.pause();
   }
 
   // The only seek control on this preview — drags across the *virtual*
@@ -208,6 +330,7 @@ export default function LessonPreviewPlayer({
   // controls), playback can never land outside the lesson's own segments.
   function handleVirtualScrub(event: React.ChangeEvent<HTMLInputElement>) {
     const virtualTime = Number(event.target.value);
+    clearHold();
     let index = segments.findIndex((segment, i) => {
       const length = segment.end - segment.start;
       return virtualTime >= segmentOffsets[i] && virtualTime < segmentOffsets[i] + length;
@@ -248,11 +371,20 @@ export default function LessonPreviewPlayer({
             "lesson-card-video block max-h-[25vh] w-full bg-black",
             isFullscreen && "h-auto max-h-[82vh] w-full",
           )}
-          onLoadedMetadata={() => setMetadataVersion((v) => v + 1)}
+          onLoadedMetadata={(event) => {
+            setMetadataVersion((v) => v + 1);
+            setVideoWidth(event.currentTarget.videoWidth);
+            onVideoSize?.({ width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight });
+          }}
           onTimeUpdate={handleTimeUpdate}
           onPlay={() => setIsPaused(false)}
           onPause={() => setIsPaused(true)}
         />
+        {/* Before the overlay images, matching the export's chain order
+           (shapes -> image overlays). */}
+        {contentRect && videoWidth > 0 && (
+          <ShapeLayers rect={contentRect} regions={currentRegions} pixelScale={contentRect.width / videoWidth} />
+        )}
         {/* Positioned against `contentRect` (the video's actual letterboxed
            content area — see `useContainedVideoRect`), same reasoning as
            `SourceVideoPreview`'s identical block. */}
@@ -275,6 +407,60 @@ export default function LessonPreviewPlayer({
               />
             );
           })}
+        {/* Overlay-mode intro/outro, full-frame on top of everything, like
+           the export; an inserted one while it's held. */}
+        {contentRect &&
+          [...activeOverlaySlides, ...(hold ? [hold] : [])].map((slide) => (
+            <img
+              key={`${slide.id}-${slide === hold ? "hold" : "overlay"}`}
+              src={convertFileSrc(slide.image_path)}
+              alt=""
+              className="pointer-events-none absolute bg-black object-contain"
+              style={{
+                left: contentRect.left,
+                top: contentRect.top,
+                width: contentRect.width,
+                height: contentRect.height,
+              }}
+            />
+          ))}
+        {contentRect && (hold ?? (isPaused && virtualCurrentTime < 0.05 ? insertedIntro : null)) && (
+          <span
+            className="pointer-events-none absolute rounded bg-black/70 px-1.5 py-0.5 text-xs text-white"
+            style={{ left: contentRect.left + 6, top: contentRect.top + 6 }}
+          >
+            {hold
+              ? `${hold.position === "intro" ? "Intro" : "Outro"} · ${hold.duration}s`
+              : `Intro · ${insertedIntro?.duration}s plays first`}
+          </span>
+        )}
+        {contentRect && (dragRect ?? outlineRect) && (
+          <RectOutline rect={contentRect} percentRect={(dragRect ?? outlineRect) as PercentRect} />
+        )}
+        {contentRect && drawRect && (
+          <div
+            className="absolute cursor-crosshair touch-none"
+            style={{ left: contentRect.left, top: contentRect.top, width: contentRect.width, height: contentRect.height }}
+            title="Drag to draw the shape"
+            onPointerDown={(event) => {
+              event.currentTarget.setPointerCapture(event.pointerId);
+              const point = pointerPercent(event);
+              setDragAnchor(point);
+              setDragRect({ x: point.x, y: point.y, w: 0, h: 0 });
+            }}
+            onPointerMove={(event) => {
+              if (dragAnchor) setDragRect(rectFromDrag(dragAnchor, pointerPercent(event)));
+            }}
+            onPointerUp={(event) => {
+              if (!dragAnchor) return;
+              const rect = rectFromDrag(dragAnchor, pointerPercent(event));
+              setDragAnchor(null);
+              setDragRect(null);
+              // Ignore a click without a real drag.
+              if (rect.w >= 1 && rect.h >= 1) drawRect.onDraw(rect);
+            }}
+          />
+        )}
       </div>
 
       <div className="mt-1 flex items-center gap-2">
@@ -284,9 +470,9 @@ export default function LessonPreviewPlayer({
           size="icon"
           disabled={segments.length === 0}
           onClick={togglePlayPause}
-          aria-label={isPaused ? "Play" : "Pause"}
+          aria-label={isPaused && !hold ? "Play" : "Pause"}
         >
-          {isPaused ? <Play /> : <Pause />}
+          {isPaused && !hold ? <Play /> : <Pause />}
         </Button>
         <span className="text-sm tabular-nums opacity-75">
           {formatTimestamp(virtualCurrentTime)} / {formatTimestamp(totalVirtualDuration)}
@@ -325,6 +511,8 @@ export default function LessonPreviewPlayer({
         onChange={handleVirtualScrub}
         aria-label={`Scrub lesson ${lessonTitle}`}
         markers={overlays}
+        regionMarkers={regions}
+        slideMarkers={overlaySlideWindows}
         duration={totalVirtualDuration}
       />
     </div>

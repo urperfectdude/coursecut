@@ -476,6 +476,99 @@ export async function deleteFrameOverlay(id: string): Promise<void> {
   await invoke("delete_frame_overlay", { id });
 }
 
+// A static shape layer (blurred or solid rect / rounded rect / ellipse)
+// applied between `start` and `end` virtual seconds
+// (`0012_lesson_regions.sql`), the same timeline as `FrameOverlay`. The rect
+// is top-left + size, 0-100 percent of the output frame.
+export type RegionShape = "rect" | "rounded" | "ellipse";
+export type RegionFill = "blur" | "solid";
+
+export interface LessonRegion {
+  id: string;
+  lesson_id: string;
+  start: number;
+  end: number;
+  x_percent: number;
+  y_percent: number;
+  w_percent: number;
+  h_percent: number;
+  shape: RegionShape;
+  fill: RegionFill;
+  /** Blur radius in source pixels (1-100). */
+  blur_strength: number;
+  /** `#rrggbb`. */
+  color: string;
+  created_at: string;
+}
+
+// The editable fields of a region.
+export type RegionInput = Omit<LessonRegion, "id" | "lesson_id" | "created_at">;
+
+export async function listLessonRegions(lessonId: string): Promise<LessonRegion[]> {
+  return invoke<LessonRegion[]>("list_lesson_regions", { lessonId });
+}
+
+export async function addLessonRegion(lessonId: string, region: RegionInput): Promise<LessonRegion> {
+  return invoke<LessonRegion>("add_lesson_region", { lessonId, region });
+}
+
+export async function updateLessonRegion(id: string, region: RegionInput): Promise<LessonRegion> {
+  return invoke<LessonRegion>("update_lesson_region", { id, region });
+}
+
+export async function deleteLessonRegion(id: string): Promise<void> {
+  await invoke("delete_lesson_region", { id });
+}
+
+// A lesson's intro or outro (`0013_lesson_slides.sql`), at most one of
+// each. `mode` "insert" plays it as its own clip before/after the lecture
+// (adds time, silent); "overlay" shows it full-frame over the first/last
+// `duration` seconds of the lesson's virtual timeline, optionally muting the
+// lecture audio there. `image_path` is the picked image, or for a title card
+// the PNG rendered by `renderTitleCardPng` and saved via `saveTitleCardPng`.
+export type SlidePosition = "intro" | "outro";
+export type SlideMode = "insert" | "overlay";
+export type SlideKind = "image" | "title";
+
+export interface LessonSlide {
+  id: string;
+  lesson_id: string;
+  position: SlidePosition;
+  mode: SlideMode;
+  duration: number;
+  kind: SlideKind;
+  image_path: string;
+  title: string;
+  subtitle: string;
+  /** `#rrggbb`. */
+  bg_color: string;
+  /** `#rrggbb`. */
+  text_color: string;
+  mute_audio: boolean;
+  created_at: string;
+}
+
+export type SlideInput = Omit<LessonSlide, "id" | "lesson_id" | "created_at">;
+
+export async function listLessonSlides(lessonId: string): Promise<LessonSlide[]> {
+  return invoke<LessonSlide[]>("list_lesson_slides", { lessonId });
+}
+
+// Creates the slide at `slide.position`, or replaces the one already there.
+export async function upsertLessonSlide(lessonId: string, slide: SlideInput): Promise<LessonSlide> {
+  return invoke<LessonSlide>("upsert_lesson_slide", { lessonId, slide });
+}
+
+export async function deleteLessonSlide(id: string): Promise<void> {
+  await invoke("delete_lesson_slide", { id });
+}
+
+// Saves a rendered title card PNG into the app cache and returns its path.
+// Sent as the raw IPC body, not JSON.
+export async function saveTitleCardPng(png: Uint8Array): Promise<string> {
+  return invoke<string>("save_title_card_png", png);
+}
+
 export async function deleteLesson(id: string): Promise<void> {
   await invoke("delete_lesson", { id });
 }

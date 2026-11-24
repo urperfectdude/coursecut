@@ -27,6 +27,12 @@ interface SegmentedScrubberProps {
    * different concepts that can overlap. Same `duration` denominator as
    * `segments`. */
   markers?: SegmentedScrubberSegment[];
+  /** Shape layers (`lesson_regions`), a violet third band below the
+   * overlay one. Same `duration` denominator. */
+  regionMarkers?: SegmentedScrubberSegment[];
+  /** Overlay-mode intro/outro windows, a sky-blue band below the shapes
+   * one. Same `duration` denominator. */
+  slideMarkers?: SegmentedScrubberSegment[];
   duration?: number;
 }
 
@@ -47,13 +53,19 @@ export default function SegmentedScrubber({
   className,
   segments,
   markers,
+  regionMarkers,
+  slideMarkers,
   duration,
 }: SegmentedScrubberProps) {
   const showOverlay = segments !== undefined && duration !== undefined && duration > 0;
   const showMarkers = markers !== undefined && markers.length > 0 && duration !== undefined && duration > 0;
+  const showRegions =
+    regionMarkers !== undefined && regionMarkers.length > 0 && duration !== undefined && duration > 0;
+  const showSlides =
+    slideMarkers !== undefined && slideMarkers.length > 0 && duration !== undefined && duration > 0;
 
   return (
-    <div className="relative box-border">
+    <div className={cn("relative box-border", showRegions && "mb-2", showSlides && "mb-3.5")}>
       <input
         type="range"
         min={min}
@@ -99,6 +111,34 @@ export default function SegmentedScrubber({
             <span
               key={marker.id}
               className="absolute inset-y-0 rounded-full bg-amber-400"
+              style={{
+                left: `${(marker.start / duration) * 100}%`,
+                width: `${((marker.end - marker.start) / duration) * 100}%`,
+              }}
+            />
+          ))}
+        </div>
+      )}
+      {showRegions && (
+        <div className="pointer-events-none absolute inset-x-0 top-full mt-2.5 h-1" aria-hidden="true">
+          {regionMarkers.map((marker) => (
+            <span
+              key={marker.id}
+              className="absolute inset-y-0 rounded-full bg-violet-400"
+              style={{
+                left: `${(marker.start / duration) * 100}%`,
+                width: `${((marker.end - marker.start) / duration) * 100}%`,
+              }}
+            />
+          ))}
+        </div>
+      )}
+      {showSlides && (
+        <div className="pointer-events-none absolute inset-x-0 top-full mt-4 h-1" aria-hidden="true">
+          {slideMarkers.map((marker) => (
+            <span
+              key={marker.id}
+              className="absolute inset-y-0 rounded-full bg-sky-400"
               style={{
                 left: `${(marker.start / duration) * 100}%`,
                 width: `${((marker.end - marker.start) / duration) * 100}%`,

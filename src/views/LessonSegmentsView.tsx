@@ -3,6 +3,9 @@ import { open } from "@tauri-apps/plugin-dialog";
 import Breadcrumbs from "../components/Breadcrumbs";
 import LessonPreviewPlayer from "../components/LessonPreviewPlayer";
 import SourceVideoPreview from "../components/SourceVideoPreview";
+import RegionsPanel, { useRegionEditor } from "../components/RegionsPanel";
+import IntroOutroBlock, { useLessonSlides } from "../components/IntroOutroPanel";
+import type { PreviewRegion } from "../components/RegionLayers";
 import { basename } from "./ProjectDetailView";
 import {
   addFrameOverlay,
@@ -33,6 +36,7 @@ import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "../lib/tim
 import {
   segmentOffsets as computeSegmentOffsets,
   rewriteFinalTimestampsToSource,
+  virtualRangeToSourceRanges,
 } from "../lib/timeline";
 import { getSegmentDiffBadgeClassName } from "../lib/badge-variants";
 import { ChevronDown, ChevronUp, Pencil, Trash2 } from "lucide-react";
@@ -292,6 +296,28 @@ export default function LessonSegmentsView({
   // freshly-inserted overlay's default Start is anchored to this, not
   // `finalVideoTime` (which is real/source time).
   const [finalVirtualTime, setFinalVirtualTime] = useState(0);
+  // Shape layers (`lesson_regions`), on the same virtual timeline as
+  // the image overlays — see `RegionsPanel`.
+  const regionEditor = useRegionEditor(lessonId, finalVirtualTime);
+  // Intro/outro slides (`lesson_slides`), edited in the Image overlays
+  // section and shown by the Final video preview. Title cards are rendered
+  // at the video's own pixel size, reported by that preview.
+  const slidesState = useLessonSlides(lessonId);
+  const [videoSize, setVideoSize] = useState<{ width: number; height: number } | null>(null);
+  // The same regions mapped onto source seconds for the Original video
+  // preview, one entry per lesson segment a region overlaps.
+  const sourcePreviewRegions = useMemo<PreviewRegion[]>(
+    () =>
+      regionEditor.previewRegions.flatMap((region) =>
+        virtualRangeToSourceRanges(segments, region.start, region.end).map((range, index) => ({
+          ...region,
+          id: `${region.id}-${index}`,
+          start: range.start,
+          end: range.end,
+        })),
+      ),
+    [regionEditor.previewRegions, segments],
+  );
 
   // Draft values for the per-segment start/end numeric inputs, keyed by
   // segment id — same draft-then-commit-on-blur pattern as the summary
@@ -1363,6 +1389,7 @@ export default function LessonSegmentsView({
                 onTimeUpdate={setCurrentTime}
                 onAddSegment={handleAddSourceSegment}
                 controlsLayout="stacked"
+                regions={sourcePreviewRegions}
               />
             </div>
 
@@ -1382,6 +1409,11 @@ export default function LessonSegmentsView({
                 segments={segments}
                 lessonTitle={lesson.title}
                 overlays={previewOverlays}
+                regions={regionEditor.previewRegions}
+                drawRect={regionEditor.draft ? { onDraw: regionEditor.setDraftRect } : undefined}
+                outlineRect={regionEditor.draft?.rect ?? null}
+                slides={slidesState.slides}
+                onVideoSize={setVideoSize}
                 onTimeUpdate={(time) => {
                   setCurrentTime(time);
                   setFinalVideoTime(time);
@@ -1929,7 +1961,11 @@ export default function LessonSegmentsView({
                 <li className="text-sm text-muted-foreground">No image overlays yet.</li>
               )}
             </ul>
+
+            <IntroOutroBlock lessonId={lessonId} slidesState={slidesState} videoSize={videoSize} />
           </div>
+
+          <RegionsPanel editor={regionEditor} />
 
           {proposedSegments !== null && (
             <LessonAiEditReviewModal
