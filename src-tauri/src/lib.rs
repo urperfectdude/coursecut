@@ -81,6 +81,7 @@ pub fn run() {
             db::update_lesson_segment,
             db::delete_lesson_segment,
             db::reorder_lesson_segments,
+            db::replace_lesson_segments,
             db::list_frame_overlays,
             db::add_frame_overlay,
             db::update_frame_overlay,

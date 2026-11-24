@@ -65,10 +65,6 @@ interface LessonPreviewPlayerProps {
   slides?: Pick<LessonSlide, "id" | "position" | "mode" | "duration" | "image_path" | "mute_audio">[];
   /** Reports the video's pixel size once its metadata has loaded. */
   onVideoSize?: (size: { width: number; height: number }) => void;
-  /** Source-time ranges to jump over while playing (removed words and
-   * pauses, docs/text-editing-plan.md §6.2), checked every animation frame.
-   * A cut reaching a segment's end moves on to the next segment. */
-  skipRanges?: readonly { start: number; end: number }[];
   /** Called every animation frame with the source-time playhead, for the
    * word highlight (no React render per frame). */
   onFrameTime?: (time: number, playing: boolean) => void;
@@ -80,9 +76,6 @@ export interface LessonPreviewPlayerHandle {
   seekToSource: (time: number) => void;
   pause: () => void;
 }
-
-/** Lands the playhead just past a skipped range. */
-const SKIP_PAST_S = 0.001;
 
 type PreviewSlide = NonNullable<LessonPreviewPlayerProps["slides"]>[number];
 
@@ -105,7 +98,6 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
   outlineRect = null,
   slides = [],
   onVideoSize,
-  skipRanges,
   onFrameTime,
 }: LessonPreviewPlayerProps, ref) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -176,12 +168,29 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
     setIsFullscreen((value) => !value);
   }
 
-  // A fresh `segments` array (new fetch, e.g. after an edit elsewhere)
-  // resets which one is "active" — the old index may no longer be valid
-  // (a segment could have been deleted) and there's no way to know which
-  // segment the caller intends to be current without a matching id.
+  // A fresh `segments` array (an edit, e.g. a Script tab cut) keeps the
+  // playhead where it is: the active row becomes the one containing it.
+  // If the playhead is now in a cut-out part, it moves to the next row
+  // that starts after it (or the first row). Before any playback, row 0.
   useEffect(() => {
-    setActiveIndex(0);
+    const video = videoRef.current;
+    if (!video || segments.length === 0 || pendingAutoSeekRef.current) {
+      setActiveIndex(0);
+      return;
+    }
+    const time = video.currentTime;
+    const inside = segments.findIndex((segment) => time >= segment.start && time < segment.end);
+    if (inside >= 0) {
+      setActiveIndex(inside);
+      return;
+    }
+    let next = -1;
+    segments.forEach((segment, i) => {
+      if (segment.start >= time && (next < 0 || segment.start < segments[next].start)) next = i;
+    });
+    const index = next >= 0 ? next : 0;
+    setActiveIndex(index);
+    video.currentTime = segments[index].start;
   }, [segments]);
 
   // Auto-seek to the first segment's start once, right after mount and
@@ -332,12 +341,14 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
     if (time >= segment.end) advanceToNextSegment(event.currentTarget);
   }
 
-  // Per-frame loop for `skipRanges` / `onFrameTime` (the approach of
-  // Rescript v1.0.9's MediaPreview playback loop). Latest props and the
-  // advance step go through refs, so the loop starts once.
-  const frameRef = useRef({ skipRanges, onFrameTime, segments, advance: advanceToNextSegment });
-  frameRef.current = { skipRanges, onFrameTime, segments, advance: advanceToNextSegment };
-  const frameLoopWanted = skipRanges !== undefined || onFrameTime !== undefined;
+  // Per-frame loop (the approach of Rescript v1.0.9's MediaPreview playback
+  // loop): moves on at a segment's end within a frame rather than on the
+  // next `timeupdate` (~250 ms later, audible when a Script cut sits right
+  // there), and reports the playhead for the word highlight. Latest props
+  // and the advance step go through refs, so the loop starts once.
+  const frameRef = useRef({ onFrameTime, segments, advance: advanceToNextSegment });
+  frameRef.current = { onFrameTime, segments, advance: advanceToNextSegment };
+  const frameLoopWanted = onFrameTime !== undefined;
   useEffect(() => {
     if (!frameLoopWanted) return;
     let raf = 0;
@@ -345,19 +356,11 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
     let lastPlaying = false;
     const tick = () => {
       const video = videoRef.current;
-      const { skipRanges: ranges, onFrameTime: report, segments: segs, advance } = frameRef.current;
+      const { onFrameTime: report, segments: segs, advance } = frameRef.current;
       if (video) {
         const playing = !video.paused;
         const segment = segs[activeIndexRef.current];
-        if (playing && ranges && segment) {
-          const time = video.currentTime;
-          const cut = ranges.find((range) => time >= range.start && time < range.end);
-          if (cut) {
-            const target = cut.end + SKIP_PAST_S;
-            if (target >= segment.end) advance(video);
-            else video.currentTime = target;
-          }
-        }
+        if (playing && segment && video.currentTime >= segment.end) advance(video);
         const time = video.currentTime;
         if (time !== lastTime || playing !== lastPlaying) {
           lastTime = time;
@@ -444,7 +447,7 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
           // entirely via the Tailwind utilities alongside it) because
           // `LessonSegmentsView`'s stylesheet forces this element to a shared
           // height alongside `SourceVideoPreview`'s video via
-          // `.lesson-segments-preview-row .lesson-card-video` — see
+          // `.lesson-editor-player .lesson-card-video` — see
           // styles.css and this phase's report.
           className={cn(
             "lesson-card-video block max-h-[25vh] w-full bg-black",

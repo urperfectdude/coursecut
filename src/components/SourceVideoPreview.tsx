@@ -389,7 +389,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
                 // `source-preview-video` is likewise kept as a hook className —
                 // `LessonSegmentsView`'s stylesheet forces this element to a
                 // shared height alongside `LessonPreviewPlayer`'s video via
-                // `.lesson-segments-preview-row .source-preview-video`.
+                // `.lesson-editor-player .source-preview-video`.
                 className={cn(
                   "source-preview-video block max-h-[30vh] w-full bg-black",
                   isFullscreen && "h-auto max-h-[82vh] w-full",

@@ -201,27 +201,6 @@ export async function listTranscriptWords(videoId: string): Promise<TranscriptWo
 
 export type PauseAction = "shorten" | "remove" | "keep";
 
-/** The user's decision on the pause after word `after_word_id`. */
-export interface PauseDecision {
-  after_word_id: string;
-  action: PauseAction | null;
-}
-
-export async function listTranscriptPauses(videoId: string): Promise<PauseDecision[]> {
-  return invoke<PauseDecision[]>("list_transcript_pauses", { videoId });
-}
-
-/** Saves a batch of word removals/restores and pause decisions (entries
- * with `action: null` clear that decision). Returns the video's segments;
- * the `keep` flag of each segment containing a changed word is re-derived
- * from its words. Local only. */
-export async function updateTranscriptWords(
-  videoId: string,
-  changes: { id: string; removed: boolean }[],
-  pauses: PauseDecision[] = [],
-): Promise<TranscriptSegment[]> {
-  return invoke<TranscriptSegment[]>("update_transcript_words", { videoId, changes, pauses });
-}
 
 // "Listen again for word-level editing": sends the video's already-extracted
 // local audio to Whisper (same as transcription, see
@@ -421,6 +400,13 @@ export async function applyLessonSegmentEdit(
 // start/end, only playback sequence.
 export async function reorderLessonSegments(lessonId: string, orderedIds: string[]): Promise<void> {
   await invoke("reorder_lesson_segments", { lessonId, orderedIds });
+}
+
+// Replaces a lesson's segments with `ranges`, in order, in one transaction
+// (rows keep their ids in order; extras deleted, missing ones added).
+// Rejects an empty list. Used by undo/redo and the Script tab's cuts.
+export async function replaceLessonSegments(lessonId: string, ranges: LessonSegmentRange[]): Promise<LessonSegment[]> {
+  return invoke<LessonSegment[]>("replace_lesson_segments", { lessonId, ranges });
 }
 
 // A still-image overlay composited over a lesson's existing frames for

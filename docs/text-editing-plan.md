@@ -537,6 +537,38 @@ Turning every word cut into its own piece would mean hundreds of ffmpeg runs and
   * **Segment keep flags:** a word save now re-derives them only for segments containing a changed word, so Transcript-page keep/drop choices elsewhere aren't overwritten.
 * **Next: Phase 3b + 4 together.** Export with cuts, and overlays/shapes/slide windows moved onto the edited timeline. The Final video's scrubber still shows the uncut lesson length until then.
 
+**Per-lesson cuts (decided 2026-11-24, replaces the shared-word model on the lesson screen).** The user wants removing words to add rows in the Segments tab, and doesn't need edits shared between lessons. So:
+
+* **Removing words in the Script tab cuts them out of this lesson's segments.** A segment becomes two rows, or shrinks. Restoring joins the rows back. Shorten/Remove on a pause chip and Quick cleanup are cuts too. Pure range logic is in `src/lib/lesson-cuts.ts` (tested).
+* **The lesson's segments are the only edit state.** Each Script edit is one ordinary segment undo step (`applySegmentSnapshot`).
+* **Exports cut removed words now,** because they export segments. Phase 3b's export work becomes an optimisation rather than a prerequisite.
+* **Overlays and shapes** stay on the lesson's own timeline, as they do for any segment edit.
+* **Script tab display:**
+  * Segments that run forward in time with gaps under 60 s form one block.
+  * The gaps inside a block show as struck-through words (restorable). A bigger or backward jump starts a new block under its own header.
+  * The length line under the title is "blocks' span → segments' total".
+* **The Final player** checks segment ends every animation frame, so it stops right before a cut-out word. The `skipRanges` prop is no longer used on this page.
+* **Dropped from the lesson screen:** stored `removed` flags and pause decisions. `useWordEdits` is deleted. The backend commands `update_transcript_words` and `list_transcript_pauses` and the `transcript_pauses` table are now unused; remove them, or reuse them for StepCut. The Transcript page's keep/drop toggle still writes `removed` on words, which nothing on the lesson screen reads.
+* **Review fixes (2026-11-24):**
+  * **One transaction per change.** Segment changes go through a single new command, `replace_lesson_segments`, so a Script cut, an undo or a redo can't be left half done.
+  * **One segment change at a time**, guarded by a single lock covering undo/redo, Script cuts and every `withSegmentUndo` edit.
+  * **Selections are cut per run.** A selection is split into runs of consecutive words within one block, so selecting across blocks can't cut what lies between them.
+  * **Cuts and restores know where words start.** A short unselected word between two cuts is kept; silent slivers under 0.3 s are still dropped. Restoring word by word rejoins rows without leaving hidden micro-cuts.
+  * **The lesson's outer edges are restorable.** Each block shows the whole sentences at its edges, so words cut from the lesson's first or last row stay visible (struck through), and restoring them extends that row, or adds one if other removed words lie between.
+  * **Quick cleanup's confirmation** (and its Undo) appears only once the cut is saved.
+  * **The Final player keeps its place** when segments change, instead of jumping to row 1.
+  * **The Script tab warns** when the lesson has overlays or blur boxes, which move when earlier parts are cut.
+  * **The video column** fills its width at the video's aspect ratio, and a draggable divider resizes it (double-click resets; remembered per viewer).
+* **Second review fixes:**
+  * **Segment edits queue rather than being refused,** so an AI proposal, a typed time or a Mark In/Out add is never dropped. Each queued edit starts from the database, not stale state. Undo/redo and Script cuts ignore input while one is running.
+  * **Deleting a segment** runs under the same lock.
+  * **An undo step is only recorded when there is something to go back to.**
+  * **Restore only touches struck parts.** It restores just the struck parts of a mixed selection (`subtractRows`), and only extends rows of the block the words are shown under, so reordered lessons restore in the right place.
+  * **Known, pre-existing:** undoing a "Split at playhead" (which creates a new lesson) restores the ranges but leaves the new lesson.
+* **Cost to watch:**
+  * Quick cleanup on a long lesson can make dozens of rows, and each row is one ffmpeg run at export. Group consecutive rows into one run with trim/concat (the §8.1 approach applied to segments).
+  * Many short rows also mean many seeks in the preview.
+
 About **15–20 working days** for Phases 0–5.
 
 **Testing:**

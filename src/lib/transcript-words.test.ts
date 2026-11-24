@@ -8,10 +8,8 @@ import {
   formatLength,
   groupIntoParagraphs,
   groupLessonParagraphs,
-  lengthAfterCuts,
   pauseCut,
   punctuateWords,
-  summarizeEdits,
 } from "./transcript-words.ts";
 import { findFillerWordIdxs, isFillerWord } from "./fillers.ts";
 import type { TranscriptSegment, TranscriptWord } from "../db.ts";
@@ -108,15 +106,6 @@ eq(
   eq(findActiveWordIndex(words, 2.1), 1, "inside b");
 }
 
-// --- summarizeEdits ---
-{
-  const words = [word(0, "a", 0, 1), word(1, "um", 2, 2.5, true), word(2, "b", 4, 5)];
-  const { cuts, editedDuration } = summarizeEdits(words, 10);
-  eq(cuts, [{ start: 2, end: 2.5 }], "one cut for the removed word");
-  eq(editedDuration, 9.5, "edited duration");
-  eq(summarizeEdits(words, 0).editedDuration, 0, "unknown duration");
-}
-
 // --- formatLength ---
 eq(formatLength(65), "1:05", "minutes");
 eq(formatLength(3723), "1:02:03", "hours");
@@ -130,11 +119,6 @@ eq(formatLength(3723), "1:02:03", "hours");
   eq(pauseCut(pauses[0], "remove"), { start: 2.05, end: 3.95 }, "remove keeps edge pads");
   eq(pauseCut(pauses[0], "keep"), null, "keep cuts nothing");
   eq(pauseCut(pauses[0], undefined), null, "undecided cuts nothing");
-
-  const actions = new Map([[pauses[0].afterWordId, "shorten" as const]]);
-  const { cuts, editedDuration } = summarizeEdits(words, 6, pauses, actions);
-  eq(cuts, [{ start: 2.15, end: 3.85 }], "pause cut included");
-  assert(Math.abs(editedDuration - 4.3) < 1e-9, "edited duration with pause cut");
 }
 
 // --- fillers ---
@@ -166,8 +150,6 @@ eq(
   const again = groupLessonParagraphs(lesson, tsegs, edited, previous);
   assert(again[1].words === paras[1].words, "untouched lesson paragraph reused");
   assert(again[0].words !== paras[0].words, "edited lesson paragraph replaced");
-
-  eq(lengthAfterCuts([{ start: 0, end: 10 }, { start: 20, end: 25 }], [{ start: 2, end: 4 }, { start: 24, end: 30 }]), 12, "length after cuts");
 }
 
 console.log("transcript-words-test: all passed");

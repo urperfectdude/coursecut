@@ -4,9 +4,9 @@ import Breadcrumbs from "../components/Breadcrumbs";
 import LessonPreviewPlayer, { type LessonPreviewPlayerHandle } from "../components/LessonPreviewPlayer";
 import LessonScript from "../components/LessonScript";
 import type { WordTranscriptHandle } from "../components/WordTranscript";
-import { useWordEdits } from "../hooks/useWordEdits";
 import { useVideoProgress } from "../hooks/useVideoProgress";
-import { findPauses, formatLength, lengthAfterCuts, summarizeEdits } from "../lib/transcript-words";
+import { findPauses, formatLength } from "../lib/transcript-words";
+import { scriptBlocks, totalLength, type Range } from "../lib/lesson-cuts";
 import SourceVideoPreview from "../components/SourceVideoPreview";
 import RegionsPanel, { useRegionEditor } from "../components/RegionsPanel";
 import IntroOutroBlock, { useLessonSlides } from "../components/IntroOutroPanel";
@@ -24,12 +24,12 @@ import {
   listFrameOverlays,
   listLessonSegments,
   listLessons,
-  listTranscriptPauses,
   listTranscriptSegments,
   listTranscriptWords,
   previewLessonSegmentEdit,
   queueExport,
   reorderLessonSegments,
+  replaceLessonSegments,
   splitLesson,
   updateFrameOverlay,
   updateLesson,
@@ -38,9 +38,9 @@ import {
   type Lesson,
   type LessonSegment,
   type LessonSegmentRange,
-  type PauseAction,
   type Project,
   type TranscriptSegment,
+  type TranscriptWord,
   type Video,
 } from "../db";
 import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "../lib/timestamp";
@@ -83,6 +83,10 @@ import { cn } from "@/lib/utils";
 const RANGE_MATCH_EPSILON_SECS = 0.01;
 
 type EditorTab = "script" | "segments" | "overlays" | "shapes" | "introOutro";
+
+const PREVIEW_WIDTH_KEY = "coursecut.lessonEditor.previewWidth";
+const MIN_PREVIEW_WIDTH_PX = 280;
+const MIN_TABS_WIDTH_PX = 360;
 
 const EDITOR_TABS: { id: EditorTab; label: string }[] = [
   { id: "script", label: "Script" },
@@ -196,33 +200,12 @@ async function applySegmentSnapshot(
   lessonId: string,
   targetRanges: LessonSegmentRange[],
 ): Promise<LessonSegment[]> {
-  const current = await listLessonSegments(lessonId);
-  const overlapCount = Math.min(current.length, targetRanges.length);
-
-  for (let i = 0; i < overlapCount; i++) {
-    const segment = current[i];
-    const target = targetRanges[i];
-    if (segment.start !== target.start || segment.end !== target.end) {
-      await updateLessonSegment(segment.id, target.start, target.end);
-    }
-  }
-
-  for (let i = current.length - 1; i >= overlapCount; i--) {
-    await deleteLessonSegment(current[i].id);
-  }
-
-  const appendedIds: string[] = [];
-  for (let i = overlapCount; i < targetRanges.length; i++) {
-    const created = await addLessonSegment(lessonId, targetRanges[i].start, targetRanges[i].end);
-    appendedIds.push(created.id);
-  }
-
-  const orderedIds = [...current.slice(0, overlapCount).map((segment) => segment.id), ...appendedIds];
-  if (orderedIds.length > 1) {
-    await reorderLessonSegments(lessonId, orderedIds);
-  }
-
-  return listLessonSegments(lessonId);
+  // One transaction on the Rust side, so an undo or a Script cut that
+  // rewrites many rows can't be left half done.
+  return replaceLessonSegments(
+    lessonId,
+    targetRanges.map((range) => ({ start: range.start, end: range.end })),
+  );
 }
 
 interface LessonSegmentsViewProps {
@@ -393,28 +376,70 @@ export default function LessonSegmentsView({
   // the user starts typing.
   const [aiPlaceholderIndex, setAiPlaceholderIndex] = useState(0);
 
-  // --- Word-level editing (docs/text-editing-plan.md §6.3, Script tab) ---
-  // Words belong to the video, so edits here show in every lesson that
-  // contains them. Each word edit is one entry on this page's undo stack
-  // (see `withWordUndo`), interleaved with segment edits.
+  // --- Script tab (docs/text-editing-plan.md, "Per-lesson cuts") ---
+  // Removing words cuts them out of this lesson's segments, so the
+  // segments are the only edit state: preview, export and undo already
+  // follow them. Word timings are read-only here.
   const [transcriptSegments, setTranscriptSegments] = useState<TranscriptSegment[]>([]);
+  const [words, setWords] = useState<TranscriptWord[]>([]);
   const [fetchingWords, setFetchingWords] = useState(false);
-  const [skipRemoved, setSkipRemoved] = useState(true);
   const [tab, setTab] = useState<EditorTab>("script");
   const [playerView, setPlayerView] = useState<"final" | "original">("final");
+
+  // Width of the video column, set by dragging the divider (null = the
+  // default 42%). Remembered per viewer in localStorage.
+  const editorGridRef = useRef<HTMLDivElement>(null);
+  const asideRef = useRef<HTMLElement>(null);
+  const [previewWidth, setPreviewWidth] = useState<number | null>(() => {
+    try {
+      const saved = Number(localStorage.getItem(PREVIEW_WIDTH_KEY));
+      return saved > 0 ? saved : null;
+    } catch {
+      return null;
+    }
+  });
+  const clampPreviewWidth = useCallback((width: number) => {
+    const total = editorGridRef.current?.getBoundingClientRect().width ?? 1200;
+    return Math.round(Math.min(Math.max(width, MIN_PREVIEW_WIDTH_PX), total - MIN_TABS_WIDTH_PX));
+  }, []);
+  const savePreviewWidth = useCallback((width: number | null) => {
+    setPreviewWidth(width);
+    try {
+      if (width === null) localStorage.removeItem(PREVIEW_WIDTH_KEY);
+      else localStorage.setItem(PREVIEW_WIDTH_KEY, String(width));
+    } catch {
+      // Storage unavailable: the width just isn't remembered.
+    }
+  }, []);
+  const handleDividerPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const grid = editorGridRef.current;
+      if (!grid || event.button !== 0) return;
+      event.preventDefault();
+      const divider = event.currentTarget;
+      divider.setPointerCapture(event.pointerId);
+      const right = grid.getBoundingClientRect().right;
+      let latest = previewWidth;
+      const onMove = (move: PointerEvent) => {
+        latest = clampPreviewWidth(right - move.clientX - 6);
+        setPreviewWidth(latest);
+      };
+      const onUp = () => {
+        divider.removeEventListener("pointermove", onMove);
+        divider.removeEventListener("pointerup", onUp);
+        divider.removeEventListener("pointercancel", onUp);
+        if (latest !== null) savePreviewWidth(latest);
+      };
+      divider.addEventListener("pointermove", onMove);
+      divider.addEventListener("pointerup", onUp);
+      divider.addEventListener("pointercancel", onUp);
+    },
+    [previewWidth, clampPreviewWidth, savePreviewWidth],
+  );
   const { progress: videoProgressMap, clearProgress } = useVideoProgress();
   const lessonPlayerRef = useRef<LessonPreviewPlayerHandle>(null);
   const scriptRef = useRef<WordTranscriptHandle>(null);
-  const wordEdits = useWordEdits({
-    videoId,
-    // Segment keep flags only matter on the Transcript page and to Analyze;
-    // both reload them.
-    onSegmentsSaved: () => {},
-    onError: setError,
-  });
-  const { load: loadWords, flush: flushWords } = wordEdits;
-  const timingWords = wordEdits.timingWords;
-  const pauses = useMemo(() => findPauses(timingWords), [timingWords]);
+  const pauses = useMemo(() => findPauses(words), [words]);
   const pausesByWordId = useMemo(() => new Map(pauses.map((p) => [p.afterWordId, p])), [pauses]);
 
   useEffect(() => {
@@ -426,15 +451,14 @@ export default function LessonSegmentsView({
       listLessons(videoId),
       listTranscriptSegments(videoId),
       listTranscriptWords(videoId),
-      listTranscriptPauses(videoId),
     ])
-      .then(([projectRow, videoRow, lessonRows, transcriptRows, wordRows, pauseRows]) => {
+      .then(([projectRow, videoRow, lessonRows, transcriptRows, wordRows]) => {
         if (cancelled) return;
         setProject(projectRow);
         setVideo(videoRow);
         setLesson(lessonRows.find((row) => row.id === lessonId) ?? null);
         setTranscriptSegments(transcriptRows);
-        loadWords(wordRows, pauseRows);
+        setWords(wordRows);
       })
       .catch((err) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -445,7 +469,7 @@ export default function LessonSegmentsView({
     return () => {
       cancelled = true;
     };
-  }, [projectId, videoId, lessonId, loadWords]);
+  }, [projectId, videoId, lessonId]);
 
   const fetchSegments = useCallback(async () => {
     setSegmentsLoading(true);
@@ -748,69 +772,61 @@ export default function LessonSegmentsView({
     setRedoStack([]);
   }, []);
 
-  // One undo/redo at a time: segment steps restore snapshots over several
-  // IPC calls, and two running at once would interleave them.
-  const undoBusyRef = useRef(false);
+  // One segment-changing operation at a time (undo, redo, Script cuts, and
+  // every edit through `withSegmentUndo`): each reads the current segments
+  // and writes a new list, so two at once would work from stale data.
+  const segmentOpBusyRef = useRef(false);
+  const [segmentOpBusy, setSegmentOpBusy] = useState(false);
+  const setOpBusy = useCallback((busy: boolean) => {
+    segmentOpBusyRef.current = busy;
+    setSegmentOpBusy(busy);
+  }, []);
+  // Edits wait their turn rather than being refused, so nothing a caller
+  // did (an AI proposal applied, a typed time, Mark In/Out) is lost.
+  // Undo/redo and Script cuts instead ignore input while busy, since a
+  // queued second undo would pop a stale stack.
+  const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  const runExclusive = useCallback(
+    <T,>(fn: () => Promise<T>): Promise<T> => {
+      const run = opChainRef.current.then(async () => {
+        setOpBusy(true);
+        try {
+          return await fn();
+        } finally {
+          setOpBusy(false);
+        }
+      });
+      opChainRef.current = run.catch(() => undefined);
+      return run;
+    },
+    [setOpBusy],
+  );
   const handleUndo = useCallback(async () => {
-    if (undoBusyRef.current) return;
+    if (segmentOpBusyRef.current) return;
     const action = undoStack[undoStack.length - 1];
     if (!action) return;
-    undoBusyRef.current = true;
     setUndoStack((prev) => prev.slice(0, -1));
     try {
-      await action.undo();
+      await runExclusive(() => action.undo());
       setRedoStack((prev) => [...prev, action]);
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
-    } finally {
-      undoBusyRef.current = false;
     }
-  }, [undoStack]);
+  }, [undoStack, runExclusive]);
 
   const handleRedo = useCallback(async () => {
-    if (undoBusyRef.current) return;
+    if (segmentOpBusyRef.current) return;
     const action = redoStack[redoStack.length - 1];
     if (!action) return;
-    undoBusyRef.current = true;
     setRedoStack((prev) => prev.slice(0, -1));
     try {
-      await action.redo();
+      await runExclusive(() => action.redo());
       setUndoStack((prev) => [...prev, action]);
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
-    } finally {
-      undoBusyRef.current = false;
     }
-  }, [redoStack]);
+  }, [redoStack, runExclusive]);
 
-  /** Runs a word edit and, if it changed anything, records one entry on
-   * this page's undo stack that steps the word history back/forward. */
-  const { undo: undoWords, redo: redoWords } = wordEdits;
-  const withWordUndo = useCallback(
-    (edit: () => boolean) => {
-      if (!edit()) return;
-      pushUndo({
-        undo: async () => {
-          undoWords();
-        },
-        redo: async () => {
-          redoWords();
-        },
-      });
-    },
-    [pushUndo, undoWords, redoWords],
-  );
-  const { remove: removeWords, restore: restoreWords, setPauseAction, cleanUp } = wordEdits;
-  const handleRemoveWords = useCallback((idxs: number[]) => withWordUndo(() => removeWords(idxs)), [withWordUndo, removeWords]);
-  const handleRestoreWords = useCallback((idxs: number[]) => withWordUndo(() => restoreWords(idxs)), [withWordUndo, restoreWords]);
-  const handlePauseAction = useCallback(
-    (afterWordId: string, action: PauseAction | null) => withWordUndo(() => setPauseAction([afterWordId], action)),
-    [withWordUndo, setPauseAction],
-  );
-  const handleCleanUp = useCallback(
-    (fillerIdxs: number[], pauseWordIds: string[]) => withWordUndo(() => cleanUp(fillerIdxs, pauseWordIds)),
-    [withWordUndo, cleanUp],
-  );
 
   /** "Get word timings": one Whisper pass storing word timestamps for the
    * whole video (user-triggered only, since it's a paid call). */
@@ -819,25 +835,21 @@ export default function LessonSegmentsView({
     setFetchingWords(true);
     clearProgress(videoId);
     try {
-      await flushWords();
-      const wordRows = await fetchWordTimestamps(videoId, 1);
-      loadWords(wordRows, []);
-      // Old word-edit undo entries no longer apply to the new words.
-      setUndoStack([]);
-      setRedoStack([]);
+      setWords(await fetchWordTimestamps(videoId, 1));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setFetchingWords(false);
     }
-  }, [fetchingWords, videoId, clearProgress, flushWords, loadWords]);
+  }, [fetchingWords, videoId, clearProgress]);
 
-  const editSummary = useMemo(
-    () => summarizeEdits(wordEdits.words, video?.duration ?? 0, pauses, wordEdits.pauseActions),
-    [wordEdits.words, video?.duration, pauses, wordEdits.pauseActions],
+  // Length now, and before Script cuts: the cut gaps inside each script
+  // block (see `scriptBlocks`) are what the Script tab shows as removed.
+  const lessonLengthAfter = useMemo(() => totalLength(segments), [segments]);
+  const lessonLength = useMemo(
+    () => scriptBlocks(segments).reduce((sum, block) => sum + (block.end - block.start), 0),
+    [segments],
   );
-  const lessonLength = useMemo(() => lengthAfterCuts(segments, []), [segments]);
-  const lessonLengthAfter = useMemo(() => lengthAfterCuts(segments, editSummary.cuts), [segments, editSummary.cuts]);
 
   // The Final player stays mounted (hidden) while Original shows, so its
   // ref is always there to seek.
@@ -897,18 +909,55 @@ export default function LessonSegmentsView({
   // this instead of calling `fetchSegments` itself, so each one gets
   // undo/redo "for free" without a bespoke inverse.
   const withSegmentUndo = useCallback(
-    async (mutate: () => Promise<void>) => {
-      const before = segments.map((segment) => ({ start: segment.start, end: segment.end }));
-      await mutate();
-      const after = await listLessonSegments(lessonId);
-      setSegments(after);
-      const afterRanges = after.map((segment) => ({ start: segment.start, end: segment.end }));
-      pushUndo({
-        undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
-        redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
-      });
+    (mutate: () => Promise<void>): Promise<boolean> =>
+      runExclusive(async () => {
+        // Read from the database, not state: a queued edit must start from
+        // the result of the one before it.
+        const before = (await listLessonSegments(lessonId)).map((segment) => ({
+          start: segment.start,
+          end: segment.end,
+        }));
+        await mutate();
+        const after = await listLessonSegments(lessonId);
+        setSegments(after);
+        const afterRanges = after.map((segment) => ({ start: segment.start, end: segment.end }));
+        // An empty "before" can't be restored (a lesson needs a segment).
+        if (before.length > 0) {
+          pushUndo({
+            undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
+            redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+          });
+        }
+        return true;
+      }),
+    [lessonId, pushUndo, runExclusive],
+  );
+
+  /** Script tab edits: replace the lesson's segments with `ranges` as one
+   * segment undo step. Resolves true once saved (false if refused, a no-op,
+   * or another segment change was running). */
+  const handleApplyScriptRanges = useCallback(
+    async (ranges: Range[]): Promise<boolean> => {
+      if (segmentOpBusyRef.current) return false;
+      const unchanged =
+        ranges.length === segments.length &&
+        ranges.every((range, i) => range.start === segments[i].start && range.end === segments[i].end);
+      if (unchanged) return false;
+      if (ranges.length === 0) {
+        setSegmentsError("That would remove everything in this lesson. Delete the lesson from the Lessons page instead.");
+        return false;
+      }
+      try {
+        return await withSegmentUndo(async () => {
+          await applySegmentSnapshot(lessonId, ranges);
+        });
+      } catch (err) {
+        setSegmentsError(err instanceof Error ? err.message : String(err));
+        void fetchSegments();
+        return false;
+      }
     },
-    [segments, lessonId, pushUndo],
+    [segments, withSegmentUndo, lessonId, fetchSegments],
   );
 
   // Submits the outer prompt box: always starts from this lesson's real,
@@ -1042,16 +1091,13 @@ export default function LessonSegmentsView({
       const dir = await open({ directory: true });
       if (!dir || typeof dir !== "string") return;
       setExporting(true);
-      // Word edits don't change exports yet (Phase 3b), but save them
-      // first so the database matches what the user sees.
-      await flushWords();
       await queueExport([lessonId], dir);
     } catch (err) {
       setExportError(err instanceof Error ? err.message : String(err));
     } finally {
       setExporting(false);
     }
-  }, [exporting, lessonId, flushWords]);
+  }, [exporting, lessonId]);
 
   const commitSegmentStart = useCallback(
     async (segment: LessonSegment) => {
@@ -1274,21 +1320,24 @@ export default function LessonSegmentsView({
       // Not routed through `withSegmentUndo` — a delete that takes the
       // whole lesson down with it (see below) leaves nothing on this page
       // to restore a snapshot into, so it must never push an undo entry.
-      const before = segments.map((s) => ({ start: s.start, end: s.end }));
-      const result = await deleteLessonSegment(segment.id);
-      if (result.lesson_deleted) {
-        // The lesson itself no longer exists — nothing left to edit here.
-        onNavigateLessons();
-        return;
-      }
-      const after = await listLessonSegments(lessonId);
-      setSegments(after);
-      const afterRanges = after.map((s) => ({ start: s.start, end: s.end }));
-      pushUndo({
-        undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
-        redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+      // Still under the shared lock, after any edit already running.
+      await runExclusive(async () => {
+        const before = (await listLessonSegments(lessonId)).map((s) => ({ start: s.start, end: s.end }));
+        const result = await deleteLessonSegment(segment.id);
+        if (result.lesson_deleted) {
+          // The lesson itself no longer exists — nothing left to edit here.
+          onNavigateLessons();
+          return;
+        }
+        const after = await listLessonSegments(lessonId);
+        setSegments(after);
+        const afterRanges = after.map((s) => ({ start: s.start, end: s.end }));
+        pushUndo({
+          undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
+          redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+        });
+        setSegmentsError(null);
       });
-      setSegmentsError(null);
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1298,7 +1347,7 @@ export default function LessonSegmentsView({
         return next;
       });
     }
-  }, [segments, pendingDeleteSegment, lessonId, onNavigateLessons, pushUndo]);
+  }, [pendingDeleteSegment, lessonId, onNavigateLessons, pushUndo, runExclusive]);
 
   // Swaps `segments[index]` with its neighbor at `index + direction` (-1 =
   // up/earlier, +1 = down/later) — playback order only, doesn't touch any
@@ -1534,7 +1583,11 @@ export default function LessonSegmentsView({
           {/* Tabs on the left, one sticky video on the right
              (docs/text-editing-plan.md §6.3). Tab panels stay mounted and
              are only hidden, so drafts in one survive switching to another. */}
-          <div className="mt-4 grid grid-cols-[minmax(0,1fr)_minmax(20rem,42%)] items-start gap-6 max-[1000px]:grid-cols-1">
+          <div
+            ref={editorGridRef}
+            className="mt-4 grid grid-cols-[minmax(0,1fr)_12px_var(--preview-w,42%)] items-start gap-3 max-[1000px]:grid-cols-1"
+            style={previewWidth ? ({ "--preview-w": `${previewWidth}px` } as React.CSSProperties) : undefined}
+          >
             <div className="min-w-0 max-[1000px]:order-2">
               <div
                 role="tablist"
@@ -1566,20 +1619,15 @@ export default function LessonSegmentsView({
                   active={tab === "script"}
                   lessonSegments={segments}
                   transcriptSegments={transcriptSegments}
-                  words={wordEdits.words}
+                  words={words}
                   pauses={pauses}
                   pausesByWordId={pausesByWordId}
-                  pauseActions={wordEdits.pauseActions}
-                  videoDuration={video.duration ?? 0}
-                  readOnly={fetchingWords}
-                  hasWords={wordEdits.words.length > 0}
+                  busy={segmentOpBusy || fetchingWords}
                   fetchingWords={fetchingWords}
                   fetchDetail={videoProgressMap[videoId]?.detail ?? null}
                   onFetchWords={() => void handleFetchWords()}
-                  onRemove={handleRemoveWords}
-                  onRestore={handleRestoreWords}
-                  onPauseAction={handlePauseAction}
-                  onCleanUp={handleCleanUp}
+                  onApplyRanges={handleApplyScriptRanges}
+                  hasTimedLayers={overlays.length > 0 || regionEditor.previewRegions.length > 0}
                   onUndo={() => void handleUndo()}
                   undoDepth={undoStack.length}
                   onSeek={handleScriptSeek}
@@ -2138,11 +2186,36 @@ export default function LessonSegmentsView({
               </div>
             </div>
 
-            {/* `lesson-segments-preview-row` keeps styles.css's shared
-               player height. Solid background and no backdrop-filter, so
-               the players' fixed-position fullscreen overlays aren't
-               trapped (see the note on the old preview row). */}
-            <aside className="lesson-segments-preview-row sticky top-0 z-30 min-w-0 self-start bg-background pt-2 max-[1000px]:static max-[1000px]:order-1">
+            {/* Drag to resize the video column; double-click resets it. */}
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize video"
+              tabIndex={0}
+              title="Drag to resize the video. Double-click to reset."
+              className="group sticky top-0 flex h-[70vh] cursor-col-resize touch-none items-center justify-center self-start max-[1000px]:hidden"
+              onPointerDown={handleDividerPointerDown}
+              onDoubleClick={() => savePreviewWidth(null)}
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+                event.preventDefault();
+                event.stopPropagation();
+                const current = previewWidth ?? asideRef.current?.getBoundingClientRect().width ?? 480;
+                savePreviewWidth(clampPreviewWidth(current + (event.key === "ArrowLeft" ? 40 : -40)));
+              }}
+            >
+              <span className="h-full w-px bg-border transition-colors group-hover:w-0.5 group-hover:bg-foreground/50 group-focus-visible:w-0.5 group-focus-visible:bg-foreground/50" />
+            </div>
+
+            {/* Fills its column at the video's own aspect ratio
+               (`.lesson-editor-player` in styles.css). Solid background and
+               no backdrop-filter, so the players' fixed-position fullscreen
+               overlays aren't trapped (see the note on the old preview
+               row). */}
+            <aside
+              ref={asideRef}
+              className="lesson-editor-player sticky top-0 z-30 min-w-0 self-start bg-background pt-2 max-[1000px]:static max-[1000px]:order-1"
+            >
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                 <div className="inline-flex rounded-md border border-border p-0.5 text-sm" role="group" aria-label="Which video">
                   {(["final", "original"] as const).map((view) => (
@@ -2160,21 +2233,10 @@ export default function LessonSegmentsView({
                     </button>
                   ))}
                 </div>
-                {playerView === "final" && wordEdits.words.length > 0 && (
-                  <label className="flex cursor-pointer items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={skipRemoved}
-                      onChange={(event) => setSkipRemoved(event.target.checked)}
-                    />
-                    Skip removed parts
-                  </label>
-                )}
               </div>
-              <div className="lesson-card-preview lesson-segments-preview" hidden={playerView !== "final"}>
+              <div className="lesson-card-preview" hidden={playerView !== "final"}>
                   <LessonPreviewPlayer
                     ref={lessonPlayerRef}
-                    skipRanges={skipRemoved ? editSummary.cuts : undefined}
                     onFrameTime={handleFrameTime}
                     videoFilePath={video.file_path}
                     segments={segments}

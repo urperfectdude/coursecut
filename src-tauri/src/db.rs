@@ -1112,6 +1112,83 @@ fn reorder_lesson_segments_tx(
     Ok(())
 }
 
+/// Replaces a lesson's segments with `ranges`, in that order, in one
+/// transaction (text editing: a Script-tab cut or restore, and undo/redo of
+/// any segment edit, rewrite many rows at once and must not be left half
+/// done by a crash or an error). Existing rows keep their ids, in order;
+/// extra rows are deleted and missing ones inserted. Rejects an empty list
+/// (deleting the lesson is a separate, explicit action) and any range with
+/// `start >= end`.
+fn replace_lesson_segments_tx(
+    tx: &rusqlite::Transaction<'_>,
+    lesson_id: &str,
+    ranges: &[SegmentRange],
+) -> Result<Vec<LessonSegmentRow>, String> {
+    if ranges.is_empty() {
+        return Err("a lesson needs at least one segment".to_string());
+    }
+    if let Some(bad) = ranges.iter().find(|range| !(range.start < range.end)) {
+        return Err(format!(
+            "invalid segment range: start ({}) must be before end ({})",
+            bad.start, bad.end
+        ));
+    }
+    let lesson = query_lesson(tx, lesson_id)?;
+    let existing: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM lesson_segments WHERE lesson_id = ?1 ORDER BY sort_order, id")
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(params![lesson_id], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())?
+    };
+    for (order, range) in ranges.iter().enumerate() {
+        match existing.get(order) {
+            Some(id) => tx.execute(
+                "UPDATE lesson_segments SET start = ?1, end = ?2, sort_order = ?3 WHERE id = ?4",
+                params![range.start, range.end, order as i64, id],
+            ),
+            None => tx.execute(
+                "INSERT INTO lesson_segments (id, lesson_id, start, end, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![uuid::Uuid::new_v4().to_string(), lesson_id, range.start, range.end, order as i64],
+            ),
+        }
+        .map_err(|err| err.to_string())?;
+    }
+    for id in existing.iter().skip(ranges.len()) {
+        tx.execute("DELETE FROM lesson_segments WHERE id = ?1", params![id])
+            .map_err(|err| err.to_string())?;
+    }
+    recompute_lesson_bounds_tx(tx, lesson_id)?;
+    resequence_lessons(tx, &lesson.video_id)?;
+
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, lesson_id, start, end, sort_order FROM lesson_segments
+             WHERE lesson_id = ?1 ORDER BY sort_order, id",
+        )
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map(params![lesson_id], row_to_lesson_segment)
+        .map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn replace_lesson_segments(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+    ranges: Vec<SegmentRange>,
+) -> Result<Vec<LessonSegmentRow>, String> {
+    let mut conn = conn.0.lock().map_err(|err| err.to_string())?;
+    let tx = conn.transaction().map_err(|err| err.to_string())?;
+    let result = replace_lesson_segments_tx(&tx, &lesson_id, &ranges)?;
+    tx.commit().map_err(|err| err.to_string())?;
+    Ok(result)
+}
+
 #[tauri::command]
 pub fn reorder_lesson_segments(
     conn: tauri::State<'_, DbConnection>,
@@ -2383,6 +2460,26 @@ mod lesson_editing_tests {
             |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?)),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn replace_lesson_segments_splits_keeps_ids_and_rejects_empty() {
+        let mut conn = seeded_conn();
+        let tx = conn.transaction().unwrap();
+        let range = |start: f64, end: f64| SegmentRange { start, end };
+        let rows = replace_lesson_segments_tx(&tx, "l0", &[range(0.0, 4.0), range(5.0, 10.0)]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "s0", "first row keeps its id");
+        assert_eq!((rows[1].start, rows[1].end, rows[1].sort_order), (5.0, 10.0, 1));
+
+        let rows = replace_lesson_segments_tx(&tx, "l0", &[range(0.0, 10.0)]).unwrap();
+        assert_eq!(rows.len(), 1, "joining deletes the extra row");
+        assert_eq!(rows[0].id, "s0");
+
+        assert!(replace_lesson_segments_tx(&tx, "l0", &[]).is_err());
+        assert!(replace_lesson_segments_tx(&tx, "l0", &[range(3.0, 3.0)]).is_err());
+        let lesson = query_lesson(&tx, "l0").unwrap();
+        assert_eq!((lesson.start, lesson.end), (0.0, 10.0), "bounds recomputed");
     }
 
     #[test]

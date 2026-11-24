@@ -8,44 +8,10 @@
  */
 
 import type { PauseAction, TranscriptSegment, TranscriptWord } from "../db";
-import { getCutRanges, getEditedDuration, type TimeRange, type Word } from "./text-edit.ts";
+import type { TimeRange } from "./text-edit.ts";
 
 /** How long after a word's end it still counts as the active word. */
 const ACTIVE_WORD_TAIL_S = 0.15;
-
-/** Our stored words → the shape `text-edit.ts` works on. `idx` is the
- * numeric id: contiguous 0..n per video, and the DOM key (`data-wid`). */
-export function toEditWords(words: readonly TranscriptWord[]): Word[] {
-  return words.map((word) => ({
-    id: word.idx,
-    text: word.text,
-    start: word.start,
-    end: word.end,
-    speaker: -1,
-    deleted: word.removed,
-  }));
-}
-
-export interface EditSummary {
-  cuts: TimeRange[];
-  editedDuration: number;
-}
-
-/** All cuts: removed words plus decided pauses, merged. */
-export function summarizeEdits(
-  words: readonly TranscriptWord[],
-  duration: number,
-  pauses: readonly Pause[] = [],
-  pauseActions: ReadonlyMap<string, PauseAction> = new Map(),
-): EditSummary {
-  if (duration <= 0) return { cuts: [], editedDuration: 0 };
-  const pauseCuts = pauses.flatMap((pause) => {
-    const cut = pauseCut(pause, pauseActions.get(pause.afterWordId));
-    return cut ? [cut] : [];
-  });
-  const cuts = getCutRanges(toEditWords(words), duration, pauseCuts);
-  return { cuts, editedDuration: getEditedDuration(cuts, duration) };
-}
 
 /** Index (into `words`, sorted by start) of the word playing at `time`, or -1. */
 export function findActiveWordIndex(words: readonly TranscriptWord[], time: number): number {
@@ -303,19 +269,3 @@ function syntheticSegment(range: { id: string; start: number; end: number }): Tr
   return { id: range.id, video_id: "", start: range.start, end: range.end, text: "", keep: true };
 }
 
-/** Total length of `ranges` minus the parts covered by `cuts`. */
-export function lengthAfterCuts(
-  ranges: readonly { start: number; end: number }[],
-  cuts: readonly TimeRange[],
-): number {
-  let total = 0;
-  for (const range of ranges) {
-    let length = Math.max(0, range.end - range.start);
-    for (const cut of cuts) {
-      const overlap = Math.min(range.end, cut.end) - Math.max(range.start, cut.start);
-      if (overlap > 0) length -= overlap;
-    }
-    total += Math.max(0, length);
-  }
-  return total;
-}

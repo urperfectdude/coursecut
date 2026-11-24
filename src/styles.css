@@ -92,18 +92,13 @@ body {
   margin-top: 0.5rem;
 }
 
-/* `LessonSegmentsView` reuses `.lesson-card-preview`'s video/controls
- * styling for its own (larger, full-page) preview. */
-.lesson-segments-preview {
-  max-width: 40rem;
-}
 
 /* Side-by-side lesson preview + raw source preview on `LessonSegmentsView`
  * — the lesson's own stitched clip next to the full original recording, so
  * the user can scrub the source for a boundary without leaving the page.
  * Flex layout, gap, max-widths, and the ">>" arrow/label styling are all
  * Tailwind utilities directly on the elements now (Phase 6 of the shadcn
- * migration) — `.lesson-segments-preview-row` and
+ * migration) — `.lesson-editor-player` and
  * `.lesson-segments-source-preview` are kept as classNames only as the CSS
  * hooks the two rules below (and `.lesson-card-preview`/`.lesson-segments-
  * preview` above) still target by name. */
@@ -112,22 +107,29 @@ body {
   max-width: none;
 }
 
-/* Force both players to the same frame height regardless of each video's
- * own intrinsic aspect ratio — without this, `width: 100%` + `max-height`
- * (set via Tailwind utilities directly on each `<video>` now, Phase 5 of the
- * shadcn migration) only caps height, so two differently-shaped recordings
- * render at different heights side by side. `object-fit: contain`
- * letterboxes into that fixed height instead of distorting either video. */
-.lesson-segments-preview-row .lesson-card-video,
-.lesson-segments-preview-row .source-preview-video {
-  height: 25vh;
-  max-height: 25vh;
+
+/* The lesson editor's single player column (`LessonSegmentsView`, tabs on
+ * the left, video on the right): the video fills the column's width at its
+ * own aspect ratio, capped at 75% of the window height. Declared before
+ * the fullscreen escape hatch below, which has equal specificity and so
+ * still wins in fullscreen. (This replaced the old side-by-side layout's
+ * fixed 25vh player height.) */
+.lesson-editor-player .lesson-card-video,
+.lesson-editor-player .source-preview-video {
+  width: 100%;
+  height: auto;
+  max-height: 75vh;
   object-fit: contain;
+}
+.lesson-editor-player .source-preview,
+.lesson-editor-player .lesson-card-preview {
+  max-width: none;
+  margin-top: 0;
 }
 
 /* Fullscreen escape hatch for the rule above — equal specificity to it, so
  * source order (this rule comes after) makes it win once either player's
- * fullscreen wrapper hook className is present. Without this, the 25vh cap
+ * fullscreen wrapper hook className is present. Without this, the 75vh cap
  * above always wins over the fullscreen `<video>`'s own Tailwind
  * `max-h-[82vh]` utility, since it's unlayered CSS and Tailwind utilities
  * are declared inside `@layer utilities` (unlayered always beats layered,
@@ -142,7 +144,7 @@ body {
 /* `LessonPreviewPlayer.tsx` is now styled with Tailwind utilities directly
  * (Phase 5 of the shadcn migration) — `.lesson-card-video` is kept on its
  * `<video>` only as a CSS hook for the shared-height override rule just
- * above (`.lesson-segments-preview-row .lesson-card-video`). */
+ * above (`.lesson-editor-player .lesson-card-video`). */
 
 @theme inline {
   --font-heading: var(--font-sans);
