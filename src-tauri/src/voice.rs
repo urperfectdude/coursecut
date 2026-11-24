@@ -129,7 +129,7 @@ pub struct VoiceLineInput {
 }
 
 /// How a line was placed in the track.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VoiceLinePlacement {
     /// Where the clip actually starts (later than asked if the line before
     /// ran long).
@@ -142,7 +142,7 @@ pub struct VoiceLinePlacement {
     pub late_by: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceTrack {
     /// WAV file in the app cache, for the preview player.
     pub path: String,
@@ -336,18 +336,24 @@ fn validate_lines(lines: &[VoiceLineInput], lesson_length: f64) -> Result<(), St
 /// Generates (or reuses) a clip per line and builds the lesson's voice
 /// track: a mono 24 kHz WAV as long as the lesson, saved in the app cache
 /// for the preview player. Emits `"voice-progress"` while generating.
+///
+/// The finished track is saved as the lesson's voice (`lesson_voice`), with
+/// the editor's `signature` and a hash of the script as it is now, so the
+/// editor finds it again and exports can use it.
 #[tauri::command]
 pub async fn generate_lesson_voice(
     app: AppHandle,
     lesson_id: String,
     lines: Vec<VoiceLineInput>,
     lesson_length: f64,
+    signature: String,
 ) -> Result<VoiceTrack, String> {
     validate_lines(&lines, lesson_length)?;
-    let settings = {
+    // Hashed before generating: the lines were built from this state.
+    let (settings, hash) = {
         let conn = app.state::<DbConnection>();
         let guard = conn.0.lock().map_err(|err| err.to_string())?;
-        read_voice_settings(&guard)?
+        (read_voice_settings(&guard)?, script_hash(&guard, &lesson_id)?)
     };
     // The privacy opt-in, enforced here and not only in the UI.
     if !settings.enabled {
@@ -469,13 +475,299 @@ pub async fn generate_lesson_voice(
     }
 
     let late_lines = placements.iter().filter(|p| p.late_by > LATE_TOLERANCE_S).count();
-    Ok(VoiceTrack {
+    let track = VoiceTrack {
         path: track_path.to_string_lossy().to_string(),
         duration,
         lines: placements,
         generated,
         late_lines,
-    })
+    };
+    {
+        let conn = app.state::<DbConnection>();
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        save_lesson_voice(&guard, &lesson_id, &signature, &hash, &track)?;
+    }
+    Ok(track)
+}
+
+const IMPROVE_SYSTEM_PROMPT: &str = "You polish one line of a training video's script so it reads \
+well aloud in a studio voice. The line was transcribed from a trainer speaking off the cuff. \
+Fix grammar, drop filler words, false starts and repetitions, and make the phrasing clear and \
+natural. Keep the meaning, the order of ideas, product names, field names, menu paths and \
+technical terms exactly. Do not add facts, greetings or new sentences. The new line must not be \
+longer than the original (it has to fit the same time slot); shorter is better when nothing is \
+lost. The neighbouring lines are context only: never repeat or rewrite them. Reply with JSON: \
+{\"text\": \"<the improved line>\"}.";
+
+#[derive(Deserialize)]
+struct ImprovedLine {
+    text: String,
+}
+
+/// Rewrites one script line for clearer delivery with GPT-5.5 and returns
+/// the suggestion; nothing is saved (the editor applies it as a text edit
+/// if the user accepts). Network: the line's text and its two neighbours'
+/// text, only (privacy invariant 3: lesson script text, behind the AI
+/// voice opt-in, checked here).
+#[tauri::command]
+pub async fn improve_voice_line(
+    app: AppHandle,
+    text: String,
+    previous: Option<String>,
+    next: Option<String>,
+) -> Result<String, String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("This line has no text.".to_string());
+    }
+    if text.chars().count() > MAX_LINE_CHARS {
+        return Err(format!("This line is over {MAX_LINE_CHARS} characters."));
+    }
+    let enabled = {
+        let conn = app.state::<DbConnection>();
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        read_voice_settings(&guard)?.enabled
+    };
+    if !enabled {
+        return Err("AI voice is off. Turn it on in Settings first.".to_string());
+    }
+    let api_key = crate::settings::read_stored_key()?
+        .ok_or_else(|| "No OpenAI API key saved. Add one in Settings.".to_string())?;
+
+    let clip = |line: Option<String>| -> String {
+        line.map(|l| l.trim().chars().take(600).collect::<String>())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| "(none)".to_string())
+    };
+    let user_prompt = format!(
+        "Previous line (context): {}\nNext line (context): {}\n\nLine to improve ({} characters): {}",
+        clip(previous),
+        clip(next),
+        text.chars().count(),
+        text
+    );
+    let body = serde_json::json!({
+        "model": "gpt-5.5",
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": IMPROVE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    });
+    let request = reqwest::Client::new()
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(&api_key)
+        .json(&body)
+        .send();
+    let response = match tokio::time::timeout(std::time::Duration::from_secs(90), request).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => return Err(format!("GPT-5.5 request failed: {err}")),
+        Err(_) => return Err("GPT-5.5 request timed out".to_string()),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let message: String = response.text().await.unwrap_or_default().chars().take(300).collect();
+        return Err(format!("GPT-5.5 returned {status}: {message}"));
+    }
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|err| format!("could not parse GPT-5.5 response: {err}"))?;
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| "GPT-5.5 response had no message content".to_string())?;
+    parse_improved_line(content)
+}
+
+fn parse_improved_line(content: &str) -> Result<String, String> {
+    let improved: ImprovedLine =
+        serde_json::from_str(content).map_err(|_| "GPT-5.5 didn't return a line.".to_string())?;
+    let text = improved.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return Err("GPT-5.5 returned an empty line.".to_string());
+    }
+    if text.chars().count() > MAX_LINE_CHARS {
+        return Err("GPT-5.5 returned a line that's too long.".to_string());
+    }
+    Ok(text)
+}
+
+/// A hash of everything the lesson's voice script is built from: its
+/// segments in play order, the words inside them (text fixes included) and
+/// the sentences those words belong to (for punctuation). Any edit that
+/// could change the script or its timing changes it.
+pub(crate) fn script_hash(conn: &Connection, lesson_id: &str) -> Result<String, String> {
+    let video_id: String = conn
+        .query_row("SELECT video_id FROM lessons WHERE id = ?1", params![lesson_id], |row| row.get(0))
+        .map_err(|err| format!("could not find lesson: {err}"))?;
+    let mut segments_stmt = conn
+        .prepare("SELECT start, end FROM lesson_segments WHERE lesson_id = ?1 ORDER BY sort_order, id")
+        .map_err(|err| err.to_string())?;
+    let segments: Vec<(f64, f64)> = segments_stmt
+        .query_map(params![lesson_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|err| err.to_string())?;
+    let mut words_stmt = conn
+        .prepare(
+            "SELECT idx, text, start, end FROM transcript_words
+             WHERE video_id = ?1 AND start >= ?2 AND start < ?3 ORDER BY start, idx",
+        )
+        .map_err(|err| err.to_string())?;
+    let mut sentences_stmt = conn
+        .prepare(
+            "SELECT text, start, end FROM transcript_segments
+             WHERE video_id = ?1 AND end > ?2 AND start < ?3 ORDER BY start",
+        )
+        .map_err(|err| err.to_string())?;
+
+    let mut hasher = Sha256::new();
+    for (start, end) in segments {
+        hasher.update(format!("S{start:.3}:{end:.3}\0").as_bytes());
+        let rows = words_stmt
+            .query_map(params![video_id, start, end], |row| {
+                Ok(format!(
+                    "W{}:{}:{:.3}:{:.3}\0",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?
+                ))
+            })
+            .map_err(|err| err.to_string())?;
+        for row in rows {
+            hasher.update(row.map_err(|err| err.to_string())?.as_bytes());
+        }
+        let rows = sentences_stmt
+            .query_map(params![video_id, start, end], |row| {
+                Ok(format!(
+                    "T{}:{:.3}:{:.3}\0",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?
+                ))
+            })
+            .map_err(|err| err.to_string())?;
+        for row in rows {
+            hasher.update(row.map_err(|err| err.to_string())?.as_bytes());
+        }
+    }
+    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Saves (or replaces) the lesson's voice. A regenerated voice keeps the
+/// lesson's "use in exports" choice.
+fn save_lesson_voice(
+    conn: &Connection,
+    lesson_id: &str,
+    signature: &str,
+    hash: &str,
+    track: &VoiceTrack,
+) -> Result<(), String> {
+    let json = serde_json::to_string(track).map_err(|err| err.to_string())?;
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO lesson_voice (lesson_id, use_in_export, signature, script_hash, track_json, updated_at)
+         VALUES (?1, 1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(lesson_id) DO UPDATE SET signature = excluded.signature,
+           script_hash = excluded.script_hash, track_json = excluded.track_json,
+           updated_at = excluded.updated_at",
+        params![lesson_id, signature, hash, json, now],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// A lesson's saved voice, as the editor gets it back.
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedLessonVoice {
+    pub track: VoiceTrack,
+    pub signature: String,
+    pub use_in_export: bool,
+}
+
+/// The saved row, or `None` when there's none or its WAV is gone (the
+/// app cache was cleared; Generate rebuilds it).
+fn read_lesson_voice(conn: &Connection, lesson_id: &str) -> Result<Option<(SavedLessonVoice, String)>, String> {
+    let row: Option<(bool, String, String, String)> = conn
+        .query_row(
+            "SELECT use_in_export, signature, script_hash, track_json FROM lesson_voice WHERE lesson_id = ?1",
+            params![lesson_id],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+    let Some((use_in_export, signature, hash, json)) = row else {
+        return Ok(None);
+    };
+    let Ok(track) = serde_json::from_str::<VoiceTrack>(&json) else {
+        return Ok(None);
+    };
+    if !Path::new(&track.path).is_file() {
+        return Ok(None);
+    }
+    Ok(Some((
+        SavedLessonVoice {
+            track,
+            signature,
+            use_in_export,
+        },
+        hash,
+    )))
+}
+
+#[tauri::command]
+pub fn get_lesson_voice(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+) -> Result<Option<SavedLessonVoice>, String> {
+    let guard = conn.0.lock().map_err(|err| err.to_string())?;
+    Ok(read_lesson_voice(&guard, &lesson_id)?.map(|(saved, _)| saved))
+}
+
+#[tauri::command]
+pub fn set_lesson_voice_export(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+    use_in_export: bool,
+) -> Result<(), String> {
+    let guard = conn.0.lock().map_err(|err| err.to_string())?;
+    guard
+        .execute(
+            "UPDATE lesson_voice SET use_in_export = ?2 WHERE lesson_id = ?1",
+            params![lesson_id, use_in_export as i64],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// The voice track an export of this lesson should use: `None` when the
+/// lesson has no voice or it's switched off for exports. Refuses, rather
+/// than export an out-of-sync voice, when the lesson changed since the
+/// voice was made or its track is gone.
+pub(crate) fn voice_track_for_export(conn: &Connection, lesson_id: &str) -> Result<Option<VoiceTrack>, String> {
+    let use_in_export: Option<bool> = conn
+        .query_row(
+            "SELECT use_in_export FROM lesson_voice WHERE lesson_id = ?1",
+            params![lesson_id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+    if use_in_export != Some(true) {
+        return Ok(None);
+    }
+    let Some((saved, hash)) = read_lesson_voice(conn, lesson_id)? else {
+        return Err("This lesson's AI voice is missing. Open its AI voice tab and Generate again \
+                    (unchanged lines are free), or turn off \"Use the AI voice in exports\"."
+            .to_string());
+    };
+    if hash != script_hash(conn, lesson_id)? {
+        return Err("This lesson was edited after its AI voice was made. Open its AI voice tab and \
+                    Generate again, or turn off \"Use the AI voice in exports\"."
+            .to_string());
+    }
+    Ok(Some(saved.track))
 }
 
 #[cfg(test)]
@@ -555,6 +847,86 @@ mod tests {
         assert_ne!(base, clip_key("coral", "calm", "Hello."));
         assert_ne!(base, clip_key("coral", "", "Hello!"));
         assert_eq!(base, clip_key("coral", "", "Hello."));
+    }
+
+    fn lesson_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Test', 't', 't');
+             INSERT INTO videos (id, project_id, file_path, created_at, updated_at)
+               VALUES ('v1', 'p1', '/tmp/video.mp4', 't', 't');
+             INSERT INTO lessons (id, video_id, title, summary, start, end, sort_order, confidence, kind, source)
+               VALUES ('l1', 'v1', 'Lesson', 's', 0.0, 10.0, 0, 0.8, 'lesson', 'ai');
+             INSERT INTO lesson_segments (id, lesson_id, start, end, sort_order) VALUES ('s1', 'l1', 0.0, 10.0, 0);
+             INSERT INTO transcript_words (id, video_id, idx, text, start, end) VALUES ('w1', 'v1', 0, 'Hello', 1.0, 1.5);
+             INSERT INTO transcript_words (id, video_id, idx, text, start, end) VALUES ('w2', 'v1', 1, 'later', 12.0, 12.5);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn script_hash_follows_the_lessons_words_and_cuts_only() {
+        let conn = lesson_conn();
+        let base = script_hash(&conn, "l1").unwrap();
+        // A word outside the lesson doesn't matter.
+        conn.execute("UPDATE transcript_words SET text = 'Later' WHERE id = 'w2'", []).unwrap();
+        assert_eq!(base, script_hash(&conn, "l1").unwrap());
+        // A text fix inside it does.
+        conn.execute("UPDATE transcript_words SET text = 'Hi' WHERE id = 'w1'", []).unwrap();
+        let fixed = script_hash(&conn, "l1").unwrap();
+        assert_ne!(base, fixed);
+        // So does a cut.
+        conn.execute("UPDATE lesson_segments SET end = 8.0 WHERE id = 's1'", []).unwrap();
+        assert_ne!(fixed, script_hash(&conn, "l1").unwrap());
+    }
+
+    #[test]
+    fn export_uses_a_saved_voice_only_while_it_matches_the_lesson() {
+        let conn = lesson_conn();
+        assert!(voice_track_for_export(&conn, "l1").unwrap().is_none());
+
+        let wav = std::env::temp_dir().join(format!("coursecut-voice-test-{}.wav", uuid::Uuid::new_v4()));
+        std::fs::write(&wav, b"RIFF").unwrap();
+        let track = VoiceTrack {
+            path: wav.to_string_lossy().to_string(),
+            duration: 10.0,
+            lines: vec![],
+            generated: 0,
+            late_lines: 0,
+        };
+        let hash = script_hash(&conn, "l1").unwrap();
+        save_lesson_voice(&conn, "l1", "sig", &hash, &track).unwrap();
+        assert_eq!(voice_track_for_export(&conn, "l1").unwrap().unwrap().path, track.path);
+        let (saved, _) = read_lesson_voice(&conn, "l1").unwrap().unwrap();
+        assert!(saved.use_in_export);
+        assert_eq!(saved.signature, "sig");
+
+        // Switched off: the recording is exported.
+        conn.execute("UPDATE lesson_voice SET use_in_export = 0", []).unwrap();
+        assert!(voice_track_for_export(&conn, "l1").unwrap().is_none());
+        // Regenerating keeps that choice.
+        save_lesson_voice(&conn, "l1", "sig2", &hash, &track).unwrap();
+        assert!(voice_track_for_export(&conn, "l1").unwrap().is_none());
+        conn.execute("UPDATE lesson_voice SET use_in_export = 1", []).unwrap();
+
+        // Edited after the voice was made: refused.
+        conn.execute("UPDATE transcript_words SET text = 'Hi' WHERE id = 'w1'", []).unwrap();
+        assert!(voice_track_for_export(&conn, "l1").is_err());
+
+        // Track gone from the cache: refused, and the editor sees no voice.
+        std::fs::remove_file(&wav).unwrap();
+        assert!(voice_track_for_export(&conn, "l1").is_err());
+        assert!(read_lesson_voice(&conn, "l1").unwrap().is_none());
+    }
+
+    #[test]
+    fn improved_lines_are_parsed_and_tidied() {
+        assert_eq!(parse_improved_line(r#"{"text": "  Open the   Setup page. "}"#).unwrap(), "Open the Setup page.");
+        assert!(parse_improved_line(r#"{"text": "   "}"#).is_err());
+        assert!(parse_improved_line("not json").is_err());
     }
 
     #[test]

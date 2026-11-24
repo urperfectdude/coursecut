@@ -1085,7 +1085,88 @@ fn progress_closure(
 /// full-frame on top of everything, with the lecture audio muted there if
 /// asked. With no slides at all, nothing here is probed and every ffmpeg
 /// invocation is exactly what it was before slides existed.
+///
+/// When the lesson has an AI voice switched on for exports (`lesson_voice`),
+/// the video is first written to a temp file, then one more pass swaps its
+/// sound for the voice track (`ffmpeg::mux_voice_track`). A voice that no
+/// longer matches the lesson fails the export with a clear message instead.
 async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
+    let voice = {
+        let conn = app.state::<DbConnection>();
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        crate::voice::voice_track_for_export(&guard, &job.lesson_id)?
+    };
+    let Some(voice) = voice else {
+        return export_video(app, job, &job.output_path).await;
+    };
+
+    let temp_dir = segment_temp_dir(app, &job.id)?;
+    let silent_path = temp_dir.join("before-voice.mp4");
+    let Some(silent) = silent_path.to_str().map(str::to_string) else {
+        return Err("export temp path is not valid UTF-8".to_string());
+    };
+    let cleanup = || {
+        let _ = std::fs::remove_file(&silent);
+        let _ = std::fs::remove_dir(&temp_dir);
+    };
+    if let Err(err) = export_video(app, job, &silent).await {
+        cleanup();
+        return Err(err);
+    }
+    if is_cancelled(app, &job.id) {
+        cleanup();
+        return Err("export cancelled".to_string());
+    }
+
+    let slides = {
+        let conn = app.state::<DbConnection>();
+        let guard = conn.0.lock().map_err(|err| err.to_string())?;
+        db::query_lesson_slides(&guard, &job.lesson_id)?
+    };
+    let lesson_length: f64 = job
+        .segments
+        .iter()
+        .map(|segment| (segment.end - segment.start).max(0.0))
+        .sum();
+    let (delay, mutes, total) = voice_placement(&slides, lesson_length);
+    let result = crate::ffmpeg::mux_voice_track(
+        app,
+        &silent,
+        &voice.path,
+        &job.output_path,
+        delay,
+        &mutes,
+        total,
+        register_child_closure(app, &job.id),
+        |_| {},
+    )
+    .await;
+    deregister_child(app, &job.id);
+    cleanup();
+    result
+}
+
+/// Where the voice track (on the lesson's own timeline) goes in the export:
+/// delayed by an inserted intro, silenced under overlay slides that mute
+/// the lecture, and as long as the whole export (inserted outro included).
+fn voice_placement(slides: &[db::LessonSlideRow], lesson_length: f64) -> (f64, Vec<(f64, f64)>, f64) {
+    let inserted = |position: &str| {
+        slides
+            .iter()
+            .find(|slide| slide.mode == "insert" && slide.position == position)
+            .map_or(0.0, |slide| slide.duration.max(0.0))
+    };
+    let delay = inserted("intro");
+    let mutes = overlay_slide_windows(slides, lesson_length)
+        .into_iter()
+        .filter(|window| window.mute)
+        .map(|window| (window.start, window.end))
+        .collect();
+    (delay, mutes, delay + lesson_length + inserted("outro"))
+}
+
+/// The video part of `do_export`, written to `output_path`.
+async fn export_video(app: &AppHandle, job: &PendingExport, output_path: &str) -> Result<(), String> {
     if job.segments.is_empty() {
         return Err(format!(
             "lesson {} has no segments to export",
@@ -1136,7 +1217,7 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
             &job.video_path,
             segment.start,
             segment.end,
-            &job.output_path,
+            output_path,
             &overlays,
             &regions,
             &extras,
@@ -1213,7 +1294,7 @@ async fn do_export(app: &AppHandle, job: &PendingExport) -> Result<(), String> {
 
     let register_child = register_child_closure(app, &job.id);
     let concat_result =
-        crate::ffmpeg::concat_videos(app, &temp_paths, &job.output_path, register_child).await;
+        crate::ffmpeg::concat_videos(app, &temp_paths, output_path, register_child).await;
     deregister_child(app, &job.id);
 
     cleanup_segment_temp_files(&temp_dir, &temp_paths);
@@ -1885,6 +1966,15 @@ mod slide_export_tests {
             mute_audio: mute,
             created_at: "t".into(),
         }
+    }
+
+    #[test]
+    fn voice_follows_inserted_slides_and_muted_overlays() {
+        assert_eq!(voice_placement(&[], 10.0), (0.0, vec![], 10.0));
+        let slides = [slide("intro", "insert", 3.0, false), slide("outro", "insert", 2.0, false)];
+        assert_eq!(voice_placement(&slides, 10.0), (3.0, vec![], 15.0));
+        let slides = [slide("intro", "overlay", 4.0, true), slide("outro", "overlay", 2.0, false)];
+        assert_eq!(voice_placement(&slides, 10.0), (0.0, vec![(0.0, 4.0)], 10.0));
     }
 
     fn segments() -> Vec<SegmentBounds> {

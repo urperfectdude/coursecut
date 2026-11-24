@@ -1542,6 +1542,64 @@ pub async fn export_slide_piece(
     run_ffmpeg_with_progress(app, args, duration, register_child, on_progress).await
 }
 
+/// The final pass of an export with the AI voice (docs/hcm-improvements-plan.md
+/// §4, V2): keeps `video_path`'s picture as is (stream copy) and replaces its
+/// sound with `track_path`, the lesson's voice track. The track is on the
+/// lesson's own timeline, so it's silenced inside `mute_windows` (muted
+/// overlay slides, same timeline) and then delayed by `delay` seconds (an
+/// inserted intro), then padded with silence and trimmed to `total` seconds,
+/// the length of the whole export.
+pub(crate) fn voice_mux_args(
+    video_path: &str,
+    track_path: &str,
+    output_path: &str,
+    delay: f64,
+    mute_windows: &[(f64, f64)],
+    total: f64,
+) -> Vec<String> {
+    let mut chain: Vec<String> = Vec::new();
+    if !mute_windows.is_empty() {
+        let enable = mute_windows
+            .iter()
+            .map(|(start, end)| format!("gte(t,{start})*lt(t,{end})"))
+            .collect::<Vec<_>>()
+            .join("+");
+        chain.push(format!("volume=0:enable='{enable}'"));
+    }
+    if delay > 0.0 {
+        chain.push(format!("adelay={}:all=1", (delay * 1000.0).round() as i64));
+    }
+    chain.push(format!("apad=whole_dur={total:.3}"));
+    chain.push(format!("atrim=0:{total:.3}"));
+    let filter = format!("[1:a]{}[voice]", chain.join(","));
+    [
+        "-y", "-i", video_path, "-i", track_path, "-filter_complex", &filter, "-map", "0:v:0", "-map", "[voice]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats", output_path,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// Runs `voice_mux_args`. Same `register_child`/`on_progress` contract as
+/// `export_lesson`.
+#[allow(clippy::too_many_arguments)]
+pub async fn mux_voice_track(
+    app: &AppHandle,
+    video_path: &str,
+    track_path: &str,
+    output_path: &str,
+    delay: f64,
+    mute_windows: &[(f64, f64)],
+    total: f64,
+    register_child: impl FnMut(CommandChild) + Send,
+    on_progress: impl FnMut(f64) + Send,
+) -> Result<(), String> {
+    let args = voice_mux_args(video_path, track_path, output_path, delay, mute_windows, total);
+    run_ffmpeg_with_progress(app, args, total, register_child, on_progress).await
+}
+
 /// Spawns the ffmpeg sidecar with `args` (which must include `-progress
 /// pipe:1`) and reports progress against `duration` seconds of output, as
 /// described on `export_lesson`.
@@ -1731,6 +1789,31 @@ pub async fn concat_videos(
 
     let _ = std::fs::remove_file(&list_path);
     result
+}
+
+#[cfg(test)]
+mod voice_mux_tests {
+    use super::*;
+
+    #[test]
+    fn plain_voice_is_padded_to_the_export() {
+        let args = voice_mux_args("/v.mp4", "/t.wav", "/o.mp4", 0.0, &[], 12.0);
+        let filter = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert_eq!(filter, "[1:a]apad=whole_dur=12.000,atrim=0:12.000[voice]");
+        assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]));
+        assert!(args.windows(2).any(|w| w == ["-map", "0:v:0"]));
+        assert_eq!(args.last().unwrap(), "/o.mp4");
+    }
+
+    #[test]
+    fn intro_delays_and_muted_slides_silence_the_voice() {
+        let args = voice_mux_args("/v.mp4", "/t.wav", "/o.mp4", 3.0, &[(0.0, 2.0)], 15.0);
+        let filter = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert_eq!(
+            filter,
+            "[1:a]volume=0:enable='gte(t,0)*lt(t,2)',adelay=3000:all=1,apad=whole_dur=15.000,atrim=0:15.000[voice]"
+        );
+    }
 }
 
 #[cfg(test)]

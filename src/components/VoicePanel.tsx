@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, Loader2, Mic } from "lucide-react";
+import { AlertTriangle, Check, Loader2, Mic, Sparkles, X } from "lucide-react";
 import {
   AI_VOICES,
   generateLessonVoice,
   getVoiceSettings,
+  improveVoiceLine,
   saveVoiceSettings,
+  setLessonVoiceExport,
   type VoiceSettings,
   type VoiceTrack,
 } from "../db";
@@ -21,6 +23,8 @@ import { cn } from "@/lib/utils";
 export interface LessonVoiceState {
   track: VoiceTrack;
   signature: string;
+  /** Exports use this voice instead of the recording. */
+  useInExport: boolean;
 }
 
 export function voiceSignature(lines: readonly VoiceLine[], settings: VoiceSettings | null): string {
@@ -126,13 +130,16 @@ interface VoicePanelProps {
   listening: boolean;
   onListeningChange: (listening: boolean) => void;
   onSeek: (sourceTime: number) => void;
+  /** Replaces a line's text (a Script tab text edit over its words). */
+  onEditLine: (wordIdxs: number[], text: string) => void;
 }
 
 /**
  * The lesson editor's AI voice tab (HCM feature 4, first part): the script
  * the voice will read, one line per sentence, built from the words the
- * lesson keeps with the user's text fixes; Generate; and hearing it in the
- * Final video. Exports don't use the voice yet.
+ * lesson keeps with the user's text fixes; Generate; hearing it in the
+ * Final video; and whether exports use it. The voice is saved with the
+ * lesson, so the editor finds it again next time.
  */
 export default function VoicePanel({
   lessonId,
@@ -144,6 +151,7 @@ export default function VoicePanel({
   listening,
   onListeningChange,
   onSeek,
+  onEditLine,
 }: VoicePanelProps) {
   const { settings, error: settingsError, save } = useVoiceSettings();
   const [busy, setBusy] = useState(false);
@@ -171,6 +179,39 @@ export default function VoicePanel({
   useEffect(() => {
     if (stale && listening) onListeningChange(false);
   }, [stale, listening, onListeningChange]);
+  // AI Improve: suggestions per line, keyed by the line's text so one
+  // left over from an earlier wording never shows on the new text.
+  const [improving, setImproving] = useState<ReadonlySet<string>>(new Set());
+  const [suggestions, setSuggestions] = useState<ReadonlyMap<string, string>>(new Map());
+  const [improveErrors, setImproveErrors] = useState<ReadonlyMap<string, string>>(new Map());
+  const lineKey = (line: VoiceLine) => `${line.wordIdxs[0]}:${line.text}`;
+  const without = <T,>(map: ReadonlyMap<string, T>, key: string) => {
+    const next = new Map(map);
+    next.delete(key);
+    return next;
+  };
+
+  async function improve(i: number) {
+    const line = lines[i];
+    const key = lineKey(line);
+    if (improving.has(key)) return;
+    setImproving((prev) => new Set(prev).add(key));
+    setImproveErrors((prev) => without(prev, key));
+    try {
+      const text = await improveVoiceLine(line.text, lines[i - 1]?.text ?? null, lines[i + 1]?.text ?? null);
+      if (text === line.text) setImproveErrors((prev) => new Map(prev).set(key, "Already reads well; no change."));
+      else setSuggestions((prev) => new Map(prev).set(key, text));
+    } catch (err) {
+      setImproveErrors((prev) => new Map(prev).set(key, err instanceof Error ? err.message : String(err)));
+    } finally {
+      setImproving((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  }
+
   const totalChars = useMemo(() => lines.reduce((sum, line) => sum + line.text.length, 0), [lines]);
 
   async function generate() {
@@ -183,8 +224,9 @@ export default function VoicePanel({
         lessonId,
         lines.map((line) => ({ text: line.text, start: line.start, end: line.end })),
         lessonLength,
+        signature,
       );
-      onVoice({ track, signature });
+      onVoice({ track, signature, useInExport: voice?.useInExport ?? true });
       onListeningChange(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -250,9 +292,25 @@ export default function VoicePanel({
               Hear the AI voice in the Final video
             </label>
           )}
+          {voice && (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={voice.useInExport}
+                onChange={(event) => {
+                  const useInExport = event.target.checked;
+                  onVoice({ ...voice, useInExport });
+                  setLessonVoiceExport(lessonId, useInExport).catch((err) =>
+                    setError(err instanceof Error ? err.message : String(err)),
+                  );
+                }}
+              />
+              Use the AI voice in exports
+            </label>
+          )}
           <span className="w-full text-xs text-muted-foreground">
             {lines.length} lines, {totalChars.toLocaleString()} characters. Only new or changed lines are sent;
-            unchanged ones are reused. Exports still use your recorded voice for now.
+            unchanged ones are reused.
           </span>
         </div>
       )}
@@ -260,6 +318,7 @@ export default function VoicePanel({
       {stale && (
         <p className="m-0 text-sm text-amber-400">
           The script or voice changed since this voice was made. Generate again to update it.
+          {voice?.useInExport && " Exports never use an out-of-date script: they stop with an error until you do."}
         </p>
       )}
       {voice && !stale && voice.track.late_lines > 0 && (
@@ -275,35 +334,93 @@ export default function VoicePanel({
         {lines.map((line, i) => {
           const placement = placements?.[i];
           const late = placement !== undefined && placement.late_by > 0.3;
+          const key = lineKey(line);
+          const suggestion = suggestions.get(key);
+          const improveError = improveErrors.get(key);
           return (
             <li key={`${i}:${line.sourceStart}`}>
-              <button
-                type="button"
-                onClick={() => onSeek(line.sourceStart + 0.001)}
-                className={cn(
-                  "flex w-full cursor-pointer gap-3 rounded-md px-2 py-1.5 text-left text-[15px] hover:bg-muted",
-                  late && "bg-amber-950/30",
-                )}
-                title="Play from here"
-              >
-                <span className="mt-0.5 shrink-0 text-xs tabular-nums text-muted-foreground">
-                  {formatTimestamp(line.start)}
-                </span>
-                <span className="min-w-0 flex-1">{line.text}</span>
-                {placement && placement.rate > 1 && (
-                  <span
-                    className={cn("shrink-0 text-xs tabular-nums", late ? "text-amber-400" : "text-muted-foreground")}
-                    title={late ? `Starts ${placement.late_by.toFixed(1)}s late` : "Sped up to fit"}
+              <div className="group flex items-start gap-1">
+                <button
+                  type="button"
+                  onClick={() => onSeek(line.sourceStart + 0.001)}
+                  className={cn(
+                    "flex min-w-0 flex-1 cursor-pointer gap-3 rounded-md px-2 py-1.5 text-left text-[15px] hover:bg-muted",
+                    late && "bg-amber-950/30",
+                  )}
+                  title="Play from here"
+                >
+                  <span className="mt-0.5 shrink-0 text-xs tabular-nums text-muted-foreground">
+                    {formatTimestamp(line.start)}
+                  </span>
+                  <span className="min-w-0 flex-1">{line.text}</span>
+                  {placement && placement.rate > 1 && (
+                    <span
+                      className={cn("shrink-0 text-xs tabular-nums", late ? "text-amber-400" : "text-muted-foreground")}
+                      title={late ? `Starts ${placement.late_by.toFixed(1)}s late` : "Sped up to fit"}
+                    >
+                      {placement.rate.toFixed(2)}×{late && ` · ${placement.late_by.toFixed(1)}s late`}
+                    </span>
+                  )}
+                  {placement && placement.rate <= 1 && late && (
+                    <span className="shrink-0 text-xs tabular-nums text-amber-400">
+                      {placement.late_by.toFixed(1)}s late
+                    </span>
+                  )}
+                </button>
+                {settings.enabled && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className={cn(
+                      "mt-0.5 shrink-0 text-muted-foreground",
+                      !improving.has(key) && !suggestion && !late && "opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
+                    )}
+                    onClick={() => void improve(i)}
+                    disabled={improving.has(key)}
+                    title="Rewrite this line more clearly with AI (sends its text to OpenAI)"
                   >
-                    {placement.rate.toFixed(2)}×{late && ` · ${placement.late_by.toFixed(1)}s late`}
-                  </span>
+                    {improving.has(key) ? (
+                      <Loader2 className="animate-spin" aria-hidden="true" />
+                    ) : (
+                      <Sparkles aria-hidden="true" />
+                    )}
+                    Improve
+                  </Button>
                 )}
-                {placement && placement.rate <= 1 && late && (
-                  <span className="shrink-0 text-xs tabular-nums text-amber-400">
-                    {placement.late_by.toFixed(1)}s late
+              </div>
+              {suggestion && (
+                <div className="ml-14 mt-1 flex items-start gap-2 rounded-md border border-violet-500/40 bg-violet-950/20 px-3 py-2 text-[15px]">
+                  <Sparkles className="mt-1 size-3.5 shrink-0 text-violet-400" aria-hidden="true" />
+                  <span className="min-w-0 flex-1">
+                    {suggestion}
+                    <span className="block text-xs text-muted-foreground">
+                      {suggestion.length} characters (was {line.text.length})
+                    </span>
                   </span>
-                )}
-              </button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => {
+                      onEditLine(line.wordIdxs, suggestion);
+                      setSuggestions((prev) => without(prev, key));
+                    }}
+                  >
+                    <Check aria-hidden="true" />
+                    Use
+                  </Button>
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    aria-label="Dismiss suggestion"
+                    onClick={() => setSuggestions((prev) => without(prev, key))}
+                  >
+                    <X aria-hidden="true" />
+                  </Button>
+                </div>
+              )}
+              {improveError && <p className="m-0 ml-14 mt-1 text-xs text-muted-foreground">{improveError}</p>}
             </li>
           );
         })}

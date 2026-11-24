@@ -15,7 +15,7 @@ Client asks:
 | 1 | Intro/outro: **overlay** or **insert** mode | **Built** (`0013_lesson_slides`, `IntroOutroPanel`, title cards via `titleCard.ts`); needs a hands-on test |
 | 2 | Shape layers (blur / solid cover) | **Built** (`0012_lesson_regions`); crop removed 2026-11-23, so it needs a fresh review, and the in-app editor still needs a hands-on test |
 | 3 | Rescript-style silence and filler removal, with word correction | In progress: see `docs/text-editing-plan.md` |
-| 4 | AI studio voice from the (corrected) transcript | **V1 built** (2026-11-24): opt-in, AI voice tab, generate + preview. Export (V2) not yet; see §4 |
+| 4 | AI studio voice from the (corrected) transcript | **V1 + V2 built** (2026-11-24): opt-in, AI voice tab, generate + preview, saved per lesson, used in exports; see §4 |
 
 Build order: 2 → 1 → 3 → 4. The voice comes last because it should read the corrected transcript and fit the cut timeline.
 
@@ -84,7 +84,7 @@ The voice reads the lesson's **corrected script**: the words the lesson keeps (i
   * Longer: sped up with ffmpeg `atempo`, at most **1.25×**.
   * Still too long: it runs over and the next line starts when it ends (lines never overlap). Lines that start more than 0.3 s late are flagged in the tab: "shorten the text". The video is never frozen or stretched. This replaces the earlier "freeze the last frame" idea, which would have changed the edited timeline under the overlays.
 * **Cache.** Each clip is cached as raw PCM (24 kHz mono) in `$APPCACHE/tts/<sha256(model, voice, style, text)>.pcm`, so regenerating after an edit only pays for changed lines. The track is rebuilt locally every time (a mono WAV in `$APPCACHE/voice_tracks/`, one per lesson).
-* **Non-destructive.** The original audio stays. Nothing about the voice is stored in SQLite yet; the track lives for the editor visit and is rebuilt from the cache (free) on the next Generate.
+* **Non-destructive.** The original audio stays. The lesson's voice is saved in `lesson_voice` (migration 0015): the track (its WAV stays in the app cache), the editor's signature, a Rust-side `script_hash` of the lesson's segments/words/sentences, and `use_in_export`. A missing WAV reads as "no voice"; Generate rebuilds it from the clip cache for free.
 * **Privacy.** Sending script text to the speech endpoint is a new purpose. It's behind an explicit opt-in (`ai_voice_enabled` in `app_settings`, off by default), checked in Rust on every call. `coursecut-privacy-invariants` lists it as the third allowed use. Only line text, the voice name and the optional speaking style are sent.
 
 ### Phases
@@ -93,7 +93,7 @@ The voice reads the lesson's **corrected script**: the words the lesson keeps (i
 |---|---|---|
 | **V0. Text fixes** | Script tab: select words, **Edit**, type the right text. Timing stays; `original_text` keeps Whisper's text; one undo step; edited words get a dotted blue underline. | **Built** 2026-11-24 |
 | **V1. Generate and preview** | Settings → AI voice (opt-in, 11 stock voices, speaking style). Lesson editor **AI voice** tab: the lines, Generate (4 requests at a time, progress), per-line speed/late flags, click a line to play there. "Hear the AI voice in the Final video" mutes the recording and plays the track in sync. | **Built** 2026-11-24, needs a hands-on test with a real key |
-| **V2. Export with the voice** | Per-lesson "Use AI voice" saved in SQLite (a `lesson_voice` row: enabled + the script signature), so an export can tell when the voice is stale. Export: after the pieces are joined, one more ffmpeg pass maps the video stream (copy) and the voice track as audio, delayed by an inserted intro's length and padded to the full length. Refuse with a clear message if the script changed since the voice was made. | Next |
+| **V2. Export with the voice** | Per-lesson "Use AI voice" saved in SQLite (a `lesson_voice` row: enabled + the script signature), so an export can tell when the voice is stale. Export: after the pieces are joined, one more ffmpeg pass maps the video stream (copy) and the voice track as audio, delayed by an inserted intro's length and padded to the full length. Refuse with a clear message if the script changed since the voice was made. | **Built** 2026-11-24: `voice::voice_track_for_export`, `export::voice_placement`, `ffmpeg::mux_voice_track` (also silences the voice under muted overlay slides). "Use the AI voice in exports" checkbox in the AI voice tab, on by default. |
 | **V3. Polish** | Per-line regenerate; a pronunciation glossary (open question 4); intro/outro lines read by the voice; keep the recording faintly under the voice (ducking) as an option. | Later |
 
 ### Known limits of V1

@@ -17,6 +17,8 @@ export interface VoiceLine {
   end: number;
   /** The first word's time in the recording, for seeking. */
   sourceStart: number;
+  /** The line's words (`TranscriptWord.idx`), for editing its text. */
+  wordIdxs: number[];
 }
 
 /** A line is cut here even mid-sentence, to stay well under the speech
@@ -71,10 +73,11 @@ export function buildVoiceLines(
         current.parts.push(text);
         current.length += text.length + 1;
         current.lastIdx = word.idx;
+        current.line.wordIdxs.push(word.idx);
       } else {
         flush();
         current = {
-          line: { text: "", start: at, end: at, sourceStart: word.start },
+          line: { text: "", start: at, end: at, sourceStart: word.start, wordIdxs: [word.idx] },
           parts: [text],
           length: text.length,
           segment,

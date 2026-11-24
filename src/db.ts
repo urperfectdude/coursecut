@@ -256,14 +256,39 @@ export interface VoiceTrack {
 }
 
 /** Reads each line with the AI voice (only lines not cached yet go to
- * OpenAI: their text only) and builds the lesson's voice track. Emits
+ * OpenAI: their text only) and builds the lesson's voice track, saved as
+ * the lesson's voice with the editor's `signature`. Emits
  * `"voice-progress"` `{ lesson_id, done, total }`. */
 export async function generateLessonVoice(
   lessonId: string,
   lines: { text: string; start: number; end: number }[],
   lessonLength: number,
+  signature: string,
 ): Promise<VoiceTrack> {
-  return invoke<VoiceTrack>("generate_lesson_voice", { lessonId, lines, lessonLength });
+  return invoke<VoiceTrack>("generate_lesson_voice", { lessonId, lines, lessonLength, signature });
+}
+
+export interface SavedLessonVoice {
+  track: VoiceTrack;
+  signature: string;
+  use_in_export: boolean;
+}
+
+/** The lesson's saved AI voice, or null (none yet, or its track file is
+ * gone from the cache). */
+export async function getLessonVoice(lessonId: string): Promise<SavedLessonVoice | null> {
+  return invoke<SavedLessonVoice | null>("get_lesson_voice", { lessonId });
+}
+
+/** GPT-5.5's clearer wording for one script line (sends that line and its
+ * neighbours' text; needs the AI voice opt-in). Nothing is saved. */
+export async function improveVoiceLine(text: string, previous: string | null, next: string | null): Promise<string> {
+  return invoke<string>("improve_voice_line", { text, previous, next });
+}
+
+/** Whether exports of the lesson use its AI voice instead of the recording. */
+export async function setLessonVoiceExport(lessonId: string, useInExport: boolean): Promise<void> {
+  await invoke("set_lesson_voice_export", { lessonId, useInExport });
 }
 
 export type PauseAction = "shorten" | "remove" | "keep";
