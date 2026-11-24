@@ -5,8 +5,10 @@ mod ffmpeg;
 mod openai;
 mod progress;
 mod settings;
+mod voice;
 mod vtt;
 mod wav;
+mod words;
 
 use tauri::Manager;
 
@@ -23,6 +25,8 @@ pub fn run() {
             // video's path now, or it would silently stop being playable
             // after a restart.
             db::allow_existing_video_playback(app.handle(), &connection)?;
+            // Same for image intro/outro slides picked in an earlier session.
+            db::allow_existing_slide_images(app.handle(), &connection)?;
             // Crash recovery: if the app was previously killed mid-export,
             // its `exports` row would otherwise be stuck at `status =
             // 'running'` forever (no UI-reachable command accepts that
@@ -35,6 +39,9 @@ pub fn run() {
                 .app_cache_dir()
                 .map_err(|err| format!("could not resolve app cache dir: {err}"))?;
             export::reconcile_interrupted_exports(&connection, &cache_dir)?;
+            // Rendered title cards no slide uses any more (lesson deleted,
+            // or an edit that failed after rendering).
+            db::sweep_orphan_title_cards(&connection, &cache_dir)?;
             app.manage(db::DbConnection(std::sync::Mutex::new(connection)));
             // Tracks the `CommandChild` of whatever export is currently
             // running, so `cancel_export` can find and kill it (see
@@ -75,15 +82,32 @@ pub fn run() {
             db::update_lesson_segment,
             db::delete_lesson_segment,
             db::reorder_lesson_segments,
+            db::replace_lesson_segments,
             db::list_frame_overlays,
             db::add_frame_overlay,
             db::update_frame_overlay,
             db::delete_frame_overlay,
+            db::list_lesson_regions,
+            db::add_lesson_region,
+            db::update_lesson_region,
+            db::delete_lesson_region,
+            db::list_lesson_slides,
+            db::upsert_lesson_slide,
+            db::delete_lesson_slide,
+            db::save_title_card_png,
             ffmpeg::extract_audio_for_video,
             ffmpeg::prepare_segment_playback_clip,
             ffmpeg::delete_playback_clip,
             openai::transcribe_video,
             openai::retranscribe_chunk,
+            openai::fetch_word_timestamps,
+            words::list_transcript_words,
+            words::update_transcript_words,
+            words::list_transcript_pauses,
+            words::set_transcript_word_texts,
+            voice::get_voice_settings,
+            voice::save_voice_settings,
+            voice::generate_lesson_voice,
             openai::analyze_video,
             openai::preview_lesson_segment_edit,
             openai::apply_lesson_segment_edit,

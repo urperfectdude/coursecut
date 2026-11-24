@@ -10,7 +10,7 @@ export interface ContainedRect {
 /** Tracks the actual on-screen rect of `video`'s *content* within
  * `container`'s box — i.e. what `object-fit: contain` (the letterboxing
  * both `SourceVideoPreview` and `LessonPreviewPlayer` use, via
- * `.lesson-segments-preview-row .source-preview-video`/`.lesson-card-video`
+ * `.lesson-editor-player .source-preview-video`/`.lesson-card-video`
  * in styles.css, to keep two differently-shaped recordings the same
  * height) actually renders the video into, as opposed to `container`'s own
  * (usually wider/taller) box.

@@ -175,6 +175,108 @@ export async function listTranscriptSegments(videoId: string): Promise<Transcrip
   return invoke<TranscriptSegment[]>("list_transcript_segments", { videoId });
 }
 
+/** One Whisper word (`transcript_words`, docs/text-editing-plan.md §7.1).
+ * Times are source-video seconds. A word belongs to the segment whose
+ * [start, end) contains its `start`; its `removed` flag follows that
+ * segment's `keep`. Whisper's word text has no punctuation. */
+export interface TranscriptWord {
+  id: string;
+  video_id: string;
+  idx: number;
+  text: string;
+  /** Whisper's text, set only when the user corrected the word. */
+  original_text: string | null;
+  start: number;
+  end: number;
+  removed: boolean;
+  /** Why the app removed or suggests removing it. */
+  suggested: "filler" | "hallucination" | null;
+}
+
+/** Empty for a video with no word timestamps yet (VTT import, or
+ * transcribed before words were stored): offer `fetchWordTimestamps`. */
+export async function listTranscriptWords(videoId: string): Promise<TranscriptWord[]> {
+  return invoke<TranscriptWord[]>("list_transcript_words", { videoId });
+}
+
+/** Corrects words' text, keeping their timing (Script tab "Edit"). An
+ * empty text is allowed for words an edit left without one; `null` puts
+ * Whisper's text back. Returns the changed rows. Local only. */
+export async function setTranscriptWordTexts(
+  videoId: string,
+  changes: { id: string; text: string | null }[],
+): Promise<TranscriptWord[]> {
+  return invoke<TranscriptWord[]>("set_transcript_word_texts", { videoId, changes });
+}
+
+/** AI voice settings (HCM feature 4). `enabled` is the privacy opt-in:
+ * nothing is sent to OpenAI's speech endpoint until it's on. */
+export interface VoiceSettings {
+  enabled: boolean;
+  voice: string;
+  instructions: string;
+}
+
+export const AI_VOICES = [
+  "alloy",
+  "ash",
+  "ballad",
+  "coral",
+  "echo",
+  "fable",
+  "nova",
+  "onyx",
+  "sage",
+  "shimmer",
+  "verse",
+] as const;
+
+export async function getVoiceSettings(): Promise<VoiceSettings> {
+  return invoke<VoiceSettings>("get_voice_settings");
+}
+
+export async function saveVoiceSettings(settings: VoiceSettings): Promise<VoiceSettings> {
+  return invoke<VoiceSettings>("save_voice_settings", { settings });
+}
+
+export interface VoiceLinePlacement {
+  start: number;
+  duration: number;
+  rate: number;
+  late_by: number;
+}
+
+export interface VoiceTrack {
+  /** WAV in the app cache; play it with `convertFileSrc`. */
+  path: string;
+  duration: number;
+  lines: VoiceLinePlacement[];
+  generated: number;
+  late_lines: number;
+}
+
+/** Reads each line with the AI voice (only lines not cached yet go to
+ * OpenAI: their text only) and builds the lesson's voice track. Emits
+ * `"voice-progress"` `{ lesson_id, done, total }`. */
+export async function generateLessonVoice(
+  lessonId: string,
+  lines: { text: string; start: number; end: number }[],
+  lessonLength: number,
+): Promise<VoiceTrack> {
+  return invoke<VoiceTrack>("generate_lesson_voice", { lessonId, lines, lessonLength });
+}
+
+export type PauseAction = "shorten" | "remove" | "keep";
+
+
+// "Listen again for word-level editing": sends the video's already-extracted
+// local audio to Whisper (same as transcription, see
+// `coursecut-privacy-invariants`) and stores only word timestamps; the
+// transcript segments are left as they are. A paid call: only on user action.
+export async function fetchWordTimestamps(videoId: string, attempt: number): Promise<TranscriptWord[]> {
+  return invoke<TranscriptWord[]>("fetch_word_timestamps", { videoId, attempt });
+}
+
 // Imports a local .vtt file as videoId's transcript, bypassing Whisper
 // entirely — for videos where the user already has an accurate transcript
 // from the recording platform (e.g. a Zoom/Teams .vtt export with real
@@ -367,6 +469,13 @@ export async function reorderLessonSegments(lessonId: string, orderedIds: string
   await invoke("reorder_lesson_segments", { lessonId, orderedIds });
 }
 
+// Replaces a lesson's segments with `ranges`, in order, in one transaction
+// (rows keep their ids in order; extras deleted, missing ones added).
+// Rejects an empty list. Used by undo/redo and the Script tab's cuts.
+export async function replaceLessonSegments(lessonId: string, ranges: LessonSegmentRange[]): Promise<LessonSegment[]> {
+  return invoke<LessonSegment[]>("replace_lesson_segments", { lessonId, ranges });
+}
+
 // A still-image overlay composited over a lesson's existing frames for
 // [start, end) *during export only* (`0007_frame_overlays.sql`, lesson-
 // scoped since `0009_frame_overlay_lesson_scoped.sql`) — never spliced into
@@ -433,6 +542,99 @@ export async function updateFrameOverlay(
 
 export async function deleteFrameOverlay(id: string): Promise<void> {
   await invoke("delete_frame_overlay", { id });
+}
+
+// A static shape layer (blurred or solid rect / rounded rect / ellipse)
+// applied between `start` and `end` virtual seconds
+// (`0012_lesson_regions.sql`), the same timeline as `FrameOverlay`. The rect
+// is top-left + size, 0-100 percent of the output frame.
+export type RegionShape = "rect" | "rounded" | "ellipse";
+export type RegionFill = "blur" | "solid";
+
+export interface LessonRegion {
+  id: string;
+  lesson_id: string;
+  start: number;
+  end: number;
+  x_percent: number;
+  y_percent: number;
+  w_percent: number;
+  h_percent: number;
+  shape: RegionShape;
+  fill: RegionFill;
+  /** Blur radius in source pixels (1-100). */
+  blur_strength: number;
+  /** `#rrggbb`. */
+  color: string;
+  created_at: string;
+}
+
+// The editable fields of a region.
+export type RegionInput = Omit<LessonRegion, "id" | "lesson_id" | "created_at">;
+
+export async function listLessonRegions(lessonId: string): Promise<LessonRegion[]> {
+  return invoke<LessonRegion[]>("list_lesson_regions", { lessonId });
+}
+
+export async function addLessonRegion(lessonId: string, region: RegionInput): Promise<LessonRegion> {
+  return invoke<LessonRegion>("add_lesson_region", { lessonId, region });
+}
+
+export async function updateLessonRegion(id: string, region: RegionInput): Promise<LessonRegion> {
+  return invoke<LessonRegion>("update_lesson_region", { id, region });
+}
+
+export async function deleteLessonRegion(id: string): Promise<void> {
+  await invoke("delete_lesson_region", { id });
+}
+
+// A lesson's intro or outro (`0013_lesson_slides.sql`), at most one of
+// each. `mode` "insert" plays it as its own clip before/after the lecture
+// (adds time, silent); "overlay" shows it full-frame over the first/last
+// `duration` seconds of the lesson's virtual timeline, optionally muting the
+// lecture audio there. `image_path` is the picked image, or for a title card
+// the PNG rendered by `renderTitleCardPng` and saved via `saveTitleCardPng`.
+export type SlidePosition = "intro" | "outro";
+export type SlideMode = "insert" | "overlay";
+export type SlideKind = "image" | "title";
+
+export interface LessonSlide {
+  id: string;
+  lesson_id: string;
+  position: SlidePosition;
+  mode: SlideMode;
+  duration: number;
+  kind: SlideKind;
+  image_path: string;
+  title: string;
+  subtitle: string;
+  /** `#rrggbb`. */
+  bg_color: string;
+  /** `#rrggbb`. */
+  text_color: string;
+  mute_audio: boolean;
+  created_at: string;
+}
+
+export type SlideInput = Omit<LessonSlide, "id" | "lesson_id" | "created_at">;
+
+export async function listLessonSlides(lessonId: string): Promise<LessonSlide[]> {
+  return invoke<LessonSlide[]>("list_lesson_slides", { lessonId });
+}
+
+// Creates the slide at `slide.position`, or replaces the one already there.
+export async function upsertLessonSlide(lessonId: string, slide: SlideInput): Promise<LessonSlide> {
+  return invoke<LessonSlide>("upsert_lesson_slide", { lessonId, slide });
+}
+
+export async function deleteLessonSlide(id: string): Promise<void> {
+  await invoke("delete_lesson_slide", { id });
+}
+
+// Saves a rendered title card PNG into the app cache and returns its path.
+// Sent as the raw IPC body, not JSON.
+export async function saveTitleCardPng(png: Uint8Array): Promise<string> {
+  return invoke<string>("save_title_card_png", png);
 }
 
 export async function deleteLesson(id: string): Promise<void> {

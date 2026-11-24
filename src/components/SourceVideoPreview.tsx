@@ -5,6 +5,7 @@ import type { LessonSegment } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
 import { useContainedVideoRect } from "../lib/useContainedVideoRect";
 import SegmentedScrubber from "./SegmentedScrubber";
+import { activeRegions, ShapeLayers, type PreviewRegion } from "./RegionLayers";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Kbd, KbdGroup } from "@/components/ui/kbd";
@@ -45,6 +46,11 @@ interface SourceVideoPreviewProps {
    * pixel-accurate render). Video-scoped like the overlays themselves, not
    * tied to `selectedLessonSegments`. */
   overlayMarkers?: { id: string; image_path: string; start: number; end: number; scale_percent: number }[];
+  /** The selected lesson's shape layers, already mapped from virtual
+   * onto *source* seconds by the caller (see `virtualRangeToSourceRanges`):
+   * previewed live the same way `LessonPreviewPlayer` does, and drawn as a
+   * band on the scrubber. */
+  regions?: PreviewRegion[];
   /** Whether a lesson is currently selected — gates the Mark In/Out/Add
    * Segment controls, since a segment always needs a target lesson. Unused
    * in `"minimal"` layout, which doesn't render those controls at all. */
@@ -70,7 +76,19 @@ interface SourceVideoPreviewProps {
    * adding a segment now happens on a lesson's own `LessonSegmentsView`
    * page instead. */
   controlsLayout?: "side" | "stacked" | "minimal";
+  /** Source-time ranges to jump over while playing (removed words on the
+   * Transcript page, docs/text-editing-plan.md §6.2). Checked every
+   * animation frame, not on `timeupdate` (~250 ms), so a removed "um" isn't
+   * heard before the jump. Seeking or pausing inside a range is allowed. */
+  skipRanges?: readonly { start: number; end: number }[];
+  /** Called every animation frame with the playhead, for UI that must
+   * follow playback closely without a React render per frame (the word
+   * highlight). */
+  onFrameTime?: (time: number, playing: boolean) => void;
 }
+
+/** Lands the playhead just past a skipped range. */
+const SKIP_PAST_S = 0.001;
 
 /** One "[key] [key]  label" hint, e.g. the Space/←→/Shift+←→ rows below —
  * factored out since that same trio of hints is rendered twice (the "side"
@@ -121,14 +139,62 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
       filePath,
       selectedLessonSegments = [],
       overlayMarkers = [],
+      regions = [],
       hasSelectedLesson = false,
       onTimeUpdate,
       onAddSegment,
       controlsLayout = "minimal",
+      skipRanges,
+      onFrameTime,
     },
     ref,
   ) {
     const videoRef = useRef<HTMLVideoElement | null>(null);
+
+    // Per-frame loop for `skipRanges` / `onFrameTime` (the approach of
+    // Rescript v1.0.9's MediaPreview playback loop). Props go through refs
+    // so the loop starts once and never restarts.
+    const skipRangesRef = useRef(skipRanges);
+    skipRangesRef.current = skipRanges;
+    const onFrameTimeRef = useRef(onFrameTime);
+    onFrameTimeRef.current = onFrameTime;
+    const frameLoopWanted = skipRanges !== undefined || onFrameTime !== undefined;
+    useEffect(() => {
+      if (!frameLoopWanted) return;
+      let raf = 0;
+      let lastTime = -1;
+      let lastPlaying = false;
+      const tick = () => {
+        const video = videoRef.current;
+        if (video) {
+          let time = video.currentTime;
+          const playing = !video.paused;
+          const ranges = skipRangesRef.current;
+          if (playing && ranges) {
+            const cut = ranges.find((range) => time >= range.start && time < range.end);
+            if (cut) {
+              const target = cut.end + SKIP_PAST_S;
+              if (video.duration && target >= video.duration - 0.05) {
+                video.pause();
+                video.currentTime = cut.start;
+                time = cut.start;
+              } else {
+                video.currentTime = target;
+                time = target;
+              }
+            }
+          }
+          if (time !== lastTime || playing !== lastPlaying) {
+            lastTime = time;
+            lastPlaying = playing;
+            onFrameTimeRef.current?.(time, playing);
+          }
+        }
+        raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+      return () => cancelAnimationFrame(raf);
+    }, [frameLoopWanted]);
     const overlayContainerRef = useRef<HTMLDivElement | null>(null);
     const [currentTime, setCurrentTime] = useState(0);
     const [duration, setDuration] = useState(0);
@@ -136,6 +202,8 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     // intrinsic dimensions are now readable — see that hook.
     const [metadataVersion, setMetadataVersion] = useState(0);
     const contentRect = useContainedVideoRect(videoRef, overlayContainerRef, metadataVersion);
+    // The video's intrinsic width, to scale the blur preview to source pixels.
+    const [videoWidth, setVideoWidth] = useState(0);
     // Native `<video controls>` is gone (see the module doc above), so this
     // component now owns play/pause state itself for the custom control
     // row's button label — driven by the video element's own `onPlay`/
@@ -278,6 +346,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
     const activeOverlayMarkers = overlayMarkers.filter(
       (marker) => currentTime >= marker.start && currentTime < marker.end,
     );
+    const currentRegions = activeRegions(regions, currentTime);
 
     return (
       <div
@@ -320,7 +389,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
                 // `source-preview-video` is likewise kept as a hook className —
                 // `LessonSegmentsView`'s stylesheet forces this element to a
                 // shared height alongside `LessonPreviewPlayer`'s video via
-                // `.lesson-segments-preview-row .source-preview-video`.
+                // `.lesson-editor-player .source-preview-video`.
                 className={cn(
                   "source-preview-video block max-h-[30vh] w-full bg-black",
                   isFullscreen && "h-auto max-h-[82vh] w-full",
@@ -328,11 +397,17 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
                 onLoadedMetadata={(event) => {
                   setDuration(event.currentTarget.duration || 0);
                   setMetadataVersion((v) => v + 1);
+                  setVideoWidth(event.currentTarget.videoWidth);
                 }}
                 onTimeUpdate={handleTimeUpdate}
                 onPlay={() => setIsPaused(false)}
                 onPause={() => setIsPaused(true)}
               />
+              {/* Shape layers before the overlay images, matching the
+                 export's chain order (shapes -> image overlays). */}
+              {contentRect && videoWidth > 0 && (
+                <ShapeLayers rect={contentRect} regions={currentRegions} pixelScale={contentRect.width / videoWidth} />
+              )}
               {/* Positioned against `contentRect` (the video's actual
                  letterboxed content area — see `useContainedVideoRect`), not
                  this wrapper's raw box, so the overlay's own box matches the
@@ -413,6 +488,7 @@ const SourceVideoPreview = forwardRef<SourceVideoPreviewHandle, SourceVideoPrevi
               aria-label="Scrub source video"
               segments={selectedLessonSegments}
               markers={overlayMarkers}
+              regionMarkers={regions}
               duration={duration}
             />
           </div>

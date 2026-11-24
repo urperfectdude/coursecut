@@ -1,8 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import Breadcrumbs from "../components/Breadcrumbs";
-import LessonPreviewPlayer from "../components/LessonPreviewPlayer";
+import LessonPreviewPlayer, { type LessonPreviewPlayerHandle } from "../components/LessonPreviewPlayer";
+import LessonScript from "../components/LessonScript";
+import VoicePanel, { type LessonVoiceState } from "../components/VoicePanel";
+import { buildVoiceLines } from "../lib/voice-script";
+import type { WordTranscriptHandle } from "../components/WordTranscript";
+import { useVideoProgress } from "../hooks/useVideoProgress";
+import { displayWordTexts, findPauses, formatLength, spreadEditedText, wordsInRange } from "../lib/transcript-words";
+import { scriptBlocks, totalLength, type Range } from "../lib/lesson-cuts";
 import SourceVideoPreview from "../components/SourceVideoPreview";
+import RegionsPanel, { useRegionEditor } from "../components/RegionsPanel";
+import IntroOutroBlock, { useLessonSlides } from "../components/IntroOutroPanel";
+import type { PreviewRegion } from "../components/RegionLayers";
 import { basename } from "./ProjectDetailView";
 import {
   addFrameOverlay,
@@ -10,14 +20,19 @@ import {
   applyLessonSegmentEdit,
   deleteFrameOverlay,
   deleteLessonSegment,
+  fetchWordTimestamps,
   getProject,
   getVideo,
   listFrameOverlays,
   listLessonSegments,
   listLessons,
+  listTranscriptSegments,
+  listTranscriptWords,
   previewLessonSegmentEdit,
   queueExport,
   reorderLessonSegments,
+  replaceLessonSegments,
+  setTranscriptWordTexts,
   splitLesson,
   updateFrameOverlay,
   updateLesson,
@@ -27,12 +42,15 @@ import {
   type LessonSegment,
   type LessonSegmentRange,
   type Project,
+  type TranscriptSegment,
+  type TranscriptWord,
   type Video,
 } from "../db";
 import { formatTimestamp, formatTimestampMs, parseTimestampMs } from "../lib/timestamp";
 import {
   segmentOffsets as computeSegmentOffsets,
   rewriteFinalTimestampsToSource,
+  virtualRangeToSourceRanges,
 } from "../lib/timeline";
 import { getSegmentDiffBadgeClassName } from "../lib/badge-variants";
 import { ChevronDown, ChevronUp, Pencil, Trash2 } from "lucide-react";
@@ -66,6 +84,21 @@ import { cn } from "@/lib/utils";
  * `===` would flag a segment the model echoed back unchanged as "trimmed"
  * over a rounding fraction of a second. */
 const RANGE_MATCH_EPSILON_SECS = 0.01;
+
+type EditorTab = "script" | "segments" | "overlays" | "shapes" | "introOutro" | "voice";
+
+const PREVIEW_WIDTH_KEY = "coursecut.lessonEditor.previewWidth";
+const MIN_PREVIEW_WIDTH_PX = 280;
+const MIN_TABS_WIDTH_PX = 360;
+
+const EDITOR_TABS: { id: EditorTab; label: string }[] = [
+  { id: "script", label: "Script" },
+  { id: "segments", label: "Segments" },
+  { id: "overlays", label: "Overlays" },
+  { id: "shapes", label: "Blur & cover" },
+  { id: "introOutro", label: "Intro/Outro" },
+  { id: "voice", label: "AI voice" },
+];
 
 /** Short example instructions the floating AI input cycles through as its
  * placeholder while empty — kept to single, concrete asks rather than the
@@ -171,33 +204,12 @@ async function applySegmentSnapshot(
   lessonId: string,
   targetRanges: LessonSegmentRange[],
 ): Promise<LessonSegment[]> {
-  const current = await listLessonSegments(lessonId);
-  const overlapCount = Math.min(current.length, targetRanges.length);
-
-  for (let i = 0; i < overlapCount; i++) {
-    const segment = current[i];
-    const target = targetRanges[i];
-    if (segment.start !== target.start || segment.end !== target.end) {
-      await updateLessonSegment(segment.id, target.start, target.end);
-    }
-  }
-
-  for (let i = current.length - 1; i >= overlapCount; i--) {
-    await deleteLessonSegment(current[i].id);
-  }
-
-  const appendedIds: string[] = [];
-  for (let i = overlapCount; i < targetRanges.length; i++) {
-    const created = await addLessonSegment(lessonId, targetRanges[i].start, targetRanges[i].end);
-    appendedIds.push(created.id);
-  }
-
-  const orderedIds = [...current.slice(0, overlapCount).map((segment) => segment.id), ...appendedIds];
-  if (orderedIds.length > 1) {
-    await reorderLessonSegments(lessonId, orderedIds);
-  }
-
-  return listLessonSegments(lessonId);
+  // One transaction on the Rust side, so an undo or a Script cut that
+  // rewrites many rows can't be left half done.
+  return replaceLessonSegments(
+    lessonId,
+    targetRanges.map((range) => ({ start: range.start, end: range.end })),
+  );
 }
 
 interface LessonSegmentsViewProps {
@@ -292,6 +304,28 @@ export default function LessonSegmentsView({
   // freshly-inserted overlay's default Start is anchored to this, not
   // `finalVideoTime` (which is real/source time).
   const [finalVirtualTime, setFinalVirtualTime] = useState(0);
+  // Shape layers (`lesson_regions`), on the same virtual timeline as
+  // the image overlays — see `RegionsPanel`.
+  const regionEditor = useRegionEditor(lessonId, finalVirtualTime);
+  // Intro/outro slides (`lesson_slides`), edited in the Image overlays
+  // section and shown by the Final video preview. Title cards are rendered
+  // at the video's own pixel size, reported by that preview.
+  const slidesState = useLessonSlides(lessonId);
+  const [videoSize, setVideoSize] = useState<{ width: number; height: number } | null>(null);
+  // The same regions mapped onto source seconds for the Original video
+  // preview, one entry per lesson segment a region overlaps.
+  const sourcePreviewRegions = useMemo<PreviewRegion[]>(
+    () =>
+      regionEditor.previewRegions.flatMap((region) =>
+        virtualRangeToSourceRanges(segments, region.start, region.end).map((range, index) => ({
+          ...region,
+          id: `${region.id}-${index}`,
+          start: range.start,
+          end: range.end,
+        })),
+      ),
+    [regionEditor.previewRegions, segments],
+  );
 
   // Draft values for the per-segment start/end numeric inputs, keyed by
   // segment id — same draft-then-commit-on-blur pattern as the summary
@@ -346,15 +380,93 @@ export default function LessonSegmentsView({
   // the user starts typing.
   const [aiPlaceholderIndex, setAiPlaceholderIndex] = useState(0);
 
+  // --- Script tab (docs/text-editing-plan.md, "Per-lesson cuts") ---
+  // Removing words cuts them out of this lesson's segments, so the
+  // segments are the only edit state: preview, export and undo already
+  // follow them. Word timings are read-only here.
+  const [transcriptSegments, setTranscriptSegments] = useState<TranscriptSegment[]>([]);
+  const [words, setWords] = useState<TranscriptWord[]>([]);
+  const [fetchingWords, setFetchingWords] = useState(false);
+  // The AI voice made for this lesson in this visit, and whether the Final
+  // video plays it instead of the recording.
+  const [lessonVoice, setLessonVoice] = useState<LessonVoiceState | null>(null);
+  const [listenToVoice, setListenToVoice] = useState(false);
+  const [tab, setTab] = useState<EditorTab>("script");
+  const [playerView, setPlayerView] = useState<"final" | "original">("final");
+
+  // Width of the video column, set by dragging the divider (null = the
+  // default 42%). Remembered per viewer in localStorage.
+  const editorGridRef = useRef<HTMLDivElement>(null);
+  const asideRef = useRef<HTMLElement>(null);
+  const [previewWidth, setPreviewWidth] = useState<number | null>(() => {
+    try {
+      const saved = Number(localStorage.getItem(PREVIEW_WIDTH_KEY));
+      return saved > 0 ? saved : null;
+    } catch {
+      return null;
+    }
+  });
+  const clampPreviewWidth = useCallback((width: number) => {
+    const total = editorGridRef.current?.getBoundingClientRect().width ?? 1200;
+    return Math.round(Math.min(Math.max(width, MIN_PREVIEW_WIDTH_PX), total - MIN_TABS_WIDTH_PX));
+  }, []);
+  const savePreviewWidth = useCallback((width: number | null) => {
+    setPreviewWidth(width);
+    try {
+      if (width === null) localStorage.removeItem(PREVIEW_WIDTH_KEY);
+      else localStorage.setItem(PREVIEW_WIDTH_KEY, String(width));
+    } catch {
+      // Storage unavailable: the width just isn't remembered.
+    }
+  }, []);
+  const handleDividerPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const grid = editorGridRef.current;
+      if (!grid || event.button !== 0) return;
+      event.preventDefault();
+      const divider = event.currentTarget;
+      divider.setPointerCapture(event.pointerId);
+      const right = grid.getBoundingClientRect().right;
+      let latest = previewWidth;
+      const onMove = (move: PointerEvent) => {
+        latest = clampPreviewWidth(right - move.clientX - 6);
+        setPreviewWidth(latest);
+      };
+      const onUp = () => {
+        divider.removeEventListener("pointermove", onMove);
+        divider.removeEventListener("pointerup", onUp);
+        divider.removeEventListener("pointercancel", onUp);
+        if (latest !== null) savePreviewWidth(latest);
+      };
+      divider.addEventListener("pointermove", onMove);
+      divider.addEventListener("pointerup", onUp);
+      divider.addEventListener("pointercancel", onUp);
+    },
+    [previewWidth, clampPreviewWidth, savePreviewWidth],
+  );
+  const { progress: videoProgressMap, clearProgress } = useVideoProgress();
+  const lessonPlayerRef = useRef<LessonPreviewPlayerHandle>(null);
+  const scriptRef = useRef<WordTranscriptHandle>(null);
+  const pauses = useMemo(() => findPauses(words), [words]);
+  const pausesByWordId = useMemo(() => new Map(pauses.map((p) => [p.afterWordId, p])), [pauses]);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    Promise.all([getProject(projectId), getVideo(videoId), listLessons(videoId)])
-      .then(([projectRow, videoRow, lessonRows]) => {
+    Promise.all([
+      getProject(projectId),
+      getVideo(videoId),
+      listLessons(videoId),
+      listTranscriptSegments(videoId),
+      listTranscriptWords(videoId),
+    ])
+      .then(([projectRow, videoRow, lessonRows, transcriptRows, wordRows]) => {
         if (cancelled) return;
         setProject(projectRow);
         setVideo(videoRow);
         setLesson(lessonRows.find((row) => row.id === lessonId) ?? null);
+        setTranscriptSegments(transcriptRows);
+        setWords(wordRows);
       })
       .catch((err) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -668,29 +780,182 @@ export default function LessonSegmentsView({
     setRedoStack([]);
   }, []);
 
+  // One segment-changing operation at a time (undo, redo, Script cuts, and
+  // every edit through `withSegmentUndo`): each reads the current segments
+  // and writes a new list, so two at once would work from stale data.
+  const segmentOpBusyRef = useRef(false);
+  const [segmentOpBusy, setSegmentOpBusy] = useState(false);
+  const setOpBusy = useCallback((busy: boolean) => {
+    segmentOpBusyRef.current = busy;
+    setSegmentOpBusy(busy);
+  }, []);
+  // Edits wait their turn rather than being refused, so nothing a caller
+  // did (an AI proposal applied, a typed time, Mark In/Out) is lost.
+  // Undo/redo and Script cuts instead ignore input while busy, since a
+  // queued second undo would pop a stale stack.
+  const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  const runExclusive = useCallback(
+    <T,>(fn: () => Promise<T>): Promise<T> => {
+      const run = opChainRef.current.then(async () => {
+        setOpBusy(true);
+        try {
+          return await fn();
+        } finally {
+          setOpBusy(false);
+        }
+      });
+      opChainRef.current = run.catch(() => undefined);
+      return run;
+    },
+    [setOpBusy],
+  );
   const handleUndo = useCallback(async () => {
+    if (segmentOpBusyRef.current) return;
     const action = undoStack[undoStack.length - 1];
     if (!action) return;
     setUndoStack((prev) => prev.slice(0, -1));
     try {
-      await action.undo();
+      await runExclusive(() => action.undo());
       setRedoStack((prev) => [...prev, action]);
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
     }
-  }, [undoStack]);
+  }, [undoStack, runExclusive]);
 
   const handleRedo = useCallback(async () => {
+    if (segmentOpBusyRef.current) return;
     const action = redoStack[redoStack.length - 1];
     if (!action) return;
     setRedoStack((prev) => prev.slice(0, -1));
     try {
-      await action.redo();
+      await runExclusive(() => action.redo());
       setUndoStack((prev) => [...prev, action]);
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
     }
-  }, [redoStack]);
+  }, [redoStack, runExclusive]);
+
+
+  /** "Get word timings": one Whisper pass storing word timestamps for the
+   * whole video (user-triggered only, since it's a paid call). */
+  const handleFetchWords = useCallback(async () => {
+    if (fetchingWords) return;
+    setFetchingWords(true);
+    clearProgress(videoId);
+    try {
+      setWords(await fetchWordTimestamps(videoId, 1));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFetchingWords(false);
+    }
+  }, [fetchingWords, videoId, clearProgress]);
+
+  /** Script tab "Edit": corrects the selected words' text, spread over
+   * them in order so each keeps its timing. One undo step. Words whose
+   * shown text doesn't change are left alone, so they don't read as edited. */
+  const handleEditWords = useCallback(
+    (idxs: number[], text: string) => {
+      const selected = idxs.map((idx) => words[idx]).filter((word): word is TranscriptWord => word !== undefined);
+      if (selected.length === 0 || !text.trim()) return;
+      // What each selected word shows now (punctuated by its sentence).
+      const shown = new Map<number, string>();
+      for (const segment of transcriptSegments) {
+        if (!selected.some((word) => word.start >= segment.start && word.start < segment.end)) continue;
+        const inSegment = wordsInRange(words, segment.start, segment.end);
+        const texts = displayWordTexts(segment.text, inSegment);
+        inSegment.forEach((word, i) => {
+          if (!shown.has(word.idx)) shown.set(word.idx, texts[i]);
+        });
+      }
+      const parts = spreadEditedText(selected.length, text);
+      const after: { id: string; text: string | null }[] = [];
+      const before: { id: string; text: string | null }[] = [];
+      selected.forEach((word, i) => {
+        if (parts[i] === (shown.get(word.idx) ?? word.text)) return;
+        after.push({ id: word.id, text: parts[i] });
+        // An unedited word goes back to Whisper's text (not edited).
+        before.push({ id: word.id, text: word.original_text === null ? null : word.text });
+      });
+      if (after.length === 0) return;
+      const merge = (rows: TranscriptWord[]) => {
+        const byId = new Map(rows.map((row) => [row.id, row]));
+        setWords((prev) => prev.map((word) => byId.get(word.id) ?? word));
+      };
+      runExclusive(async () => {
+        merge(await setTranscriptWordTexts(videoId, after));
+        pushUndo({
+          undo: async () => merge(await setTranscriptWordTexts(videoId, before)),
+          redo: async () => merge(await setTranscriptWordTexts(videoId, after)),
+        });
+      }).catch((err) => setSegmentsError(err instanceof Error ? err.message : String(err)));
+    },
+    [words, transcriptSegments, videoId, runExclusive, pushUndo],
+  );
+
+  // Length now, and before Script cuts: the cut gaps inside each script
+  // block (see `scriptBlocks`) are what the Script tab shows as removed.
+  const lessonLengthAfter = useMemo(() => totalLength(segments), [segments]);
+  const lessonLength = useMemo(
+    () => scriptBlocks(segments).reduce((sum, block) => sum + (block.end - block.start), 0),
+    [segments],
+  );
+
+  const voiceLines = useMemo(
+    () => (words.length > 0 ? buildVoiceLines(segments, transcriptSegments, words) : []),
+    [segments, transcriptSegments, words],
+  );
+
+  // The Final player stays mounted (hidden) while Original shows, so its
+  // ref is always there to seek.
+  const handleScriptSeek = useCallback((time: number) => {
+    setPlayerView("final");
+    lessonPlayerRef.current?.seekToSource(time);
+  }, []);
+  const showPlayer = useCallback((view: "final" | "original") => {
+    if (view === "original") lessonPlayerRef.current?.pause();
+    setPlayerView(view);
+  }, []);
+  // The word highlight and auto-scroll only run while the Script tab shows.
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+  const lastFrameRef = useRef({ time: 0, playing: false });
+  const handleFrameTime = useCallback((time: number, playing: boolean) => {
+    lastFrameRef.current = { time, playing };
+    if (tabRef.current === "script") scriptRef.current?.setPlayhead(time, playing);
+  }, []);
+  // Entering or leaving Script: bring its highlight up to date, and treat
+  // it as paused while hidden so scrolling other tabs doesn't switch off
+  // follow mode.
+  useEffect(() => {
+    const { time, playing } = lastFrameRef.current;
+    scriptRef.current?.setPlayhead(time, tab === "script" && playing);
+  }, [tab]);
+
+  // ⌘Z / ⇧⌘Z (Ctrl on Windows) for this page's undo stack, outside text
+  // fields (which keep their own undo).
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "z") return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      // Not under an open dialog (delete confirm, AI review), which works
+      // from the current segments.
+      if (document.querySelector('[role="dialog"], [role="alertdialog"]')) return;
+      event.preventDefault();
+      if (event.repeat) return;
+      if (event.shiftKey) void handleRedo();
+      else void handleUndo();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [handleUndo, handleRedo]);
+
+  // Placing overlays and drawing shapes happens on the Final video.
+  const selectTab = useCallback((next: EditorTab) => {
+    setTab(next);
+    if (next === "overlays" || next === "shapes" || next === "introOutro") setPlayerView("final");
+  }, []);
 
   // Runs a segment-mutating IPC call, then records an undo/redo step
   // spanning it — captures this lesson's full segment range list right
@@ -699,18 +964,55 @@ export default function LessonSegmentsView({
   // this instead of calling `fetchSegments` itself, so each one gets
   // undo/redo "for free" without a bespoke inverse.
   const withSegmentUndo = useCallback(
-    async (mutate: () => Promise<void>) => {
-      const before = segments.map((segment) => ({ start: segment.start, end: segment.end }));
-      await mutate();
-      const after = await listLessonSegments(lessonId);
-      setSegments(after);
-      const afterRanges = after.map((segment) => ({ start: segment.start, end: segment.end }));
-      pushUndo({
-        undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
-        redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
-      });
+    (mutate: () => Promise<void>): Promise<boolean> =>
+      runExclusive(async () => {
+        // Read from the database, not state: a queued edit must start from
+        // the result of the one before it.
+        const before = (await listLessonSegments(lessonId)).map((segment) => ({
+          start: segment.start,
+          end: segment.end,
+        }));
+        await mutate();
+        const after = await listLessonSegments(lessonId);
+        setSegments(after);
+        const afterRanges = after.map((segment) => ({ start: segment.start, end: segment.end }));
+        // An empty "before" can't be restored (a lesson needs a segment).
+        if (before.length > 0) {
+          pushUndo({
+            undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
+            redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+          });
+        }
+        return true;
+      }),
+    [lessonId, pushUndo, runExclusive],
+  );
+
+  /** Script tab edits: replace the lesson's segments with `ranges` as one
+   * segment undo step. Resolves true once saved (false if refused, a no-op,
+   * or another segment change was running). */
+  const handleApplyScriptRanges = useCallback(
+    async (ranges: Range[]): Promise<boolean> => {
+      if (segmentOpBusyRef.current) return false;
+      const unchanged =
+        ranges.length === segments.length &&
+        ranges.every((range, i) => range.start === segments[i].start && range.end === segments[i].end);
+      if (unchanged) return false;
+      if (ranges.length === 0) {
+        setSegmentsError("That would remove everything in this lesson. Delete the lesson from the Lessons page instead.");
+        return false;
+      }
+      try {
+        return await withSegmentUndo(async () => {
+          await applySegmentSnapshot(lessonId, ranges);
+        });
+      } catch (err) {
+        setSegmentsError(err instanceof Error ? err.message : String(err));
+        void fetchSegments();
+        return false;
+      }
     },
-    [segments, lessonId, pushUndo],
+    [segments, withSegmentUndo, lessonId, fetchSegments],
   );
 
   // Submits the outer prompt box: always starts from this lesson's real,
@@ -1073,21 +1375,24 @@ export default function LessonSegmentsView({
       // Not routed through `withSegmentUndo` — a delete that takes the
       // whole lesson down with it (see below) leaves nothing on this page
       // to restore a snapshot into, so it must never push an undo entry.
-      const before = segments.map((s) => ({ start: s.start, end: s.end }));
-      const result = await deleteLessonSegment(segment.id);
-      if (result.lesson_deleted) {
-        // The lesson itself no longer exists — nothing left to edit here.
-        onNavigateLessons();
-        return;
-      }
-      const after = await listLessonSegments(lessonId);
-      setSegments(after);
-      const afterRanges = after.map((s) => ({ start: s.start, end: s.end }));
-      pushUndo({
-        undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
-        redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+      // Still under the shared lock, after any edit already running.
+      await runExclusive(async () => {
+        const before = (await listLessonSegments(lessonId)).map((s) => ({ start: s.start, end: s.end }));
+        const result = await deleteLessonSegment(segment.id);
+        if (result.lesson_deleted) {
+          // The lesson itself no longer exists — nothing left to edit here.
+          onNavigateLessons();
+          return;
+        }
+        const after = await listLessonSegments(lessonId);
+        setSegments(after);
+        const afterRanges = after.map((s) => ({ start: s.start, end: s.end }));
+        pushUndo({
+          undo: async () => setSegments(await applySegmentSnapshot(lessonId, before)),
+          redo: async () => setSegments(await applySegmentSnapshot(lessonId, afterRanges)),
+        });
+        setSegmentsError(null);
       });
-      setSegmentsError(null);
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1097,7 +1402,7 @@ export default function LessonSegmentsView({
         return next;
       });
     }
-  }, [segments, pendingDeleteSegment, lessonId, onNavigateLessons, pushUndo]);
+  }, [pendingDeleteSegment, lessonId, onNavigateLessons, pushUndo, runExclusive]);
 
   // Swaps `segments[index]` with its neighbor at `index + direction` (-1 =
   // up/earlier, +1 = down/later) — playback order only, doesn't touch any
@@ -1321,455 +1626,110 @@ export default function LessonSegmentsView({
             )}
           </div>
 
-          {/* Pinned to the top of the viewport so the segment list below
-             scrolls *under* it — with a dozen-plus segments, editing a bound
-             near the bottom otherwise means scrolling back up to see what it
-             did. `-mx-8`/`px-8` bleed the band across `.app-shell`'s own 2rem
-             padding, so nothing shows through the gap beside it.
-
-             Two deliberate choices in the classes below:
-             * Solid `bg-background`, *not* `backdrop-blur` like the floating
-               AI input — `backdrop-filter` makes an element a containing
-               block for `position: fixed` descendants, which would trap both
-               players' fullscreen overlays (rendered in place as `fixed
-               inset-0`, not portaled) inside this row instead of covering the
-               viewport.
-             * `z-30` puts the band above the segment rows (whose `relative`
-               spinner wrappers would otherwise paint over it), while staying
-               below the body-portaled dialogs at `z-50`. It also caps this
-               subtree's paint level, which is why the floating AI input sits
-               at `z-20` — so a fullscreened player covers it rather than
-               having the prompt box float over the video. */}
-          <div className="lesson-segments-preview-row sticky top-0 z-30 -mx-8 mt-4 flex flex-wrap items-start gap-6 border-b border-border bg-background px-8 pt-4 pb-4">
-            {/* The raw source video, alongside the lesson's own stitched
-               preview — lets the user scrub the full original recording to
-               find a boundary without leaving this page, rather than only
-               being able to play back what's already in the lesson. Shares
-               `currentTime` (via `onTimeUpdate`) with the lesson preview, so
-               either player's playhead drives Trim/Split at playhead below;
-               its own segment-highlight overlay shows where this lesson's
-               segments sit in the full recording, and its Mark In/Out feeds
-               `handleAddSourceSegment` to add new ones. Placed first (left)
-               since it's the input the lesson preview (right) is derived
-               from — the arrow between them reads that direction. */}
-            <div className="lesson-segments-source-preview flex-[1_1_22rem] max-w-[40rem]">
-              <p className="mb-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-                Original video
-              </p>
-              <SourceVideoPreview
-                filePath={video.file_path}
-                selectedLessonSegments={segments}
-                hasSelectedLesson
-                onTimeUpdate={setCurrentTime}
-                onAddSegment={handleAddSourceSegment}
-                controlsLayout="stacked"
-              />
-            </div>
-
-            <span
-              className="flex-none self-center text-3xl leading-none text-muted-foreground/60"
-              aria-hidden="true"
-            >
-              »
-            </span>
-
-            <div className="lesson-card-preview lesson-segments-preview flex-[1_1_22rem] max-w-[40rem]">
-              <p className="mb-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-                Final video
-              </p>
-              <LessonPreviewPlayer
-                videoFilePath={video.file_path}
-                segments={segments}
-                lessonTitle={lesson.title}
-                overlays={previewOverlays}
-                onTimeUpdate={(time) => {
-                  setCurrentTime(time);
-                  setFinalVideoTime(time);
-                }}
-                onVirtualTimeUpdate={setFinalVirtualTime}
-              />
-              {segmentsLoading && <p>Loading segments…</p>}
-              {segmentsError && <p className="error">{segmentsError}</p>}
-            </div>
-          </div>
-
-          <ul className="m-0 mt-4 flex list-none flex-col gap-2 p-0">
-            {segments.map((segment, index) => {
-              const isSegmentBusy = segmentBusyIds.has(segment.id);
-              const canSplitSegment = currentTime > segment.start && currentTime < segment.end;
-              // Same "is the playhead inside this segment's range" check as
-              // `canSplitSegment` above, just against the final-video-only
-              // `finalVideoTime` instead of the shared `currentTime`.
-              const isActiveSegment = finalVideoTime > segment.start && finalVideoTime < segment.end;
-              return (
-                <li
-                  key={segment.id}
-                  className={cn(
-                    "flex flex-wrap items-center gap-3 border-b border-border py-1.5 px-2 text-sm last:border-b-0",
-                    isActiveSegment && "rounded-md bg-muted/60 ring-1 ring-inset ring-ring",
-                  )}
-                >
-                  <div className="flex flex-col items-center gap-0.5">
-                    <span className="text-xs text-muted-foreground">{index + 1}</span>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      disabled={isSegmentBusy || index === 0}
-                      onClick={() => void handleMoveSegment(index, -1)}
-                      aria-label="Move segment earlier"
-                    >
-                      <ChevronUp />
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      disabled={isSegmentBusy || index === segments.length - 1}
-                      onClick={() => void handleMoveSegment(index, 1)}
-                      aria-label="Move segment later"
-                    >
-                      <ChevronDown />
-                    </Button>
-                  </div>
-                  <label className="flex flex-col gap-0.5 text-xs">
-                    Start
-                    <div className="relative">
-                      <Input
-                        type="text"
-                        inputMode="numeric"
-                        pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
-                        placeholder="hh:mm:ss:fff"
-                        disabled={isSegmentBusy}
-                        value={startDrafts[segment.id] ?? formatTimestampMs(segment.start)}
-                        onChange={(event) =>
-                          setStartDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
-                        }
-                        onBlur={() => void commitSegmentStart(segment)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") event.currentTarget.blur();
-                        }}
-                        aria-label={`Start time for segment ${segment.id}`}
-                        className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
-                      />
-                      <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-xs"
-                          disabled={isSegmentBusy}
-                          onClick={() => void adjustSegmentBound(segment, "start", 1)}
-                          aria-label={`Increase start time for segment ${segment.id}`}
-                          className="h-3 w-4 [&_svg]:size-2.5"
-                        >
-                          <ChevronUp />
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-xs"
-                          disabled={isSegmentBusy}
-                          onClick={() => void adjustSegmentBound(segment, "start", -1)}
-                          aria-label={`Decrease start time for segment ${segment.id}`}
-                          className="h-3 w-4 [&_svg]:size-2.5"
-                        >
-                          <ChevronDown />
-                        </Button>
-                      </div>
-                    </div>
-                  </label>
-                  <label className="flex flex-col gap-0.5 text-xs">
-                    End
-                    <div className="relative">
-                      <Input
-                        type="text"
-                        inputMode="numeric"
-                        pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
-                        placeholder="hh:mm:ss:fff"
-                        disabled={isSegmentBusy}
-                        value={endDrafts[segment.id] ?? formatTimestampMs(segment.end)}
-                        onChange={(event) =>
-                          setEndDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
-                        }
-                        onBlur={() => void commitSegmentEnd(segment)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") event.currentTarget.blur();
-                        }}
-                        aria-label={`End time for segment ${segment.id}`}
-                        className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
-                      />
-                      <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-xs"
-                          disabled={isSegmentBusy}
-                          onClick={() => void adjustSegmentBound(segment, "end", 1)}
-                          aria-label={`Increase end time for segment ${segment.id}`}
-                          className="h-3 w-4 [&_svg]:size-2.5"
-                        >
-                          <ChevronUp />
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-xs"
-                          disabled={isSegmentBusy}
-                          onClick={() => void adjustSegmentBound(segment, "end", -1)}
-                          aria-label={`Decrease end time for segment ${segment.id}`}
-                          className="h-3 w-4 [&_svg]:size-2.5"
-                        >
-                          <ChevronDown />
-                        </Button>
-                      </div>
-                    </div>
-                  </label>
-                  <span className="flex flex-col gap-0.5 text-xs text-muted-foreground">
-                    Final video start
-                    <span className="tabular-nums" aria-label={`Final video start time for segment ${segment.id}`}>
-                      {formatTimestampMs(segmentOffsets[index])}
-                    </span>
-                  </span>
-                  <span className="flex flex-col gap-0.5 text-xs text-muted-foreground">
-                    Final video end
-                    <span className="tabular-nums" aria-label={`Final video end time for segment ${segment.id}`}>
-                      {formatTimestampMs(segmentOffsets[index] + (segment.end - segment.start))}
-                    </span>
-                  </span>
-                  <div className="flex flex-wrap gap-1.5">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={isSegmentBusy}
-                      onClick={() => void handleTrimSegmentStart(segment)}
-                    >
-                      Trim Start
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={isSegmentBusy}
-                      onClick={() => void handleTrimSegmentEnd(segment)}
-                    >
-                      Trim End
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={!canSplitSegment || isSegmentBusy}
-                      onClick={() => void handleSplitSegment(segment)}
-                    >
-                      Split at playhead
-                    </Button>
-                  </div>
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    size="icon-sm"
-                    className="ml-auto"
-                    disabled={isSegmentBusy}
-                    aria-label={`Delete segment ${segment.id}`}
-                    title="Delete segment"
-                    onClick={() => handleDeleteSegment(segment)}
-                  >
-                    <Trash2 />
-                  </Button>
-                </li>
-              );
-            })}
-          </ul>
-
-          {/* Still-image overlays composited over this lesson's own final
-             video, live in preview and at export time (`0007_frame_overlays.sql`,
-             lesson-scoped since `0009_frame_overlay_lesson_scoped.sql`) —
-             never spliced into the timeline, so video duration/transcript
-             segments/audio are untouched. `start`/`end` are virtual,
-             stitched-lesson seconds (0 = the start of this lesson's own
-             output), matching the Final video player's own scrubber — not
-             shareable across other lessons of the same video. Each overlay
-             has its own scale_percent (100 = fills the frame, lower shrinks
-             toward the center). */}
-          <div className="mt-6 border-t border-border pt-4">
-            <p className="mb-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-              Image overlays
+          {lessonLength > 0 && (
+            <p className="mt-3 mb-0 text-sm tabular-nums" title="Lesson length before → after removed words and pauses">
+              Length {formatLength(lessonLength)} → {formatLength(lessonLengthAfter)}
+              {lessonLength - lessonLengthAfter >= 0.5 && (
+                <span className="ml-1.5 text-red-400">(−{formatLength(lessonLength - lessonLengthAfter)})</span>
+              )}
             </p>
+          )}
 
-            <div className="flex flex-wrap items-end gap-3">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={overlayFormBusy}
-                onClick={() => void handlePickOverlayImage()}
+          {/* Tabs on the left, one sticky video on the right
+             (docs/text-editing-plan.md §6.3). Tab panels stay mounted and
+             are only hidden, so drafts in one survive switching to another. */}
+          <div
+            ref={editorGridRef}
+            className="mt-4 grid grid-cols-[minmax(0,1fr)_12px_var(--preview-w,42%)] items-start gap-3 max-[1000px]:grid-cols-1"
+            style={previewWidth ? ({ "--preview-w": `${previewWidth}px` } as React.CSSProperties) : undefined}
+          >
+            <div className="min-w-0 max-[1000px]:order-2">
+              <div
+                role="tablist"
+                aria-label="Lesson editor"
+                className="sticky top-0 z-30 flex flex-wrap gap-1 border-b border-border bg-background pt-2"
               >
-                Insert image{pendingOverlays.length > 0 ? "s" : ""}
-              </Button>
-            </div>
-
-            {pendingOverlays.length > 0 && (
-              <div className="mt-3 flex flex-col gap-2 rounded-md border border-border p-2">
-                {pendingOverlays.map((draft) => (
-                  <div key={draft.id} className="flex flex-wrap items-end gap-3">
-                    <span className="min-w-0 flex-1 truncate text-xs">{basename(draft.imagePath)}</span>
-                    <label className="flex flex-col gap-0.5 text-xs">
-                      Start
-                      <div className="relative">
-                        <Input
-                          type="text"
-                          inputMode="numeric"
-                          pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
-                          placeholder="hh:mm:ss:fff"
-                          disabled={overlayFormBusy}
-                          value={draft.startDraft}
-                          onChange={(event) =>
-                            handlePendingOverlayFieldChange(draft.id, "startDraft", event.target.value)
-                          }
-                          aria-label={`Start time for ${basename(draft.imagePath)}`}
-                          className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
-                        />
-                        <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            disabled={overlayFormBusy}
-                            onClick={() => handleNudgePendingOverlayStart(draft.id, 1)}
-                            aria-label={`Increase start time for ${basename(draft.imagePath)}`}
-                            className="h-3 w-4 [&_svg]:size-2.5"
-                          >
-                            <ChevronUp />
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            disabled={overlayFormBusy}
-                            onClick={() => handleNudgePendingOverlayStart(draft.id, -1)}
-                            aria-label={`Decrease start time for ${basename(draft.imagePath)}`}
-                            className="h-3 w-4 [&_svg]:size-2.5"
-                          >
-                            <ChevronDown />
-                          </Button>
-                        </div>
-                      </div>
-                    </label>
-                    <label className="flex flex-col gap-0.5 text-xs">
-                      Duration (s)
-                      <Input
-                        type="number"
-                        min="0.1"
-                        step="0.1"
-                        disabled={overlayFormBusy}
-                        value={draft.durationDraft}
-                        onChange={(event) =>
-                          handlePendingOverlayFieldChange(draft.id, "durationDraft", event.target.value)
-                        }
-                        aria-label={`Duration in seconds for ${basename(draft.imagePath)}`}
-                        className="h-7 w-20 text-xs tabular-nums"
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5 text-xs">
-                      Scale (%)
-                      <Input
-                        type="number"
-                        min="1"
-                        max="100"
-                        step="1"
-                        disabled={overlayFormBusy}
-                        value={draft.scalePercentDraft}
-                        onChange={(event) =>
-                          handlePendingOverlayFieldChange(draft.id, "scalePercentDraft", event.target.value)
-                        }
-                        aria-label={`Scale percent for ${basename(draft.imagePath)}`}
-                        title="100% fills the frame; lower values shrink the image toward the center"
-                        className="h-7 w-16 text-xs tabular-nums"
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5 text-xs">
-                      X (%)
-                      <Input
-                        type="number"
-                        min="0"
-                        max="100"
-                        step="1"
-                        disabled={overlayFormBusy}
-                        value={draft.xPercentDraft}
-                        onChange={(event) =>
-                          handlePendingOverlayFieldChange(draft.id, "xPercentDraft", event.target.value)
-                        }
-                        aria-label={`Horizontal position for ${basename(draft.imagePath)}`}
-                        title="0 = left edge, 50 = centered, 100 = right edge"
-                        className="h-7 w-16 text-xs tabular-nums"
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5 text-xs">
-                      Y (%)
-                      <Input
-                        type="number"
-                        min="0"
-                        max="100"
-                        step="1"
-                        disabled={overlayFormBusy}
-                        value={draft.yPercentDraft}
-                        onChange={(event) =>
-                          handlePendingOverlayFieldChange(draft.id, "yPercentDraft", event.target.value)
-                        }
-                        aria-label={`Vertical position for ${basename(draft.imagePath)}`}
-                        title="0 = top edge, 50 = centered, 100 = bottom edge"
-                        className="h-7 w-16 text-xs tabular-nums"
-                      />
-                    </label>
-                    <Button
-                      type="button"
-                      size="icon-sm"
-                      variant="ghost"
-                      disabled={overlayFormBusy}
-                      aria-label={`Remove ${basename(draft.imagePath)} from batch`}
-                      title="Remove from batch"
-                      onClick={() => handleRemovePendingOverlay(draft.id)}
-                    >
-                      <Trash2 />
-                    </Button>
-                    {draft.error && <p className="w-full text-xs text-destructive">{draft.error}</p>}
-                  </div>
+                {EDITOR_TABS.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === item.id}
+                    onClick={() => selectTab(item.id)}
+                    className={cn(
+                      "-mb-px cursor-pointer border-b-2 px-3 py-2 text-sm",
+                      tab === item.id
+                        ? "border-foreground font-medium text-foreground"
+                        : "border-transparent text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {item.label}
+                  </button>
                 ))}
-
-                <div className="flex gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    disabled={overlayFormBusy}
-                    onClick={() => void handleAddPendingOverlays()}
-                  >
-                    {overlayFormBusy
-                      ? "Adding…"
-                      : `Add ${pendingOverlays.length} overlay${pendingOverlays.length === 1 ? "" : "s"}`}
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    disabled={overlayFormBusy}
-                    onClick={handleCancelOverlayForm}
-                  >
-                    Cancel all
-                  </Button>
-                </div>
               </div>
-            )}
 
-            {overlaysError && <p className="mt-2 text-sm text-destructive">{overlaysError}</p>}
-            {overlaysLoading && <p className="mt-2 text-sm text-muted-foreground">Loading overlays…</p>}
+              <div role="tabpanel" hidden={tab !== "script"}>
+                <LessonScript
+                  ref={scriptRef}
+                  active={tab === "script"}
+                  lessonSegments={segments}
+                  transcriptSegments={transcriptSegments}
+                  words={words}
+                  pauses={pauses}
+                  pausesByWordId={pausesByWordId}
+                  busy={segmentOpBusy || fetchingWords}
+                  fetchingWords={fetchingWords}
+                  fetchDetail={videoProgressMap[videoId]?.detail ?? null}
+                  onFetchWords={() => void handleFetchWords()}
+                  onApplyRanges={handleApplyScriptRanges}
+                  onEditText={handleEditWords}
+                  hasTimedLayers={overlays.length > 0 || regionEditor.previewRegions.length > 0}
+                  onUndo={() => void handleUndo()}
+                  undoDepth={undoStack.length}
+                  onSeek={handleScriptSeek}
+                />
+              </div>
 
-            <ul className="m-0 mt-3 flex list-none flex-col gap-1 p-0">
-              {overlays.map((overlay) =>
-                editingOverlay?.id === overlay.id ? (
-                  <li key={overlay.id} className="border-b border-border py-1.5 px-2 last:border-b-0">
-                    <div className="flex flex-wrap items-end gap-3">
-                      <span className="min-w-0 flex-1 truncate text-xs">{basename(overlay.image_path)}</span>
+              <div role="tabpanel" hidden={tab !== "segments"}>
+              <ul className="m-0 mt-2 flex list-none flex-col gap-2 p-0">
+                {segments.map((segment, index) => {
+                  const isSegmentBusy = segmentBusyIds.has(segment.id);
+                  const canSplitSegment = currentTime > segment.start && currentTime < segment.end;
+                  // Same "is the playhead inside this segment's range" check as
+                  // `canSplitSegment` above, just against the final-video-only
+                  // `finalVideoTime` instead of the shared `currentTime`.
+                  const isActiveSegment = finalVideoTime > segment.start && finalVideoTime < segment.end;
+                  return (
+                    <li
+                      key={segment.id}
+                      className={cn(
+                        "flex flex-wrap items-center gap-3 border-b border-border py-1.5 px-2 text-sm last:border-b-0",
+                        isActiveSegment && "rounded-md bg-muted/60 ring-1 ring-inset ring-ring",
+                      )}
+                    >
+                      <div className="flex flex-col items-center gap-0.5">
+                        <span className="text-xs text-muted-foreground">{index + 1}</span>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          disabled={isSegmentBusy || index === 0}
+                          onClick={() => void handleMoveSegment(index, -1)}
+                          aria-label="Move segment earlier"
+                        >
+                          <ChevronUp />
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          disabled={isSegmentBusy || index === segments.length - 1}
+                          onClick={() => void handleMoveSegment(index, 1)}
+                          aria-label="Move segment later"
+                        >
+                          <ChevronDown />
+                        </Button>
+                      </div>
                       <label className="flex flex-col gap-0.5 text-xs">
                         Start
                         <div className="relative">
@@ -1778,10 +1738,16 @@ export default function LessonSegmentsView({
                             inputMode="numeric"
                             pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
                             placeholder="hh:mm:ss:fff"
-                            disabled={overlayFormBusy}
-                            value={editingOverlay.startDraft}
-                            onChange={(event) => handleEditOverlayFieldChange("startDraft", event.target.value)}
-                            aria-label={`Start time for ${basename(overlay.image_path)}`}
+                            disabled={isSegmentBusy}
+                            value={startDrafts[segment.id] ?? formatTimestampMs(segment.start)}
+                            onChange={(event) =>
+                              setStartDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
+                            }
+                            onBlur={() => void commitSegmentStart(segment)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") event.currentTarget.blur();
+                            }}
+                            aria-label={`Start time for segment ${segment.id}`}
                             className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
                           />
                           <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
@@ -1789,9 +1755,9 @@ export default function LessonSegmentsView({
                               type="button"
                               variant="ghost"
                               size="icon-xs"
-                              disabled={overlayFormBusy}
-                              onClick={() => handleNudgeEditOverlayStart(1)}
-                              aria-label={`Increase start time for ${basename(overlay.image_path)}`}
+                              disabled={isSegmentBusy}
+                              onClick={() => void adjustSegmentBound(segment, "start", 1)}
+                              aria-label={`Increase start time for segment ${segment.id}`}
                               className="h-3 w-4 [&_svg]:size-2.5"
                             >
                               <ChevronUp />
@@ -1800,9 +1766,9 @@ export default function LessonSegmentsView({
                               type="button"
                               variant="ghost"
                               size="icon-xs"
-                              disabled={overlayFormBusy}
-                              onClick={() => handleNudgeEditOverlayStart(-1)}
-                              aria-label={`Decrease start time for ${basename(overlay.image_path)}`}
+                              disabled={isSegmentBusy}
+                              onClick={() => void adjustSegmentBound(segment, "start", -1)}
+                              aria-label={`Decrease start time for segment ${segment.id}`}
                               className="h-3 w-4 [&_svg]:size-2.5"
                             >
                               <ChevronDown />
@@ -1811,124 +1777,572 @@ export default function LessonSegmentsView({
                         </div>
                       </label>
                       <label className="flex flex-col gap-0.5 text-xs">
-                        Duration (s)
-                        <Input
-                          type="number"
-                          min="0.1"
-                          step="0.1"
-                          disabled={overlayFormBusy}
-                          value={editingOverlay.durationDraft}
-                          onChange={(event) => handleEditOverlayFieldChange("durationDraft", event.target.value)}
-                          aria-label={`Duration in seconds for ${basename(overlay.image_path)}`}
-                          className="h-7 w-20 text-xs tabular-nums"
-                        />
+                        End
+                        <div className="relative">
+                          <Input
+                            type="text"
+                            inputMode="numeric"
+                            pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                            placeholder="hh:mm:ss:fff"
+                            disabled={isSegmentBusy}
+                            value={endDrafts[segment.id] ?? formatTimestampMs(segment.end)}
+                            onChange={(event) =>
+                              setEndDrafts((prev) => ({ ...prev, [segment.id]: event.target.value }))
+                            }
+                            onBlur={() => void commitSegmentEnd(segment)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") event.currentTarget.blur();
+                            }}
+                            aria-label={`End time for segment ${segment.id}`}
+                            className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
+                          />
+                          <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              disabled={isSegmentBusy}
+                              onClick={() => void adjustSegmentBound(segment, "end", 1)}
+                              aria-label={`Increase end time for segment ${segment.id}`}
+                              className="h-3 w-4 [&_svg]:size-2.5"
+                            >
+                              <ChevronUp />
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              disabled={isSegmentBusy}
+                              onClick={() => void adjustSegmentBound(segment, "end", -1)}
+                              aria-label={`Decrease end time for segment ${segment.id}`}
+                              className="h-3 w-4 [&_svg]:size-2.5"
+                            >
+                              <ChevronDown />
+                            </Button>
+                          </div>
+                        </div>
                       </label>
-                      <label className="flex flex-col gap-0.5 text-xs">
-                        Scale (%)
-                        <Input
-                          type="number"
-                          min="1"
-                          max="100"
-                          step="1"
+                      <span className="flex flex-col gap-0.5 text-xs text-muted-foreground">
+                        Final video start
+                        <span className="tabular-nums" aria-label={`Final video start time for segment ${segment.id}`}>
+                          {formatTimestampMs(segmentOffsets[index])}
+                        </span>
+                      </span>
+                      <span className="flex flex-col gap-0.5 text-xs text-muted-foreground">
+                        Final video end
+                        <span className="tabular-nums" aria-label={`Final video end time for segment ${segment.id}`}>
+                          {formatTimestampMs(segmentOffsets[index] + (segment.end - segment.start))}
+                        </span>
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={isSegmentBusy}
+                          onClick={() => void handleTrimSegmentStart(segment)}
+                        >
+                          Trim Start
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={isSegmentBusy}
+                          onClick={() => void handleTrimSegmentEnd(segment)}
+                        >
+                          Trim End
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={!canSplitSegment || isSegmentBusy}
+                          onClick={() => void handleSplitSegment(segment)}
+                        >
+                          Split at playhead
+                        </Button>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        size="icon-sm"
+                        className="ml-auto"
+                        disabled={isSegmentBusy}
+                        aria-label={`Delete segment ${segment.id}`}
+                        title="Delete segment"
+                        onClick={() => handleDeleteSegment(segment)}
+                      >
+                        <Trash2 />
+                      </Button>
+                    </li>
+                  );
+                })}
+              </ul>
+              </div>
+
+              <div role="tabpanel" hidden={tab !== "overlays"}>
+              {/* Still-image overlays composited over this lesson's own final
+                 video, live in preview and at export time (`0007_frame_overlays.sql`,
+                 lesson-scoped since `0009_frame_overlay_lesson_scoped.sql`) —
+                 never spliced into the timeline, so video duration/transcript
+                 segments/audio are untouched. `start`/`end` are virtual,
+                 stitched-lesson seconds (0 = the start of this lesson's own
+                 output), matching the Final video player's own scrubber — not
+                 shareable across other lessons of the same video. Each overlay
+                 has its own scale_percent (100 = fills the frame, lower shrinks
+                 toward the center). */}
+              <div className="pt-2">
+                <p className="mb-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+                  Image overlays
+                </p>
+
+                <div className="flex flex-wrap items-end gap-3">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={overlayFormBusy}
+                    onClick={() => void handlePickOverlayImage()}
+                  >
+                    Insert image{pendingOverlays.length > 0 ? "s" : ""}
+                  </Button>
+                </div>
+
+                {pendingOverlays.length > 0 && (
+                  <div className="mt-3 flex flex-col gap-2 rounded-md border border-border p-2">
+                    {pendingOverlays.map((draft) => (
+                      <div key={draft.id} className="flex flex-wrap items-end gap-3">
+                        <span className="min-w-0 flex-1 truncate text-xs">{basename(draft.imagePath)}</span>
+                        <label className="flex flex-col gap-0.5 text-xs">
+                          Start
+                          <div className="relative">
+                            <Input
+                              type="text"
+                              inputMode="numeric"
+                              pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                              placeholder="hh:mm:ss:fff"
+                              disabled={overlayFormBusy}
+                              value={draft.startDraft}
+                              onChange={(event) =>
+                                handlePendingOverlayFieldChange(draft.id, "startDraft", event.target.value)
+                              }
+                              aria-label={`Start time for ${basename(draft.imagePath)}`}
+                              className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
+                            />
+                            <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                disabled={overlayFormBusy}
+                                onClick={() => handleNudgePendingOverlayStart(draft.id, 1)}
+                                aria-label={`Increase start time for ${basename(draft.imagePath)}`}
+                                className="h-3 w-4 [&_svg]:size-2.5"
+                              >
+                                <ChevronUp />
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                disabled={overlayFormBusy}
+                                onClick={() => handleNudgePendingOverlayStart(draft.id, -1)}
+                                aria-label={`Decrease start time for ${basename(draft.imagePath)}`}
+                                className="h-3 w-4 [&_svg]:size-2.5"
+                              >
+                                <ChevronDown />
+                              </Button>
+                            </div>
+                          </div>
+                        </label>
+                        <label className="flex flex-col gap-0.5 text-xs">
+                          Duration (s)
+                          <Input
+                            type="number"
+                            min="0.1"
+                            step="0.1"
+                            disabled={overlayFormBusy}
+                            value={draft.durationDraft}
+                            onChange={(event) =>
+                              handlePendingOverlayFieldChange(draft.id, "durationDraft", event.target.value)
+                            }
+                            aria-label={`Duration in seconds for ${basename(draft.imagePath)}`}
+                            className="h-7 w-20 text-xs tabular-nums"
+                          />
+                        </label>
+                        <label className="flex flex-col gap-0.5 text-xs">
+                          Scale (%)
+                          <Input
+                            type="number"
+                            min="1"
+                            max="100"
+                            step="1"
+                            disabled={overlayFormBusy}
+                            value={draft.scalePercentDraft}
+                            onChange={(event) =>
+                              handlePendingOverlayFieldChange(draft.id, "scalePercentDraft", event.target.value)
+                            }
+                            aria-label={`Scale percent for ${basename(draft.imagePath)}`}
+                            title="100% fills the frame; lower values shrink the image toward the center"
+                            className="h-7 w-16 text-xs tabular-nums"
+                          />
+                        </label>
+                        <label className="flex flex-col gap-0.5 text-xs">
+                          X (%)
+                          <Input
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="1"
+                            disabled={overlayFormBusy}
+                            value={draft.xPercentDraft}
+                            onChange={(event) =>
+                              handlePendingOverlayFieldChange(draft.id, "xPercentDraft", event.target.value)
+                            }
+                            aria-label={`Horizontal position for ${basename(draft.imagePath)}`}
+                            title="0 = left edge, 50 = centered, 100 = right edge"
+                            className="h-7 w-16 text-xs tabular-nums"
+                          />
+                        </label>
+                        <label className="flex flex-col gap-0.5 text-xs">
+                          Y (%)
+                          <Input
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="1"
+                            disabled={overlayFormBusy}
+                            value={draft.yPercentDraft}
+                            onChange={(event) =>
+                              handlePendingOverlayFieldChange(draft.id, "yPercentDraft", event.target.value)
+                            }
+                            aria-label={`Vertical position for ${basename(draft.imagePath)}`}
+                            title="0 = top edge, 50 = centered, 100 = bottom edge"
+                            className="h-7 w-16 text-xs tabular-nums"
+                          />
+                        </label>
+                        <Button
+                          type="button"
+                          size="icon-sm"
+                          variant="ghost"
                           disabled={overlayFormBusy}
-                          value={editingOverlay.scalePercentDraft}
-                          onChange={(event) =>
-                            handleEditOverlayFieldChange("scalePercentDraft", event.target.value)
-                          }
-                          aria-label={`Scale percent for ${basename(overlay.image_path)}`}
-                          title="100% fills the frame; lower values shrink the image toward the center"
-                          className="h-7 w-16 text-xs tabular-nums"
-                        />
-                      </label>
-                      <label className="flex flex-col gap-0.5 text-xs">
-                        X (%)
-                        <Input
-                          type="number"
-                          min="0"
-                          max="100"
-                          step="1"
-                          disabled={overlayFormBusy}
-                          value={editingOverlay.xPercentDraft}
-                          onChange={(event) => handleEditOverlayFieldChange("xPercentDraft", event.target.value)}
-                          aria-label={`Horizontal position for ${basename(overlay.image_path)}`}
-                          title="0 = left edge, 50 = centered, 100 = right edge"
-                          className="h-7 w-16 text-xs tabular-nums"
-                        />
-                      </label>
-                      <label className="flex flex-col gap-0.5 text-xs">
-                        Y (%)
-                        <Input
-                          type="number"
-                          min="0"
-                          max="100"
-                          step="1"
-                          disabled={overlayFormBusy}
-                          value={editingOverlay.yPercentDraft}
-                          onChange={(event) => handleEditOverlayFieldChange("yPercentDraft", event.target.value)}
-                          aria-label={`Vertical position for ${basename(overlay.image_path)}`}
-                          title="0 = top edge, 50 = centered, 100 = bottom edge"
-                          className="h-7 w-16 text-xs tabular-nums"
-                        />
-                      </label>
+                          aria-label={`Remove ${basename(draft.imagePath)} from batch`}
+                          title="Remove from batch"
+                          onClick={() => handleRemovePendingOverlay(draft.id)}
+                        >
+                          <Trash2 />
+                        </Button>
+                        {draft.error && <p className="w-full text-xs text-destructive">{draft.error}</p>}
+                      </div>
+                    ))}
+
+                    <div className="flex gap-2">
                       <Button
                         type="button"
                         size="sm"
                         disabled={overlayFormBusy}
-                        onClick={() => void handleSaveEditOverlay()}
+                        onClick={() => void handleAddPendingOverlays()}
                       >
-                        {overlayFormBusy ? "Saving…" : "Save"}
+                        {overlayFormBusy
+                          ? "Adding…"
+                          : `Add ${pendingOverlays.length} overlay${pendingOverlays.length === 1 ? "" : "s"}`}
                       </Button>
                       <Button
                         type="button"
                         size="sm"
                         variant="ghost"
                         disabled={overlayFormBusy}
-                        onClick={handleCancelEditOverlay}
+                        onClick={handleCancelOverlayForm}
                       >
-                        Cancel
+                        Cancel all
                       </Button>
-                      {editingOverlay.error && (
-                        <p className="w-full text-xs text-destructive">{editingOverlay.error}</p>
-                      )}
                     </div>
-                  </li>
-                ) : (
-                  <li
-                    key={overlay.id}
-                    className="flex items-center justify-between gap-2 border-b border-border py-1.5 px-2 text-sm last:border-b-0"
-                  >
-                    <span className="truncate">{basename(overlay.image_path)}</span>
-                    <span className="tabular-nums text-muted-foreground">
-                      {formatTimestamp(overlay.start)}–{formatTimestamp(overlay.end)} · {overlay.scale_percent}% ·{" "}
-                      {overlay.x_percent}/{overlay.y_percent}
-                    </span>
-                    <Button
+                  </div>
+                )}
+
+                {overlaysError && <p className="mt-2 text-sm text-destructive">{overlaysError}</p>}
+                {overlaysLoading && <p className="mt-2 text-sm text-muted-foreground">Loading overlays…</p>}
+
+                <ul className="m-0 mt-3 flex list-none flex-col gap-1 p-0">
+                  {overlays.map((overlay) =>
+                    editingOverlay?.id === overlay.id ? (
+                      <li key={overlay.id} className="border-b border-border py-1.5 px-2 last:border-b-0">
+                        <div className="flex flex-wrap items-end gap-3">
+                          <span className="min-w-0 flex-1 truncate text-xs">{basename(overlay.image_path)}</span>
+                          <label className="flex flex-col gap-0.5 text-xs">
+                            Start
+                            <div className="relative">
+                              <Input
+                                type="text"
+                                inputMode="numeric"
+                                pattern="\d+:[0-5]?\d:[0-5]?\d:\d{3}"
+                                placeholder="hh:mm:ss:fff"
+                                disabled={overlayFormBusy}
+                                value={editingOverlay.startDraft}
+                                onChange={(event) => handleEditOverlayFieldChange("startDraft", event.target.value)}
+                                aria-label={`Start time for ${basename(overlay.image_path)}`}
+                                className="h-7 w-32 pr-5 font-mono text-xs tabular-nums"
+                              />
+                              <div className="absolute inset-y-0 right-0.5 flex flex-col justify-center">
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  disabled={overlayFormBusy}
+                                  onClick={() => handleNudgeEditOverlayStart(1)}
+                                  aria-label={`Increase start time for ${basename(overlay.image_path)}`}
+                                  className="h-3 w-4 [&_svg]:size-2.5"
+                                >
+                                  <ChevronUp />
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  disabled={overlayFormBusy}
+                                  onClick={() => handleNudgeEditOverlayStart(-1)}
+                                  aria-label={`Decrease start time for ${basename(overlay.image_path)}`}
+                                  className="h-3 w-4 [&_svg]:size-2.5"
+                                >
+                                  <ChevronDown />
+                                </Button>
+                              </div>
+                            </div>
+                          </label>
+                          <label className="flex flex-col gap-0.5 text-xs">
+                            Duration (s)
+                            <Input
+                              type="number"
+                              min="0.1"
+                              step="0.1"
+                              disabled={overlayFormBusy}
+                              value={editingOverlay.durationDraft}
+                              onChange={(event) => handleEditOverlayFieldChange("durationDraft", event.target.value)}
+                              aria-label={`Duration in seconds for ${basename(overlay.image_path)}`}
+                              className="h-7 w-20 text-xs tabular-nums"
+                            />
+                          </label>
+                          <label className="flex flex-col gap-0.5 text-xs">
+                            Scale (%)
+                            <Input
+                              type="number"
+                              min="1"
+                              max="100"
+                              step="1"
+                              disabled={overlayFormBusy}
+                              value={editingOverlay.scalePercentDraft}
+                              onChange={(event) =>
+                                handleEditOverlayFieldChange("scalePercentDraft", event.target.value)
+                              }
+                              aria-label={`Scale percent for ${basename(overlay.image_path)}`}
+                              title="100% fills the frame; lower values shrink the image toward the center"
+                              className="h-7 w-16 text-xs tabular-nums"
+                            />
+                          </label>
+                          <label className="flex flex-col gap-0.5 text-xs">
+                            X (%)
+                            <Input
+                              type="number"
+                              min="0"
+                              max="100"
+                              step="1"
+                              disabled={overlayFormBusy}
+                              value={editingOverlay.xPercentDraft}
+                              onChange={(event) => handleEditOverlayFieldChange("xPercentDraft", event.target.value)}
+                              aria-label={`Horizontal position for ${basename(overlay.image_path)}`}
+                              title="0 = left edge, 50 = centered, 100 = right edge"
+                              className="h-7 w-16 text-xs tabular-nums"
+                            />
+                          </label>
+                          <label className="flex flex-col gap-0.5 text-xs">
+                            Y (%)
+                            <Input
+                              type="number"
+                              min="0"
+                              max="100"
+                              step="1"
+                              disabled={overlayFormBusy}
+                              value={editingOverlay.yPercentDraft}
+                              onChange={(event) => handleEditOverlayFieldChange("yPercentDraft", event.target.value)}
+                              aria-label={`Vertical position for ${basename(overlay.image_path)}`}
+                              title="0 = top edge, 50 = centered, 100 = bottom edge"
+                              className="h-7 w-16 text-xs tabular-nums"
+                            />
+                          </label>
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={overlayFormBusy}
+                            onClick={() => void handleSaveEditOverlay()}
+                          >
+                            {overlayFormBusy ? "Saving…" : "Save"}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            disabled={overlayFormBusy}
+                            onClick={handleCancelEditOverlay}
+                          >
+                            Cancel
+                          </Button>
+                          {editingOverlay.error && (
+                            <p className="w-full text-xs text-destructive">{editingOverlay.error}</p>
+                          )}
+                        </div>
+                      </li>
+                    ) : (
+                      <li
+                        key={overlay.id}
+                        className="flex items-center justify-between gap-2 border-b border-border py-1.5 px-2 text-sm last:border-b-0"
+                      >
+                        <span className="truncate">{basename(overlay.image_path)}</span>
+                        <span className="tabular-nums text-muted-foreground">
+                          {formatTimestamp(overlay.start)}–{formatTimestamp(overlay.end)} · {overlay.scale_percent}% ·{" "}
+                          {overlay.x_percent}/{overlay.y_percent}
+                        </span>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={`Edit overlay ${basename(overlay.image_path)}`}
+                          title="Edit overlay"
+                          onClick={() => handleStartEditOverlay(overlay)}
+                        >
+                          <Pencil />
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="destructive"
+                          size="icon-sm"
+                          aria-label={`Delete overlay ${basename(overlay.image_path)}`}
+                          title="Delete overlay"
+                          onClick={() => void handleDeleteOverlay(overlay.id)}
+                        >
+                          <Trash2 />
+                        </Button>
+                      </li>
+                    ),
+                  )}
+                  {overlays.length === 0 && !overlaysLoading && (
+                    <li className="text-sm text-muted-foreground">No image overlays yet.</li>
+                  )}
+                </ul>
+
+              </div>
+              </div>
+
+              <div role="tabpanel" hidden={tab !== "shapes"} className="pt-2">
+                <RegionsPanel editor={regionEditor} />
+              </div>
+
+              <div role="tabpanel" hidden={tab !== "introOutro"} className="pt-2">
+                <IntroOutroBlock lessonId={lessonId} slidesState={slidesState} videoSize={videoSize} />
+              </div>
+
+              <div role="tabpanel" hidden={tab !== "voice"}>
+                <VoicePanel
+                  lessonId={lessonId}
+                  lines={voiceLines}
+                  lessonLength={lessonLengthAfter}
+                  hasWords={words.length > 0}
+                  voice={lessonVoice}
+                  onVoice={setLessonVoice}
+                  listening={listenToVoice}
+                  onListeningChange={setListenToVoice}
+                  onSeek={handleScriptSeek}
+                />
+              </div>
+            </div>
+
+            {/* Drag to resize the video column; double-click resets it. */}
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize video"
+              tabIndex={0}
+              title="Drag to resize the video. Double-click to reset."
+              className="group sticky top-0 flex h-[70vh] cursor-col-resize touch-none items-center justify-center self-start max-[1000px]:hidden"
+              onPointerDown={handleDividerPointerDown}
+              onDoubleClick={() => savePreviewWidth(null)}
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+                event.preventDefault();
+                event.stopPropagation();
+                const current = previewWidth ?? asideRef.current?.getBoundingClientRect().width ?? 480;
+                savePreviewWidth(clampPreviewWidth(current + (event.key === "ArrowLeft" ? 40 : -40)));
+              }}
+            >
+              <span className="h-full w-px bg-border transition-colors group-hover:w-0.5 group-hover:bg-foreground/50 group-focus-visible:w-0.5 group-focus-visible:bg-foreground/50" />
+            </div>
+
+            {/* Fills its column at the video's own aspect ratio
+               (`.lesson-editor-player` in styles.css). Solid background and
+               no backdrop-filter, so the players' fixed-position fullscreen
+               overlays aren't trapped (see the note on the old preview
+               row). */}
+            <aside
+              ref={asideRef}
+              className="lesson-editor-player sticky top-0 z-30 min-w-0 self-start bg-background pt-2 max-[1000px]:static max-[1000px]:order-1"
+            >
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <div className="inline-flex rounded-md border border-border p-0.5 text-sm" role="group" aria-label="Which video">
+                  {(["final", "original"] as const).map((view) => (
+                    <button
+                      key={view}
                       type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={`Edit overlay ${basename(overlay.image_path)}`}
-                      title="Edit overlay"
-                      onClick={() => handleStartEditOverlay(overlay)}
+                      aria-pressed={playerView === view}
+                      onClick={() => showPlayer(view)}
+                      className={cn(
+                        "cursor-pointer rounded px-2.5 py-1",
+                        playerView === view ? "bg-muted font-medium" : "text-muted-foreground hover:text-foreground",
+                      )}
                     >
-                      <Pencil />
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="destructive"
-                      size="icon-sm"
-                      aria-label={`Delete overlay ${basename(overlay.image_path)}`}
-                      title="Delete overlay"
-                      onClick={() => void handleDeleteOverlay(overlay.id)}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </li>
-                ),
+                      {view === "final" ? "Final video" : "Original recording"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="lesson-card-preview" hidden={playerView !== "final"}>
+                  <LessonPreviewPlayer
+                    ref={lessonPlayerRef}
+                    onFrameTime={handleFrameTime}
+                    videoFilePath={video.file_path}
+                    segments={segments}
+                    lessonTitle={lesson.title}
+                    overlays={previewOverlays}
+                    regions={regionEditor.previewRegions}
+                    drawRect={regionEditor.draft ? { onDraw: regionEditor.setDraftRect } : undefined}
+                    outlineRect={regionEditor.draft?.rect ?? null}
+                    slides={slidesState.slides}
+                    voiceTrackPath={listenToVoice ? (lessonVoice?.track.path ?? null) : null}
+                    onVideoSize={setVideoSize}
+                    onTimeUpdate={(time) => {
+                      setCurrentTime(time);
+                      setFinalVideoTime(time);
+                    }}
+                    onVirtualTimeUpdate={setFinalVirtualTime}
+                  />
+                  {segmentsLoading && <p>Loading segments…</p>}
+                  {segmentsError && <p className="error">{segmentsError}</p>}
+              </div>
+              {/* Mounted only while shown: its Space/arrow shortcuts are
+                 document-wide and would drive a hidden player. */}
+              {playerView === "original" && (
+                <div className="lesson-segments-source-preview">
+                  <SourceVideoPreview
+                    filePath={video.file_path}
+                    selectedLessonSegments={segments}
+                    hasSelectedLesson
+                    onTimeUpdate={setCurrentTime}
+                    onAddSegment={handleAddSourceSegment}
+                    controlsLayout="stacked"
+                    regions={sourcePreviewRegions}
+                  />
+                </div>
               )}
-              {overlays.length === 0 && !overlaysLoading && (
-                <li className="text-sm text-muted-foreground">No image overlays yet.</li>
-              )}
-            </ul>
+            </aside>
           </div>
 
           {proposedSegments !== null && (

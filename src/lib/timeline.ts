@@ -127,3 +127,24 @@ export function rewriteFinalTimestampsToSource(
     return formatTimestamp(finalToSource(segments, finalSeconds));
   });
 }
+
+/** A virtual (final-video) range → the source-video ranges it covers, one
+ * per segment it overlaps — the inverse direction of the per-piece mapping
+ * `export.rs` does for overlays/regions. Used to show a lesson's shape
+ * layers on the *Original* video preview, which plays source time. A
+ * source range can belong to more than one segment, so the result may
+ * contain overlapping ranges; callers just render each. */
+export function virtualRangeToSourceRanges(segments: readonly Range[], start: number, end: number): Range[] {
+  const ranges: Range[] = [];
+  let offset = 0;
+  for (const segment of segments) {
+    const length = segment.end - segment.start;
+    const localStart = Math.max(start - offset, 0);
+    const localEnd = Math.min(end - offset, length);
+    if (localEnd > localStart) {
+      ranges.push({ start: segment.start + localStart, end: segment.start + localEnd });
+    }
+    offset += length;
+  }
+  return ranges;
+}

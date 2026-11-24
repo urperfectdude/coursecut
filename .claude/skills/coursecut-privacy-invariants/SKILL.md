@@ -10,9 +10,10 @@ This is PRD principle 1 (Local First) and the core value proposition, not a soft
 ## The rule
 
 * Raw video files are **never** uploaded, streamed, or transmitted anywhere, for any feature (not previews, not crash reports, not analytics).
-* Only two things may be sent to OpenAI, and only for their stated purpose:
+* Only these may be sent to OpenAI, and only for their stated purpose:
   1. **Extracted audio** → Whisper, for transcription.
   2. **Transcript text** → GPT-5.5, for lesson analysis.
+  3. **Lesson script text** (the corrected words of one lesson, a line at a time), plus the chosen voice name and the user's optional speaking-style text → the speech endpoint (`/v1/audio/speech`, `gpt-4o-mini-tts`), for the AI voice. **Only while the user has turned AI voice on** (`ai_voice_enabled` in `app_settings`, off by default). `voice.rs::generate_lesson_voice` checks the flag itself on every call, not just the UI. Added 2026-11-24 (HCM feature 4).
 * No other network destination should ever see project media or transcript content unless the user explicitly configures one in the future (out of scope for MVP — PRD §16 excludes cloud storage/collaboration).
 
 ## What this means in practice
