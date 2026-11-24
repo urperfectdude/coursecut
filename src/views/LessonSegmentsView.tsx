@@ -21,6 +21,7 @@ import {
   deleteFrameOverlay,
   deleteLessonSegment,
   fetchWordTimestamps,
+  getLessonVoice,
   getProject,
   getVideo,
   listFrameOverlays,
@@ -449,6 +450,25 @@ export default function LessonSegmentsView({
   const scriptRef = useRef<WordTranscriptHandle>(null);
   const pauses = useMemo(() => findPauses(words), [words]);
   const pausesByWordId = useMemo(() => new Map(pauses.map((p) => [p.afterWordId, p])), [pauses]);
+
+  // The lesson's saved AI voice, if any (made in an earlier visit).
+  useEffect(() => {
+    let cancelled = false;
+    setLessonVoice(null);
+    setListenToVoice(false);
+    getLessonVoice(lessonId)
+      .then((saved) => {
+        if (!cancelled && saved) {
+          setLessonVoice({ track: saved.track, signature: saved.signature, useInExport: saved.use_in_export });
+        }
+      })
+      .catch(() => {
+        // No saved voice to show; Generate still works.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [lessonId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2252,6 +2272,7 @@ export default function LessonSegmentsView({
                   listening={listenToVoice}
                   onListeningChange={setListenToVoice}
                   onSeek={handleScriptSeek}
+                  onEditLine={handleEditWords}
                 />
               </div>
             </div>

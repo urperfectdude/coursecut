@@ -192,6 +192,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|err| format!("could not update schema version: {err}"))?;
     }
 
+    if version < 15 {
+        conn.execute_batch(include_str!("../migrations/0015_lesson_voice.sql"))
+            .map_err(|err| format!("migration 0015_lesson_voice failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 15)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
     Ok(())
 }
 
