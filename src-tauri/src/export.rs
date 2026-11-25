@@ -756,6 +756,32 @@ fn regions_for_segment(
     Ok(regions)
 }
 
+/// The lesson's crop for `CutExtras::crop`: `None` without a row or while
+/// it's switched off, so such an export is exactly what it was before crop
+/// existed. The same crop applies to every segment of the lesson.
+fn crop_for_lesson(conn: &Connection, lesson_id: &str) -> Result<Option<crate::ffmpeg::SegmentCrop>, String> {
+    let Some(row) = crate::db::query_lesson_crop(conn, lesson_id)? else {
+        return Ok(None);
+    };
+    if !row.enabled {
+        return Ok(None);
+    }
+    Ok(Some(crate::ffmpeg::SegmentCrop {
+        x_percent: row.x_percent,
+        y_percent: row.y_percent,
+        w_percent: row.w_percent,
+        h_percent: row.h_percent,
+        bg_color: row.bg_color,
+        padding_percent: row.padding_percent,
+        shadow: row.shadow_enabled.then_some(crate::ffmpeg::CropShadow {
+            blur: row.shadow_blur,
+            opacity: row.shadow_opacity,
+            offset_y: row.shadow_offset_y,
+        }),
+        sar: None,
+    }))
+}
+
 /// One piece of an export's output, in play order. Each is encoded to its
 /// own file, and the files are joined by the stream-copy `concat_videos`.
 #[derive(Debug, Clone, PartialEq)]
@@ -1197,7 +1223,7 @@ async fn export_video(app: &AppHandle, job: &PendingExport, output_path: &str) -
 
     if job.segments.len() == 1 && !has_inserted_slide {
         let segment = &job.segments[0];
-        let (overlays, regions) = {
+        let (overlays, regions, crop) = {
             let conn = app.state::<DbConnection>();
             let guard = conn.0.lock().map_err(|err| err.to_string())?;
             // A single-segment lesson's one segment starts at virtual t=0 —
@@ -1206,10 +1232,12 @@ async fn export_video(app: &AppHandle, job: &PendingExport, output_path: &str) -
             (
                 overlays_for_segment(&guard, &job.lesson_id, 0.0, length)?,
                 regions_for_segment(&guard, &job.lesson_id, 0.0, length)?,
+                crop_for_lesson(&guard, &job.lesson_id)?,
             )
         };
         let mut extras = slides_for_segment(&windows, 0.0, lesson_length, source_has_audio);
         extras.single_audio = !slides.is_empty();
+        extras.crop = crop;
         let register_child = register_child_closure(app, &job.id);
         let on_progress = progress_closure(app, &job.id, 0.0, 1.0, 1.0);
         let result = crate::ffmpeg::export_lesson(
@@ -1303,9 +1331,9 @@ async fn export_video(app: &AppHandle, job: &PendingExport, output_path: &str) -
 }
 
 /// Encodes one `ExportPiece` of a concatenated export to `temp_path`. A
-/// segment piece gets the overlays, shapes and overlay-mode slides of its
-/// own slice of the virtual timeline (`virtual_offset`, which doesn't count
-/// inserted slides), plus `insert_params`' stream params when the export has
+/// segment piece gets the lesson's crop, and the overlays, shapes and
+/// overlay-mode slides of its own slice of the virtual timeline
+/// (`virtual_offset`, which doesn't count inserted slides), plus `insert_params`' stream params when the export has
 /// an inserted slide; `any_slides` maps only the first audio track (see
 /// `CutExtras::single_audio`). A slide piece needs `insert_params`, which is
 /// set whenever one exists.
@@ -1330,17 +1358,19 @@ async fn encode_piece(
             ..
         } => {
             let length = (end - start).max(0.0);
-            let (overlays, regions) = {
+            let (overlays, regions, crop) = {
                 let conn = app.state::<DbConnection>();
                 let guard = conn.0.lock().map_err(|err| err.to_string())?;
                 (
                     overlays_for_segment(&guard, &job.lesson_id, *virtual_offset, length)?,
                     regions_for_segment(&guard, &job.lesson_id, *virtual_offset, length)?,
+                    crop_for_lesson(&guard, &job.lesson_id)?,
                 )
             };
             let mut extras = slides_for_segment(windows, *virtual_offset, length, source_has_audio);
             extras.stream = insert_params.map(|(stream, _)| stream.clone());
             extras.single_audio = any_slides;
+            extras.crop = crop;
             crate::ffmpeg::export_lesson(
                 app,
                 &job.video_path,
@@ -1873,13 +1903,45 @@ mod regions_for_segment_tests {
         assert!(regions_for_segment(&conn, "l1", OFFSET, LENGTH).is_err());
     }
 
+    #[test]
+    fn crop_is_loaded_only_while_enabled() {
+        let conn = seeded_conn();
+        assert_eq!(crop_for_lesson(&conn, "l1").unwrap(), None);
+        let mut input = crate::db::CropInput {
+            enabled: false,
+            x_percent: 10.0,
+            y_percent: 20.0,
+            w_percent: 40.0,
+            h_percent: 50.0,
+            bg_color: "#123456".into(),
+            padding_percent: 4.0,
+            shadow_enabled: true,
+            shadow_blur: 12,
+            shadow_opacity: 0.25,
+            shadow_offset_y: -3,
+        };
+        crate::db::upsert_lesson_crop_for_test(&conn, "l1", &input).unwrap();
+        assert_eq!(crop_for_lesson(&conn, "l1").unwrap(), None);
+        input.enabled = true;
+        crate::db::upsert_lesson_crop_for_test(&conn, "l1", &input).unwrap();
+        let crop = crop_for_lesson(&conn, "l1").unwrap().unwrap();
+        assert_eq!((crop.x_percent, crop.w_percent, crop.padding_percent), (10.0, 40.0, 4.0));
+        assert_eq!(crop.bg_color, "#123456");
+        assert_eq!(crop.shadow, Some(crate::ffmpeg::CropShadow { blur: 12, opacity: 0.25, offset_y: -3 }));
+        input.shadow_enabled = false;
+        crate::db::upsert_lesson_crop_for_test(&conn, "l1", &input).unwrap();
+        assert_eq!(crop_for_lesson(&conn, "l1").unwrap().unwrap().shadow, None);
+        assert_eq!(crop_for_lesson(&conn, "l2").unwrap(), None);
+    }
+
     /// Not a real test: dumps the exact per-segment ffmpeg arg lists
     /// `do_export` would run for a 2-segment lesson with a blurred ellipse
     /// crossing the segment boundary, a solid rounded rect and an image
     /// overlay, so they can be run against the real sidecar ffmpeg. Run with
     /// `CC_VIDEO=... CC_IMAGE=... CC_OUT=<dir> cargo test --lib dump_cli_check_args -- --ignored`.
     /// Dimensions are passed in (`CC_DIMS=1440x774`, `CC_IMAGE_DIMS=WxH`)
-    /// since there's no AppHandle to probe with here.
+    /// since there's no AppHandle to probe with here. `CC_CROP=1` adds an
+    /// enabled crop with the default background, padding and shadow.
     #[test]
     #[ignore]
     fn dump_cli_check_args() {
@@ -1918,6 +1980,27 @@ mod regions_for_segment_tests {
         )
         .unwrap();
 
+        if std::env::var("CC_CROP").is_ok() {
+            let crop = crate::db::CropInput {
+                enabled: true,
+                x_percent: 10.0,
+                y_percent: 5.0,
+                w_percent: 45.0,
+                h_percent: 80.0,
+                bg_color: "#0B1F3A".into(),
+                padding_percent: 6.0,
+                shadow_enabled: true,
+                shadow_blur: 24,
+                shadow_opacity: 0.5,
+                shadow_offset_y: 8,
+            };
+            crate::db::upsert_lesson_crop_for_test(&conn, "l1", &crop).unwrap();
+        }
+        let extras = crate::ffmpeg::CutExtras {
+            crop: crop_for_lesson(&conn, "l1").unwrap(),
+            ..crate::ffmpeg::CutExtras::default()
+        };
+
         let mut offset = 0.0;
         let mut lines = Vec::new();
         for (index, (start, end)) in [(30.0, 40.0), (100.0, 110.0)].into_iter().enumerate() {
@@ -1935,7 +2018,7 @@ mod regions_for_segment_tests {
                 &overlay_dims,
                 &regions,
                 main_dims,
-                &crate::ffmpeg::CutExtras::default(),
+                &extras,
                 &[],
             );
             lines.push(serde_json::to_string(&args).unwrap());

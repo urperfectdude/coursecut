@@ -423,8 +423,128 @@ pub(crate) fn apply_word_texts(
         .collect())
 }
 
+/// Rewrites `video_id`'s word texts from its transcript sentences, after an
+/// imported transcript replaced them. Words keep their timing; each
+/// sentence's text is spread over the words it contains, in order (like
+/// the editor's `spreadEditedText`). Clears every past text edit
+/// (`original_text`), since it was a fix to the old transcript's wording.
+/// Words outside every sentence go back to Whisper's text.
+pub(crate) fn retext_words_from_segments(conn: &Connection, video_id: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE transcript_words SET text = COALESCE(original_text, text), original_text = NULL
+         WHERE video_id = ?1",
+        params![video_id],
+    )
+    .map_err(|err| err.to_string())?;
+
+    let segments: Vec<(f64, f64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT start, end, text FROM transcript_segments WHERE video_id = ?1 ORDER BY start")
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(params![video_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|err| err.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|err| err.to_string())?
+    };
+    let mut select = conn
+        .prepare("SELECT id FROM transcript_words WHERE video_id = ?1 AND start >= ?2 AND start < ?3 ORDER BY idx")
+        .map_err(|err| err.to_string())?;
+    let mut update = conn
+        .prepare("UPDATE transcript_words SET text = ?1 WHERE id = ?2")
+        .map_err(|err| err.to_string())?;
+    for (start, end, text) in &segments {
+        let ids: Vec<String> = select
+            .query_map(params![video_id, start, end], |row| row.get(0))
+            .map_err(|err| err.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|err| err.to_string())?;
+        for (id, part) in ids.iter().zip(spread_text(ids.len(), text)) {
+            update.execute(params![part, id]).map_err(|err| err.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Applies a transcript imported since the last Analyze to the words
+/// (`retext_words_from_segments`), once, and clears the mark.
+pub(crate) fn apply_pending_retext(conn: &Connection, video_id: &str) -> Result<(), String> {
+    let pending: bool = conn
+        .query_row(
+            "SELECT words_retext_pending FROM videos WHERE id = ?1",
+            params![video_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    if pending {
+        retext_words_from_segments(conn, video_id)?;
+        conn.execute(
+            "UPDATE videos SET words_retext_pending = 0 WHERE id = ?1",
+            params![video_id],
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+/// `text`'s tokens spread over `count` words in order (the Rust twin of
+/// `spreadEditedText` in `src/lib/transcript-words.ts`).
+fn spread_text(count: usize, text: &str) -> Vec<String> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    (0..count)
+        .map(|i| {
+            let from = (i * tokens.len()).div_ceil(count);
+            let to = ((i + 1) * tokens.len()).div_ceil(count);
+            tokens[from..to].join(" ")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retext_spreads_sentence_text_and_clears_edits() {
+        let conn = setup();
+        replace_words(&conn, "v", None, &[w(1.0, "helo"), w(1.5, "wrld"), w(2.5, "x"), w(9.0, "out")], None).unwrap();
+        conn.execute(
+            "UPDATE transcript_words SET original_text = text, text = 'edited' WHERE text IN ('x', 'out')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transcript_segments (id, video_id, start, end, text, keep) VALUES
+             ('a', 'v', 0.0, 2.0, 'Hello, world.', 1), ('b', 'v', 2.0, 4.0, 'Three new words.', 1)",
+            [],
+        )
+        .unwrap();
+        retext_words_from_segments(&conn, "v").unwrap();
+        assert_eq!(texts(&conn), vec!["Hello,", "world.", "Three new words.", "out"]);
+        let edited: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transcript_words WHERE original_text IS NOT NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edited, 0);
+        assert_eq!(spread_text(3, "a b"), vec!["a", "b", ""]);
+    }
+
+    #[test]
+    fn pending_retext_applies_once_then_clears() {
+        let conn = setup();
+        replace_words(&conn, "v", None, &[w(1.0, "old")], None).unwrap();
+        conn.execute(
+            "INSERT INTO transcript_segments (id, video_id, start, end, text, keep) VALUES ('a', 'v', 0.0, 2.0, 'New.', 1)",
+            [],
+        )
+        .unwrap();
+        apply_pending_retext(&conn, "v").unwrap();
+        assert_eq!(texts(&conn), vec!["old"]);
+        conn.execute("UPDATE videos SET words_retext_pending = 1", []).unwrap();
+        apply_pending_retext(&conn, "v").unwrap();
+        assert_eq!(texts(&conn), vec!["New."]);
+        let pending: bool = conn
+            .query_row("SELECT words_retext_pending FROM videos", [], |r| r.get(0))
+            .unwrap();
+        assert!(!pending);
+    }
+
     use super::*;
 
     fn setup() -> Connection {

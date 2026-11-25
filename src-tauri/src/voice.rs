@@ -499,6 +499,19 @@ longer than the original (it has to fit the same time slot); shorter is better w
 lost. The neighbouring lines are context only: never repeat or rewrite them. Reply with JSON: \
 {\"text\": \"<the improved line>\"}.";
 
+/// Follows a user-supplied system prompt (Improve all's editable prompt):
+/// whatever that prompt says about its output, each call rewrites one
+/// line that must fit its slot, and the reply is parsed as JSON.
+const IMPROVE_LINE_TASK: &str = "\n\n---\nTASK FOR THIS REQUEST (this overrides any output format \
+or multi-segment instructions above): you are given ONE line of the script, with its neighbouring \
+lines as context only. Apply the editing rules above to that line alone. The new line must not be \
+longer than the original (it has to fit the same time slot); shorter is better when nothing is lost. \
+Never repeat or rewrite the neighbouring lines, and add no timestamps, cue numbers or NOTE blocks. \
+Reply with JSON only: {\"text\": \"<the improved line>\"}.";
+
+/// The longest user system prompt sent.
+const MAX_SYSTEM_PROMPT_CHARS: usize = 10_000;
+
 #[derive(Deserialize)]
 struct ImprovedLine {
     text: String,
@@ -515,6 +528,8 @@ pub async fn improve_voice_line(
     text: String,
     previous: Option<String>,
     next: Option<String>,
+    instructions: Option<String>,
+    system_prompt: Option<String>,
 ) -> Result<String, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -539,18 +554,37 @@ pub async fn improve_voice_line(
             .filter(|l| !l.is_empty())
             .unwrap_or_else(|| "(none)".to_string())
     };
-    let user_prompt = format!(
+    let mut user_prompt = format!(
         "Previous line (context): {}\nNext line (context): {}\n\nLine to improve ({} characters): {}",
         clip(previous),
         clip(next),
         text.chars().count(),
         text
     );
+    // The user's own direction for this rewrite (Improve all's optional
+    // prompt). It can't lift the length limit: the line must still fit.
+    let instructions: String = instructions.unwrap_or_default().trim().chars().take(1000).collect();
+    if !instructions.is_empty() {
+        user_prompt.push_str(&format!(
+            "\n\nExtra instructions from the user (follow them, but keep the line no longer than the original): {instructions}"
+        ));
+    }
+    let system_prompt: String = system_prompt
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(MAX_SYSTEM_PROMPT_CHARS)
+        .collect();
+    let system = if system_prompt.is_empty() {
+        IMPROVE_SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{system_prompt}{IMPROVE_LINE_TASK}")
+    };
     let body = serde_json::json!({
         "model": "gpt-5.5",
         "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": IMPROVE_SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": user_prompt},
         ],
     });

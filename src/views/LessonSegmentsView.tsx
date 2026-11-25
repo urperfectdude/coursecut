@@ -12,6 +12,7 @@ import { scriptBlocks, totalLength, type Range } from "../lib/lesson-cuts";
 import SourceVideoPreview from "../components/SourceVideoPreview";
 import RegionsPanel, { useRegionEditor } from "../components/RegionsPanel";
 import IntroOutroBlock, { useLessonSlides } from "../components/IntroOutroPanel";
+import CropPanel, { useCropEditor } from "../components/CropPanel";
 import type { PreviewRegion } from "../components/RegionLayers";
 import { basename } from "./ProjectDetailView";
 import {
@@ -86,7 +87,7 @@ import { cn } from "@/lib/utils";
  * over a rounding fraction of a second. */
 const RANGE_MATCH_EPSILON_SECS = 0.01;
 
-type EditorTab = "script" | "segments" | "overlays" | "shapes" | "introOutro" | "voice";
+type EditorTab = "script" | "segments" | "overlays" | "shapes" | "crop" | "introOutro" | "voice";
 
 const PREVIEW_WIDTH_KEY = "coursecut.lessonEditor.previewWidth";
 const MIN_PREVIEW_WIDTH_PX = 280;
@@ -97,6 +98,7 @@ const EDITOR_TABS: { id: EditorTab; label: string }[] = [
   { id: "segments", label: "Segments" },
   { id: "overlays", label: "Overlays" },
   { id: "shapes", label: "Blur & cover" },
+  { id: "crop", label: "Crop" },
   { id: "introOutro", label: "Intro/Outro" },
   { id: "voice", label: "AI voice" },
 ];
@@ -800,6 +802,11 @@ export default function LessonSegmentsView({
     setRedoStack([]);
   }, []);
 
+  // The lesson's crop (`lesson_crop`): each save is one step on this page's
+  // undo stack.
+  const cropEditor = useCropEditor(lessonId, pushUndo);
+  const { flush: flushCrop, flushForUndo: flushCropForUndo } = cropEditor;
+
   // One segment-changing operation at a time (undo, redo, Script cuts, and
   // every edit through `withSegmentUndo`): each reads the current segments
   // and writes a new list, so two at once would work from stale data.
@@ -831,6 +838,20 @@ export default function LessonSegmentsView({
   );
   const handleUndo = useCallback(async () => {
     if (segmentOpBusyRef.current) return;
+    // A crop change still waiting to save is the latest edit: save it as
+    // its own step and undo that, leaving the rest of the stack alone. As a
+    // fresh edit, it replaces whatever was redoable.
+    try {
+      const cropStep = await flushCropForUndo();
+      if (cropStep) {
+        await runExclusive(() => cropStep.undo());
+        setRedoStack([cropStep]);
+        return;
+      }
+    } catch (err) {
+      setSegmentsError(err instanceof Error ? err.message : String(err));
+      return;
+    }
     const action = undoStack[undoStack.length - 1];
     if (!action) return;
     setUndoStack((prev) => prev.slice(0, -1));
@@ -840,10 +861,22 @@ export default function LessonSegmentsView({
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
     }
-  }, [undoStack, runExclusive]);
+  }, [undoStack, runExclusive, flushCropForUndo]);
 
   const handleRedo = useCallback(async () => {
     if (segmentOpBusyRef.current) return;
+    // A crop change still waiting to save is a fresh edit, so nothing is
+    // redoable after it: save it (its step clears the redo stack) instead.
+    try {
+      const cropStep = await flushCropForUndo();
+      if (cropStep) {
+        pushUndo(cropStep);
+        return;
+      }
+    } catch (err) {
+      setSegmentsError(err instanceof Error ? err.message : String(err));
+      return;
+    }
     const action = redoStack[redoStack.length - 1];
     if (!action) return;
     setRedoStack((prev) => prev.slice(0, -1));
@@ -853,7 +886,7 @@ export default function LessonSegmentsView({
     } catch (err) {
       setSegmentsError(err instanceof Error ? err.message : String(err));
     }
-  }, [redoStack, runExclusive]);
+  }, [redoStack, runExclusive, flushCropForUndo, pushUndo]);
 
 
   /** "Get word timings": one Whisper pass storing word timestamps for the
@@ -871,13 +904,21 @@ export default function LessonSegmentsView({
     }
   }, [fetchingWords, videoId, clearProgress]);
 
-  /** Script tab "Edit": corrects the selected words' text, spread over
-   * them in order so each keeps its timing. One undo step. Words whose
-   * shown text doesn't change are left alone, so they don't read as edited. */
-  const handleEditWords = useCallback(
-    (idxs: number[], text: string) => {
-      const selected = idxs.map((idx) => words[idx]).filter((word): word is TranscriptWord => word !== undefined);
-      if (selected.length === 0 || !text.trim()) return;
+  /** Script tab "Edit" and AI voice line edits: corrects each group of
+   * words' text, spread over them in order so each keeps its timing. One
+   * undo step for all groups. Words whose shown text doesn't change are
+   * left alone, so they don't read as edited. */
+  const handleEditLines = useCallback(
+    (edits: readonly { idxs: number[]; text: string }[]) => {
+      const groups = edits
+        .filter((edit) => edit.text.trim())
+        .map((edit) => ({
+          text: edit.text,
+          words: edit.idxs.map((idx) => words[idx]).filter((word): word is TranscriptWord => word !== undefined),
+        }))
+        .filter((group) => group.words.length > 0);
+      if (groups.length === 0) return;
+      const selected = groups.flatMap((group) => group.words);
       // What each selected word shows now (punctuated by its sentence).
       const shown = new Map<number, string>();
       for (const segment of transcriptSegments) {
@@ -888,15 +929,17 @@ export default function LessonSegmentsView({
           if (!shown.has(word.idx)) shown.set(word.idx, texts[i]);
         });
       }
-      const parts = spreadEditedText(selected.length, text);
       const after: { id: string; text: string | null }[] = [];
       const before: { id: string; text: string | null }[] = [];
-      selected.forEach((word, i) => {
-        if (parts[i] === (shown.get(word.idx) ?? word.text)) return;
-        after.push({ id: word.id, text: parts[i] });
-        // An unedited word goes back to Whisper's text (not edited).
-        before.push({ id: word.id, text: word.original_text === null ? null : word.text });
-      });
+      for (const group of groups) {
+        const parts = spreadEditedText(group.words.length, group.text);
+        group.words.forEach((word, i) => {
+          if (parts[i] === (shown.get(word.idx) ?? word.text)) return;
+          after.push({ id: word.id, text: parts[i] });
+          // An unedited word goes back to Whisper's text (not edited).
+          before.push({ id: word.id, text: word.original_text === null ? null : word.text });
+        });
+      }
       if (after.length === 0) return;
       const merge = (rows: TranscriptWord[]) => {
         const byId = new Map(rows.map((row) => [row.id, row]));
@@ -911,6 +954,10 @@ export default function LessonSegmentsView({
       }).catch((err) => setSegmentsError(err instanceof Error ? err.message : String(err)));
     },
     [words, transcriptSegments, videoId, runExclusive, pushUndo],
+  );
+  const handleEditWords = useCallback(
+    (idxs: number[], text: string) => handleEditLines([{ idxs, text }]),
+    [handleEditLines],
   );
 
   // Length now, and before Script cuts: the cut gaps inside each script
@@ -971,10 +1018,10 @@ export default function LessonSegmentsView({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [handleUndo, handleRedo]);
 
-  // Placing overlays and drawing shapes happens on the Final video.
+  // Placing overlays, drawing shapes and cropping happen on the Final video.
   const selectTab = useCallback((next: EditorTab) => {
     setTab(next);
-    if (next === "overlays" || next === "shapes" || next === "introOutro") setPlayerView("final");
+    if (next === "overlays" || next === "shapes" || next === "crop" || next === "introOutro") setPlayerView("final");
   }, []);
 
   // Runs a segment-mutating IPC call, then records an undo/redo step
@@ -1166,13 +1213,16 @@ export default function LessonSegmentsView({
       const dir = await open({ directory: true });
       if (!dir || typeof dir !== "string") return;
       setExporting(true);
+      // The export reads the crop from the database: save a change still
+      // waiting first.
+      await flushCrop();
       await queueExport([lessonId], dir);
     } catch (err) {
       setExportError(err instanceof Error ? err.message : String(err));
     } finally {
       setExporting(false);
     }
-  }, [exporting, lessonId]);
+  }, [exporting, lessonId, flushCrop]);
 
   const commitSegmentStart = useCallback(
     async (segment: LessonSegment) => {
@@ -2257,6 +2307,10 @@ export default function LessonSegmentsView({
                 <RegionsPanel editor={regionEditor} />
               </div>
 
+              <div role="tabpanel" hidden={tab !== "crop"} className="pt-2">
+                <CropPanel editor={cropEditor} />
+              </div>
+
               <div role="tabpanel" hidden={tab !== "introOutro"} className="pt-2">
                 <IntroOutroBlock lessonId={lessonId} slidesState={slidesState} videoSize={videoSize} />
               </div>
@@ -2272,7 +2326,7 @@ export default function LessonSegmentsView({
                   listening={listenToVoice}
                   onListeningChange={setListenToVoice}
                   onSeek={handleScriptSeek}
-                  onEditLine={handleEditWords}
+                  onEditLines={handleEditLines}
                 />
               </div>
             </div>
@@ -2336,6 +2390,12 @@ export default function LessonSegmentsView({
                     regions={regionEditor.previewRegions}
                     drawRect={regionEditor.draft ? { onDraw: regionEditor.setDraftRect } : undefined}
                     outlineRect={regionEditor.draft?.rect ?? null}
+                    crop={cropEditor.loaded ? cropEditor.crop : null}
+                    cropEdit={
+                      tab === "crop" && cropEditor.crop.enabled
+                        ? { rect: cropEditor.rect, onChange: cropEditor.setRect }
+                        : null
+                    }
                     slides={slidesState.slides}
                     voiceTrackPath={listenToVoice ? (lessonVoice?.track.path ?? null) : null}
                     onVideoSize={setVideoSize}

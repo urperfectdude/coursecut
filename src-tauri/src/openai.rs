@@ -1064,7 +1064,8 @@ async fn run_transcription(
         }
         crate::words::replace_words(&tx, video_id, None, &words, Some("hallucination"))?;
         tx.execute(
-            "UPDATE videos SET transcript_status = 'transcribed', transcript_source = 'whisper', updated_at = ?1 WHERE id = ?2",
+            "UPDATE videos SET transcript_status = 'transcribed', transcript_source = 'whisper',
+                 words_retext_pending = 0, updated_at = ?1 WHERE id = ?2",
             params![now, video_id],
         )
         .map_err(|err| err.to_string())?;
@@ -1137,6 +1138,18 @@ pub async fn fetch_word_timestamps(
     let mut guard = conn.0.lock().map_err(|err| err.to_string())?;
     let tx = guard.transaction().map_err(|err| err.to_string())?;
     crate::words::replace_words(&tx, &video_id, None, &transcript.words, None)?;
+    // An imported transcript's text wins over Whisper's: keep its wording,
+    // unless it hasn't been analyzed yet (Analyze applies it then).
+    let (source, pending): (String, bool) = tx
+        .query_row(
+            "SELECT transcript_source, words_retext_pending FROM videos WHERE id = ?1",
+            params![video_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|err| err.to_string())?;
+    if source == "vtt" && !pending {
+        crate::words::retext_words_from_segments(&tx, &video_id)?;
+    }
     tx.commit().map_err(|err| err.to_string())?;
     crate::words::query_words(&guard, &video_id)
 }
@@ -2196,6 +2209,9 @@ pub async fn analyze_video(
         // created/edited lessons (source != 'ai') are left untouched.
         let tx = guard.transaction().map_err(|err| err.to_string())?;
         replace_ai_lessons_tx(&tx, &video_id, &suggestions)?;
+        // A transcript imported since the last Analyze reaches the lesson
+        // editor's words now.
+        crate::words::apply_pending_retext(&tx, &video_id)?;
         tx.commit().map_err(|err| err.to_string())?;
     }
 

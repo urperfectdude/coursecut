@@ -281,9 +281,16 @@ export async function getLessonVoice(lessonId: string): Promise<SavedLessonVoice
 }
 
 /** GPT-5.5's clearer wording for one script line (sends that line and its
- * neighbours' text; needs the AI voice opt-in). Nothing is saved. */
-export async function improveVoiceLine(text: string, previous: string | null, next: string | null): Promise<string> {
-  return invoke<string>("improve_voice_line", { text, previous, next });
+ * neighbours' text, plus the user's optional `instructions`; needs the AI
+ * voice opt-in). Nothing is saved. */
+export async function improveVoiceLine(
+  text: string,
+  previous: string | null,
+  next: string | null,
+  instructions: string | null = null,
+  systemPrompt: string | null = null,
+): Promise<string> {
+  return invoke<string>("improve_voice_line", { text, previous, next, instructions, systemPrompt });
 }
 
 /** Whether exports of the lesson use its AI voice instead of the recording. */
@@ -611,6 +618,42 @@ export async function updateLessonRegion(id: string, region: RegionInput): Promi
 
 export async function deleteLessonRegion(id: string): Promise<void> {
   await invoke("delete_lesson_region", { id });
+}
+
+// A lesson's crop (`0017_lesson_crop.sql`), one per lesson, whole export.
+// The rect is top-left + size, 0-100 percent of the SOURCE frame. The
+// cropped picture is scaled to fit inside the frame minus `padding_percent`
+// (of the shorter side, every edge), centred on `bg_color`, with an
+// optional drop shadow. No row or `enabled: false` = no crop.
+export interface LessonCrop {
+  lesson_id: string;
+  enabled: boolean;
+  x_percent: number;
+  y_percent: number;
+  w_percent: number;
+  h_percent: number;
+  /** `#rrggbb`. */
+  bg_color: string;
+  padding_percent: number;
+  shadow_enabled: boolean;
+  /** CSS `box-shadow` blur radius in source pixels (0-200). */
+  shadow_blur: number;
+  /** 0-1. */
+  shadow_opacity: number;
+  /** Source pixels, down is positive (-200 to 200). */
+  shadow_offset_y: number;
+  updated_at: string;
+}
+
+// The editable fields of a crop.
+export type CropInput = Omit<LessonCrop, "lesson_id" | "updated_at">;
+
+export async function getLessonCrop(lessonId: string): Promise<LessonCrop | null> {
+  return invoke<LessonCrop | null>("get_lesson_crop", { lessonId });
+}
+
+export async function upsertLessonCrop(lessonId: string, crop: CropInput): Promise<LessonCrop> {
+  return invoke<LessonCrop>("upsert_lesson_crop", { lessonId, crop });
 }
 
 // A lesson's intro or outro (`0013_lesson_slides.sql`), at most one of

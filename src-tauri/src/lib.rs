@@ -91,6 +91,8 @@ pub fn run() {
             db::add_lesson_region,
             db::update_lesson_region,
             db::delete_lesson_region,
+            db::get_lesson_crop,
+            db::upsert_lesson_crop,
             db::list_lesson_slides,
             db::upsert_lesson_slide,
             db::delete_lesson_slide,
