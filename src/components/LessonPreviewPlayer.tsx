@@ -1,11 +1,12 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Maximize, Minimize2, Pause, Play } from "lucide-react";
-import type { LessonSegment, LessonSlide } from "../db";
+import type { CropInput, LessonSegment, LessonSlide } from "../db";
 import { formatTimestamp } from "../lib/timestamp";
 import { useContainedVideoRect } from "../lib/useContainedVideoRect";
 import SegmentedScrubber from "./SegmentedScrubber";
 import { activeRegions, RectOutline, ShapeLayers, type PercentRect, type PreviewRegion } from "./RegionLayers";
+import { CropBoxEditor, cropScreenGeometry, resolveCropLayout } from "./CropLayers";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -57,6 +58,16 @@ interface LessonPreviewPlayerProps {
   drawRect?: { onDraw: (rect: PercentRect) => void };
   /** A dashed outline over the frame, e.g. the region being edited. */
   outlineRect?: PercentRect | null;
+  /** The lesson's crop. When enabled, the frame is shown composed like the
+   * export (cropped picture centred on the background, with its shadow),
+   * except while `cropEdit` or `drawRect` is set: those work on the
+   * uncropped source frame. */
+  crop?: CropInput | null;
+  /** When set (the Crop tab), the uncropped frame shows with an editable
+   * crop box (percent of the source frame), reported via `onChange`.
+   * Image overlays and overlay-mode slides are hidden meanwhile, since
+   * they belong on the composed frame. */
+  cropEdit?: { rect: PercentRect; onChange: (rect: PercentRect) => void } | null;
   /** The lesson's intro/outro slides. Overlay-mode ones show full-frame over
    * the first/last `duration` virtual seconds (muting the video there if
    * `mute_audio`) and get a scrubber band. Inserted ones take no virtual
@@ -99,6 +110,8 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
   regions = [],
   drawRect,
   outlineRect = null,
+  crop = null,
+  cropEdit = null,
   slides = [],
   onVideoSize,
   onFrameTime,
@@ -111,8 +124,10 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
   // intrinsic dimensions are now readable — see that hook.
   const [metadataVersion, setMetadataVersion] = useState(0);
   const contentRect = useContainedVideoRect(videoRef, overlayContainerRef, metadataVersion);
-  // The video's intrinsic width, to scale the blur preview to source pixels.
+  // The video's intrinsic size, to scale the blur preview and the crop to
+  // source pixels.
   const [videoWidth, setVideoWidth] = useState(0);
+  const [videoHeight, setVideoHeight] = useState(0);
   // Drag state while drawing a rect (`drawRect`): anchor and current rect,
   // both in percent of the frame.
   const [dragAnchor, setDragAnchor] = useState<{ x: number; y: number } | null>(null);
@@ -248,6 +263,12 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
   );
 
   const currentRegions = activeRegions(regions, virtualCurrentTime);
+
+  // The composed crop's on-screen geometry, while it applies (see `crop`).
+  const cropView =
+    crop?.enabled && !cropEdit && !drawRect && contentRect && videoWidth > 0 && videoHeight > 0
+      ? cropScreenGeometry(contentRect, resolveCropLayout(crop, videoWidth, videoHeight), videoWidth, videoHeight)
+      : null;
 
   // Overlay-mode slides' windows on the virtual timeline, clamped to the
   // lesson's length, same as the export's `overlay_slide_windows`.
@@ -494,6 +515,41 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
       )}
     >
       <div ref={overlayContainerRef} className="relative">
+        {/* Composed crop: the background and the picture's shadow go under
+           the video, which is itself clipped to the crop and moved onto the
+           fitted box (a transformed element paints above earlier positioned
+           siblings), so `contentRect` and everything placed on it stay as
+           they are. */}
+        {cropView && contentRect && crop && (
+          // Clipped to the frame, like the export: a big blur or offset
+          // never reaches the letterbox bars.
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute overflow-hidden"
+            style={{
+              left: contentRect.left,
+              top: contentRect.top,
+              width: contentRect.width,
+              height: contentRect.height,
+              backgroundColor: crop.bg_color,
+            }}
+          >
+            {crop.shadow_enabled && (
+              <div
+                className="absolute"
+                style={{
+                  left: cropView.box.left - contentRect.left,
+                  top: cropView.box.top - contentRect.top,
+                  width: cropView.box.width,
+                  height: cropView.box.height,
+                  boxShadow: `0 ${crop.shadow_offset_y * cropView.pixelScale}px ${
+                    crop.shadow_blur * cropView.pixelScale
+                  }px rgba(0, 0, 0, ${crop.shadow_opacity})`,
+                }}
+              />
+            )}
+          </div>
+        )}
         <video
           ref={videoRef}
           src={convertFileSrc(videoFilePath)}
@@ -507,9 +563,13 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
             "lesson-card-video block max-h-[25vh] w-full bg-black",
             isFullscreen && "h-auto max-h-[82vh] w-full",
           )}
+          style={
+            cropView ? { transform: cropView.transform, transformOrigin: "0 0", clipPath: cropView.clipPath } : undefined
+          }
           onLoadedMetadata={(event) => {
             setMetadataVersion((v) => v + 1);
             setVideoWidth(event.currentTarget.videoWidth);
+            setVideoHeight(event.currentTarget.videoHeight);
             onVideoSize?.({ width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight });
           }}
           onTimeUpdate={handleTimeUpdate}
@@ -519,13 +579,23 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
         {voiceTrackPath && <audio ref={voiceRef} src={convertFileSrc(voiceTrackPath)} preload="auto" />}
         {/* Before the overlay images, matching the export's chain order
            (shapes -> image overlays). */}
-        {contentRect && videoWidth > 0 && (
-          <ShapeLayers rect={contentRect} regions={currentRegions} pixelScale={contentRect.width / videoWidth} />
+        {/* Shapes are in source-frame percent, so with a crop they move with
+           the cropped picture, clipped to it. */}
+        {cropView ? (
+          <div className="pointer-events-none absolute overflow-hidden" style={cropView.box}>
+            <ShapeLayers rect={cropView.sourceRect} regions={currentRegions} pixelScale={cropView.contentScale} />
+          </div>
+        ) : (
+          contentRect &&
+          videoWidth > 0 && (
+            <ShapeLayers rect={contentRect} regions={currentRegions} pixelScale={contentRect.width / videoWidth} />
+          )
         )}
         {/* Positioned against `contentRect` (the video's actual letterboxed
            content area — see `useContainedVideoRect`), same reasoning as
            `SourceVideoPreview`'s identical block. */}
         {contentRect &&
+          !cropEdit &&
           activeOverlays.map((overlay) => {
             const width = contentRect.width * (overlay.scale_percent / 100);
             const height = contentRect.height * (overlay.scale_percent / 100);
@@ -547,7 +617,7 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
         {/* Overlay-mode intro/outro, full-frame on top of everything, like
            the export; an inserted one while it's held. */}
         {contentRect &&
-          [...activeOverlaySlides, ...(hold ? [hold] : [])].map((slide) => (
+          [...(cropEdit ? [] : activeOverlaySlides), ...(hold ? [hold] : [])].map((slide) => (
             <img
               key={`${slide.id}-${slide === hold ? "hold" : "overlay"}`}
               src={convertFileSrc(slide.image_path)}
@@ -571,10 +641,13 @@ const LessonPreviewPlayer = forwardRef<LessonPreviewPlayerHandle, LessonPreviewP
               : `Intro · ${insertedIntro?.duration}s plays first`}
           </span>
         )}
-        {contentRect && (dragRect ?? outlineRect) && (
+        {contentRect && cropEdit && (
+          <CropBoxEditor rect={contentRect} percentRect={cropEdit.rect} onChange={cropEdit.onChange} />
+        )}
+        {contentRect && !cropEdit && (dragRect ?? outlineRect) && (
           <RectOutline rect={contentRect} percentRect={(dragRect ?? outlineRect) as PercentRect} />
         )}
-        {contentRect && drawRect && (
+        {contentRect && drawRect && !cropEdit && (
           <div
             className="absolute cursor-crosshair touch-none"
             style={{ left: contentRect.left, top: contentRect.top, width: contentRect.width, height: contentRect.height }}

@@ -206,6 +206,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|err| format!("could not update schema version: {err}"))?;
     }
 
+    if version < 17 {
+        conn.execute_batch(include_str!("../migrations/0017_lesson_crop.sql"))
+            .map_err(|err| format!("migration 0017_lesson_crop failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 17)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
     Ok(())
 }
 
@@ -1650,6 +1657,186 @@ pub fn delete_lesson_region(conn: tauri::State<'_, DbConnection>, id: String) ->
     conn.execute("DELETE FROM lesson_regions WHERE id = ?1", params![id])
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Lesson crop (0017_lesson_crop.sql): one crop setting per lesson, applied
+// to the whole export after shape layers and before image overlays. See
+// `ffmpeg.rs::resolve_crop` for how it's laid out.
+// ---------------------------------------------------------------------
+
+/// Smallest crop side, in percent of the source frame. The editor clamps
+/// to the same value.
+const MIN_CROP_PERCENT: f64 = 5.0;
+/// Largest padding, in percent of the frame's shorter side, per edge.
+const MAX_CROP_PADDING_PERCENT: f64 = 30.0;
+/// Largest shadow blur and |offset|, in source pixels.
+const MAX_CROP_SHADOW_PX: i64 = 200;
+
+const CROP_COLUMNS: &str = "lesson_id, enabled, x_percent, y_percent, w_percent, h_percent, bg_color, \
+     padding_percent, shadow_enabled, shadow_blur, shadow_opacity, shadow_offset_y, updated_at";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LessonCropRow {
+    pub lesson_id: String,
+    pub enabled: bool,
+    pub x_percent: f64,
+    pub y_percent: f64,
+    pub w_percent: f64,
+    pub h_percent: f64,
+    /// `#rrggbb`.
+    pub bg_color: String,
+    pub padding_percent: f64,
+    pub shadow_enabled: bool,
+    pub shadow_blur: i64,
+    pub shadow_opacity: f64,
+    pub shadow_offset_y: i64,
+    pub updated_at: String,
+}
+
+/// The caller-editable fields of a lesson's crop (`upsert_lesson_crop`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CropInput {
+    pub enabled: bool,
+    pub x_percent: f64,
+    pub y_percent: f64,
+    pub w_percent: f64,
+    pub h_percent: f64,
+    pub bg_color: String,
+    pub padding_percent: f64,
+    pub shadow_enabled: bool,
+    pub shadow_blur: i64,
+    pub shadow_opacity: f64,
+    pub shadow_offset_y: i64,
+}
+
+fn row_to_lesson_crop(row: &rusqlite::Row<'_>) -> rusqlite::Result<LessonCropRow> {
+    Ok(LessonCropRow {
+        lesson_id: row.get("lesson_id")?,
+        enabled: row.get("enabled")?,
+        x_percent: row.get("x_percent")?,
+        y_percent: row.get("y_percent")?,
+        w_percent: row.get("w_percent")?,
+        h_percent: row.get("h_percent")?,
+        bg_color: row.get("bg_color")?,
+        padding_percent: row.get("padding_percent")?,
+        shadow_enabled: row.get("shadow_enabled")?,
+        shadow_blur: row.get("shadow_blur")?,
+        shadow_opacity: row.get("shadow_opacity")?,
+        shadow_offset_y: row.get("shadow_offset_y")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+/// Field-level checks for a crop's caller-editable fields. Checked even
+/// while disabled, so a saved row is always exportable once switched on.
+fn validate_crop(crop: &CropInput) -> Result<(), String> {
+    // Same rounding slack as `validate_region` for a box dragged to the edge.
+    let in_frame = |pos: f64, size: f64| {
+        pos.is_finite() && size.is_finite() && pos >= 0.0 && size >= MIN_CROP_PERCENT - 1e-6 && pos + size <= 100.0 + 1e-6
+    };
+    if !in_frame(crop.x_percent, crop.w_percent) || !in_frame(crop.y_percent, crop.h_percent) {
+        return Err(format!(
+            "invalid crop rect: it must be at least {MIN_CROP_PERCENT}% on each side and lie inside the frame (0-100%)"
+        ));
+    }
+    if !is_hex_color(&crop.bg_color) {
+        return Err(format!("invalid crop background colour {:?}: must be #rrggbb", crop.bg_color));
+    }
+    if !crop.padding_percent.is_finite() || !(0.0..=MAX_CROP_PADDING_PERCENT).contains(&crop.padding_percent) {
+        return Err(format!(
+            "invalid crop padding {}: must be between 0 and {MAX_CROP_PADDING_PERCENT}",
+            crop.padding_percent
+        ));
+    }
+    if !(0..=MAX_CROP_SHADOW_PX).contains(&crop.shadow_blur) {
+        return Err(format!(
+            "invalid shadow blur {}: must be between 0 and {MAX_CROP_SHADOW_PX}",
+            crop.shadow_blur
+        ));
+    }
+    if !crop.shadow_opacity.is_finite() || !(0.0..=1.0).contains(&crop.shadow_opacity) {
+        return Err(format!("invalid shadow opacity {}: must be between 0 and 1", crop.shadow_opacity));
+    }
+    if !(-MAX_CROP_SHADOW_PX..=MAX_CROP_SHADOW_PX).contains(&crop.shadow_offset_y) {
+        return Err(format!(
+            "invalid shadow offset {}: must be between -{MAX_CROP_SHADOW_PX} and {MAX_CROP_SHADOW_PX}",
+            crop.shadow_offset_y
+        ));
+    }
+    Ok(())
+}
+
+/// `lesson_id`'s crop row, if it has one (enabled or not).
+pub(crate) fn query_lesson_crop(conn: &Connection, lesson_id: &str) -> Result<Option<LessonCropRow>, String> {
+    conn.query_row(
+        &format!("SELECT {CROP_COLUMNS} FROM lesson_crop WHERE lesson_id = ?1"),
+        params![lesson_id],
+        row_to_lesson_crop,
+    )
+    .optional()
+    .map_err(|err| err.to_string())
+}
+
+fn upsert_lesson_crop_conn(conn: &Connection, lesson_id: &str, crop: &CropInput) -> Result<LessonCropRow, String> {
+    let lesson_exists: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM lessons WHERE id = ?1)", params![lesson_id], |row| {
+            row.get(0)
+        })
+        .map_err(|err| err.to_string())?;
+    if !lesson_exists {
+        return Err(format!("lesson {lesson_id} does not exist"));
+    }
+    validate_crop(crop)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO lesson_crop (lesson_id, enabled, x_percent, y_percent, w_percent, h_percent, bg_color,
+                                  padding_percent, shadow_enabled, shadow_blur, shadow_opacity, shadow_offset_y,
+                                  updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT (lesson_id) DO UPDATE SET
+            enabled = excluded.enabled, x_percent = excluded.x_percent, y_percent = excluded.y_percent,
+            w_percent = excluded.w_percent, h_percent = excluded.h_percent, bg_color = excluded.bg_color,
+            padding_percent = excluded.padding_percent, shadow_enabled = excluded.shadow_enabled,
+            shadow_blur = excluded.shadow_blur, shadow_opacity = excluded.shadow_opacity,
+            shadow_offset_y = excluded.shadow_offset_y, updated_at = excluded.updated_at",
+        params![
+            lesson_id,
+            crop.enabled,
+            crop.x_percent,
+            crop.y_percent,
+            crop.w_percent,
+            crop.h_percent,
+            crop.bg_color,
+            crop.padding_percent,
+            crop.shadow_enabled,
+            crop.shadow_blur,
+            crop.shadow_opacity,
+            crop.shadow_offset_y,
+            now
+        ],
+    )
+    .map_err(|err| err.to_string())?;
+    query_lesson_crop(conn, lesson_id)?.ok_or_else(|| format!("crop for lesson {lesson_id} was not saved"))
+}
+
+#[tauri::command]
+pub fn get_lesson_crop(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+) -> Result<Option<LessonCropRow>, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    query_lesson_crop(&conn, &lesson_id)
+}
+
+#[tauri::command]
+pub fn upsert_lesson_crop(
+    conn: tauri::State<'_, DbConnection>,
+    lesson_id: String,
+    crop: CropInput,
+) -> Result<LessonCropRow, String> {
+    let conn = conn.0.lock().map_err(|err| err.to_string())?;
+    upsert_lesson_crop_conn(&conn, &lesson_id, &crop)
 }
 
 // ---------------------------------------------------------------------
@@ -3115,6 +3302,95 @@ pub(crate) fn add_lesson_region_for_test(
     region: &RegionInput,
 ) -> Result<LessonRegionRow, String> {
     add_lesson_region_conn(conn, lesson_id, region)
+}
+
+#[cfg(test)]
+mod lesson_crop_tests {
+    use super::*;
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Test', 't', 't');
+             INSERT INTO videos (id, project_id, file_path, created_at, updated_at) VALUES ('v1', 'p1', '/v', 't', 't');
+             INSERT INTO lessons (id, video_id, title, start, end) VALUES ('l1', 'v1', 'Lesson', 0, 60);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn input() -> CropInput {
+        CropInput {
+            enabled: true,
+            x_percent: 10.0,
+            y_percent: 20.0,
+            w_percent: 40.0,
+            h_percent: 50.0,
+            bg_color: "#0B1F3A".into(),
+            padding_percent: 6.0,
+            shadow_enabled: true,
+            shadow_blur: 24,
+            shadow_opacity: 0.5,
+            shadow_offset_y: 8,
+        }
+    }
+
+    #[test]
+    fn upsert_inserts_then_updates_one_row() {
+        let conn = seeded_conn();
+        assert!(query_lesson_crop(&conn, "l1").unwrap().is_none());
+        let saved = upsert_lesson_crop_conn(&conn, "l1", &input()).unwrap();
+        assert!(saved.enabled && saved.shadow_enabled);
+        assert_eq!((saved.x_percent, saved.w_percent, saved.shadow_blur), (10.0, 40.0, 24));
+        let updated =
+            upsert_lesson_crop_conn(&conn, "l1", &CropInput { enabled: false, bg_color: "#ffffff".into(), ..input() })
+                .unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.bg_color, "#ffffff");
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM lesson_crop", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn invalid_fields_are_rejected() {
+        let conn = seeded_conn();
+        let bad = [
+            CropInput { x_percent: 70.0, ..input() },        // 70 + 40 > 100
+            CropInput { w_percent: 2.0, ..input() },         // below the minimum size
+            CropInput { y_percent: -1.0, ..input() },
+            CropInput { bg_color: "0B1F3A".into(), ..input() },
+            CropInput { bg_color: "#0B1F3G".into(), ..input() },
+            CropInput { padding_percent: 31.0, ..input() },
+            CropInput { shadow_blur: -1, ..input() },
+            CropInput { shadow_opacity: 1.5, ..input() },
+            CropInput { shadow_offset_y: 500, ..input() },
+        ];
+        for crop in bad {
+            assert!(upsert_lesson_crop_conn(&conn, "l1", &crop).is_err(), "{crop:?}");
+        }
+        assert!(upsert_lesson_crop_conn(&conn, "missing", &input()).is_err());
+        assert!(query_lesson_crop(&conn, "l1").unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_the_lesson_cascades() {
+        let conn = seeded_conn();
+        upsert_lesson_crop_conn(&conn, "l1", &input()).unwrap();
+        conn.execute("DELETE FROM lessons WHERE id = 'l1'", []).unwrap();
+        assert!(query_lesson_crop(&conn, "l1").unwrap().is_none());
+    }
+}
+
+/// Test-only access to the validated upsert, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn upsert_lesson_crop_for_test(
+    conn: &Connection,
+    lesson_id: &str,
+    crop: &CropInput,
+) -> Result<LessonCropRow, String> {
+    upsert_lesson_crop_conn(conn, lesson_id, crop)
 }
 
 #[cfg(test)]

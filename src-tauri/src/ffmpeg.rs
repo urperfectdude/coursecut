@@ -985,8 +985,134 @@ fn resolve_region(region: &SegmentRegion, main_w: u32, main_h: u32) -> ResolvedR
     }
 }
 
-/// Builds the `-filter_complex` graph for `export_lesson`: **shapes → image
-/// overlays**, every size and position a literal pixel value resolved in
+/// A lesson's crop (`lesson_crop`, only when enabled), the same for every
+/// cut of the lesson. The rect is percent of the source frame; see
+/// `resolve_crop` for the layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentCrop {
+    pub x_percent: f64,
+    pub y_percent: f64,
+    pub w_percent: f64,
+    pub h_percent: f64,
+    /// `#rrggbb`.
+    pub bg_color: String,
+    /// Percent of the frame's shorter side, kept clear on every edge.
+    pub padding_percent: f64,
+    pub shadow: Option<CropShadow>,
+    /// The source's sample aspect ratio (`StreamParams::sar`), filled in by
+    /// `export_lesson`. The fitted picture is tagged with it (`0` when
+    /// unset), like inserted slide pieces, so the export's SAR is the
+    /// source's.
+    pub sar: Option<String>,
+}
+
+/// The drop shadow under a cropped picture. `blur` is a CSS `box-shadow`
+/// blur radius and `offset_y` a downward offset, both in source pixels;
+/// `opacity` is 0-1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CropShadow {
+    pub blur: i64,
+    pub opacity: f64,
+    pub offset_y: i64,
+}
+
+/// A `SegmentCrop` resolved to literal, even pixels against the source
+/// frame (see `resolve_crop`).
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedCrop {
+    crop_w: i64,
+    crop_h: i64,
+    crop_x: i64,
+    crop_y: i64,
+    fit_w: i64,
+    fit_h: i64,
+    /// Top-left of the fitted picture in the output frame.
+    x: i64,
+    y: i64,
+    main_w: i64,
+    main_h: i64,
+    /// `RRGGBB`, no `#`.
+    bg_hex: String,
+    shadow: Option<ResolvedShadow>,
+    /// `setsar` value: the source's `num/den`, or `0` when unset.
+    sar: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedShadow {
+    /// `gblur` sigma: a CSS blur radius is two standard deviations, so the
+    /// export matches the preview's `box-shadow`.
+    sigma: f64,
+    /// Transparent border around the shadow's rect so the blur isn't
+    /// clipped: twice the blur radius (= 4 sigma).
+    margin: i64,
+    opacity: f64,
+    /// Top-left of the margin-padded shadow canvas in the output frame (may
+    /// be negative; `overlay` clips).
+    x: i64,
+    y: i64,
+}
+
+/// Resolves a crop against the `main_w`x`main_h` source frame:
+///
+/// * the crop rect, even and inside the frame (min 2 px a side);
+/// * the padding `p` = `padding_percent` of the shorter side, in pixels;
+/// * the fit: the crop scaled by one factor (its own aspect kept) to fit
+///   inside `(W - 2p)`x`(H - 2p)`, even;
+/// * the fit centred, its top-left rounded down to even so the 4:2:0
+///   `pad` (which rounds odd offsets down) and the `overlay` agree.
+///
+/// The output frame is always the source's `W`x`H`.
+fn resolve_crop(crop: &SegmentCrop, main_w: u32, main_h: u32) -> ResolvedCrop {
+    let (main_w, main_h) = (main_w as i64, main_h as i64);
+    let even = |value: i64| value & !1;
+    let size = |percent: f64, main: i64| even((main as f64 * percent / 100.0).round() as i64).clamp(2, even(main));
+    let crop_w = size(crop.w_percent, main_w);
+    let crop_h = size(crop.h_percent, main_h);
+    let pos = |percent: f64, main: i64, size: i64| even((main as f64 * percent / 100.0).round() as i64).clamp(0, even(main - size));
+    let crop_x = pos(crop.x_percent, main_w, crop_w);
+    let crop_y = pos(crop.y_percent, main_h, crop_h);
+
+    let padding = (main_w.min(main_h) as f64 * crop.padding_percent / 100.0).round() as i64;
+    let avail_w = even(main_w - 2 * padding).max(2);
+    let avail_h = even(main_h - 2 * padding).max(2);
+    let factor = (avail_w as f64 / crop_w as f64).min(avail_h as f64 / crop_h as f64);
+    let fit = |side: i64, avail: i64| even((side as f64 * factor).round() as i64).clamp(2, avail);
+    let fit_w = fit(crop_w, avail_w);
+    let fit_h = fit(crop_h, avail_h);
+    let x = even((main_w - fit_w) / 2);
+    let y = even((main_h - fit_h) / 2);
+
+    let shadow = crop.shadow.as_ref().map(|shadow| {
+        let blur = shadow.blur.max(0);
+        let margin = 2 * blur;
+        ResolvedShadow {
+            sigma: blur as f64 / 2.0,
+            margin,
+            opacity: shadow.opacity.clamp(0.0, 1.0),
+            x: x - margin,
+            y: y - margin + shadow.offset_y,
+        }
+    });
+    ResolvedCrop {
+        crop_w,
+        crop_h,
+        crop_x,
+        crop_y,
+        fit_w,
+        fit_h,
+        x,
+        y,
+        main_w,
+        main_h,
+        bg_hex: crop.bg_color.trim_start_matches('#').to_string(),
+        shadow,
+        sar: crop.sar.clone().unwrap_or_else(|| "0".to_string()),
+    }
+}
+
+/// Builds the `-filter_complex` graph for `export_lesson`: **shapes → crop →
+/// image overlays**, every size and position a literal pixel value resolved in
 /// Rust (see `resolve_region`/`resolve_segment_overlay`). The main video is
 /// input `0`; overlay images are inputs `1..=overlays.len()`.
 ///
@@ -1006,6 +1132,17 @@ fn resolve_region(region: &SegmentRegion, main_w: u32, main_h: u32) -> ResolvedR
 /// where a segment (or another shape) starts never covers the boundary
 /// frame. With no shapes, the string is byte-identical to the original
 /// overlay-only builder.
+///
+/// Crop (`crop`, see `resolve_crop`) comes right after the shapes, so they
+/// stay in source-frame coordinates and move with the cropped picture:
+/// `crop,scale,setsar=<source SAR>`, then `pad` to the full frame with the background
+/// colour. The background is the padded picture itself, not a `color`
+/// source, so frame rate and timestamps are the source's and the stream
+/// ends with it. With a shadow the fitted picture is split: one copy is
+/// padded as the background, the shadow is overlaid on that, and the other
+/// copy goes on top. The shadow is a single generated frame (a black
+/// `opacity` rect inside a transparent `margin`, `gblur`red once, then
+/// `loop`ed like the shape masks). With no crop the string is unchanged.
 ///
 /// Image overlays: once every overlay's size/position has
 /// already been resolved to literal pixels (see `ResolvedOverlay`). Each overlay image is its own extra
@@ -1038,10 +1175,11 @@ fn resolve_region(region: &SegmentRegion, main_w: u32, main_h: u32) -> ResolvedR
 /// unchanged.
 fn build_filter_complex(
     regions: &[ResolvedRegion],
+    crop: Option<&ResolvedCrop>,
     overlays: &[ResolvedOverlay],
     slides: &[ResolvedSlide],
 ) -> String {
-    let total_stages = regions.len() + overlays.len() + slides.len();
+    let total_stages = regions.len() + usize::from(crop.is_some()) + overlays.len() + slides.len();
     let mut stage = 0usize;
     // Output label of the stage about to be emitted: `outv` for the last
     // one, else `{prefix}{index}`.
@@ -1115,7 +1253,41 @@ fn build_filter_complex(
         current = out;
     }
 
-    // 2. The existing image overlays, on top of every shape.
+    // 2. Crop, on the shaped frame: everything after this sits on the
+    // composed full-size frame.
+    if let Some(crop) = crop {
+        let out = next_label("cp", 0);
+        let fitted = format!(
+            "crop={}:{}:{}:{},scale={}:{},setsar={}",
+            crop.crop_w, crop.crop_h, crop.crop_x, crop.crop_y, crop.fit_w, crop.fit_h, crop.sar
+        );
+        let pad = format!(
+            "pad={}:{}:{}:{}:color=0x{}",
+            crop.main_w, crop.main_h, crop.x, crop.y, crop.bg_hex
+        );
+        match &crop.shadow {
+            None => parts.push(format!("[{current}]{fitted},{pad}[{out}]")),
+            Some(shadow) => {
+                let m = shadow.margin;
+                let blur = if shadow.sigma > 0.0 { format!(",gblur=sigma={}", shadow.sigma) } else { String::new() };
+                parts.push(format!("[{current}]{fitted},split[cpf][cpp]"));
+                parts.push(format!("[cpp]{pad}[cpb]"));
+                parts.push(format!(
+                    "color=c=black@{}:s={}x{}:d=1,format=yuva444p,pad={}:{}:{m}:{m}:color=black@0{blur},loop=loop=-1:size=1[cps]",
+                    shadow.opacity,
+                    crop.fit_w,
+                    crop.fit_h,
+                    crop.fit_w + 2 * m,
+                    crop.fit_h + 2 * m
+                ));
+                parts.push(format!("[cpb][cps]overlay={}:{}[cpbs]", shadow.x, shadow.y));
+                parts.push(format!("[cpbs][cpf]overlay={}:{}[{out}]", crop.x, crop.y));
+            }
+        }
+        current = out;
+    }
+
+    // 3. The existing image overlays, on top of every shape and the crop.
     for (index, overlay) in overlays.iter().enumerate() {
         let out = next_label("ov", index);
         parts.push(format!(
@@ -1125,7 +1297,7 @@ fn build_filter_complex(
         current = out;
     }
 
-    // 3. Overlay-mode intro/outro slides, full-frame, on top of everything.
+    // 4. Overlay-mode intro/outro slides, full-frame, on top of everything.
     for (index, slide) in slides.iter().enumerate() {
         let image_input = 1 + overlays.len() + index;
         parts.push(format!(
@@ -1183,11 +1355,14 @@ pub(crate) fn fit_full_frame(main_w: u32, main_h: u32, image_w: u32, image_h: u3
     (fit.width, fit.height, fit.x, fit.y)
 }
 
-/// What a cut needs beyond overlays and regions, for intro/outro slides.
-/// `Default` (all empty) leaves `lesson_cut_args` exactly as it was before
-/// slides existed.
+/// What a cut needs beyond overlays and regions: intro/outro slides and the
+/// lesson's crop. `Default` (all empty) leaves `lesson_cut_args` exactly as
+/// it was before slides existed.
 #[derive(Debug, Clone, Default)]
 pub struct CutExtras {
+    /// The lesson's crop, when enabled. Applied after the shapes, before
+    /// image overlays and overlay-mode slides.
+    pub crop: Option<SegmentCrop>,
     /// Overlay-mode slides over this cut.
     pub slides: Vec<SegmentSlide>,
     /// Cut-relative `[start, end)` windows to silence. Only set when the
@@ -1381,7 +1556,8 @@ pub(crate) fn lesson_cut_args(
         "-i".to_string(),
         video_path.to_string(),
     ];
-    let has_video_graph = !overlays.is_empty() || !regions.is_empty() || !extras.slides.is_empty();
+    let has_video_graph =
+        !overlays.is_empty() || !regions.is_empty() || !extras.slides.is_empty() || extras.crop.is_some();
     let mute = mute_filter(&extras.mute_windows);
     if has_video_graph || mute.is_some() {
         let (main_w, main_h) = main_dims;
@@ -1412,6 +1588,7 @@ pub(crate) fn lesson_cut_args(
                 }
             })
             .collect();
+        let resolved_crop = extras.crop.as_ref().map(|crop| resolve_crop(crop, main_w, main_h));
         for image_path in overlays
             .iter()
             .map(|overlay| &overlay.image_path)
@@ -1423,7 +1600,9 @@ pub(crate) fn lesson_cut_args(
             args.push(image_path.clone());
         }
         let graph = [
-            has_video_graph.then(|| build_filter_complex(&resolved_regions, &resolved, &resolved_slides)),
+            has_video_graph.then(|| {
+                build_filter_complex(&resolved_regions, resolved_crop.as_ref(), &resolved, &resolved_slides)
+            }),
             mute.clone(),
         ]
         .into_iter()
@@ -1493,12 +1672,25 @@ pub async fn export_lesson(
 ) -> Result<(), String> {
     let duration = (end - start).max(0.0);
 
+    // A crop is tagged with the source's SAR: the probed stream params' when
+    // the export has them, else probed here.
+    let mut extras = extras.clone();
+    if let Some(crop) = extras.crop.as_mut() {
+        if crop.sar.is_none() {
+            crop.sar = match &extras.stream {
+                Some(stream) => stream.sar.clone(),
+                None => probe_stream_params(app, video_path).await?.sar,
+            };
+        }
+    }
+    let extras = &extras;
+
     // Probes only when there's a filter graph to size; the plain path stays
     // probe-free, exactly as before regions existed.
     let mut main_dims = (0, 0);
     let mut overlay_dims: Vec<(u32, u32)> = Vec::with_capacity(overlays.len());
     let mut slide_dims: Vec<(u32, u32)> = Vec::with_capacity(extras.slides.len());
-    if !overlays.is_empty() || !regions.is_empty() || !extras.slides.is_empty() {
+    if !overlays.is_empty() || !regions.is_empty() || !extras.slides.is_empty() || extras.crop.is_some() {
         main_dims = probe_dimensions(app, video_path).await?;
         for overlay in overlays {
             overlay_dims.push(probe_dimensions(app, &overlay.image_path).await?);
@@ -1906,7 +2098,7 @@ mod overlay_filter_tests {
     #[test]
     fn single_overlay_builds_a_scale_and_overlay_graph() {
         let overlays = [resolved(1440, 774, 0, 0, 1.0, 3.0)];
-        let graph = build_filter_complex(&[], &overlays, &[]);
+        let graph = build_filter_complex(&[], None, &overlays, &[]);
         assert_eq!(
             graph,
             "[1:v]scale=1440:774[scaled0];\
@@ -1919,7 +2111,7 @@ mod overlay_filter_tests {
     #[test]
     fn shrunk_overlay_uses_its_resolved_pixel_box() {
         let overlays = [resolved(154, 154, 1286, 0, 1.0, 3.0)];
-        let graph = build_filter_complex(&[], &overlays, &[]);
+        let graph = build_filter_complex(&[], None, &overlays, &[]);
         assert_eq!(
             graph,
             "[1:v]scale=154:154[scaled0];\
@@ -1935,7 +2127,7 @@ mod overlay_filter_tests {
     #[test]
     fn two_overlays_each_get_their_own_scale_and_chain_overlay_bases() {
         let overlays = [resolved(1440, 774, 0, 0, 1.0, 2.0), resolved(200, 100, 50, 50, 3.0, 4.0)];
-        let graph = build_filter_complex(&[], &overlays, &[]);
+        let graph = build_filter_complex(&[], None, &overlays, &[]);
         assert_eq!(
             graph,
             "[1:v]scale=1440:774[scaled0];\
@@ -2007,7 +2199,7 @@ mod region_filter_tests {
     fn blurred_rect_has_no_mask() {
         let blur = resolve_region(&region(RegionShape::Rect, RegionFill::Blur, 10.0, 10.0, 20.0, 20.0, 30), 1000, 500);
         assert_eq!(
-            build_filter_complex(&[blur], &[], &[]),
+            build_filter_complex(&[blur], None, &[], &[]),
             "[0:v]split[shm0][shc0];\
              [shc0]crop=200:100:100:50,boxblur=luma_radius=30:luma_power=2:chroma_radius=24:chroma_power=2[shb0];\
              [shm0][shb0]overlay=100:50:enable='gte(t,1)*lt(t,3.5)'[outv]"
@@ -2018,7 +2210,7 @@ mod region_filter_tests {
     fn blurred_ellipse_is_alpha_masked() {
         let blur = resolve_region(&region(RegionShape::Ellipse, RegionFill::Blur, 10.0, 10.0, 20.0, 20.0, 10), 1000, 500);
         assert_eq!(
-            build_filter_complex(&[blur], &[], &[]),
+            build_filter_complex(&[blur], None, &[], &[]),
             "[0:v]split[shm0][shc0];\
              [shc0]crop=200:100:100:50,boxblur=luma_radius=10:luma_power=2:chroma_radius=10:chroma_power=2[shb0];\
              color=c=black:s=200x100:d=1,format=gray,geq=lum='255*lte(pow((X+0.5-100)/100,2)+pow((Y+0.5-50)/50,2),1)',loop=loop=-1:size=1[shk0];\
@@ -2031,14 +2223,14 @@ mod region_filter_tests {
     fn solid_rect_is_a_plain_colour_source_and_rounded_is_masked() {
         let rect = resolve_region(&region(RegionShape::Rect, RegionFill::Solid("#1a2B3c".into()), 10.0, 10.0, 20.0, 20.0, 10), 1000, 500);
         assert_eq!(
-            build_filter_complex(&[rect], &[], &[]),
+            build_filter_complex(&[rect], None, &[], &[]),
             "color=c=0x1a2B3c:s=200x100[shf0];\
              [0:v][shf0]overlay=100:50:enable='gte(t,1)*lt(t,3.5)'[outv]"
         );
         let rounded = resolve_region(&region(RegionShape::Rounded, RegionFill::Solid("#000000".into()), 10.0, 10.0, 20.0, 20.0, 10), 1000, 500);
         // Corner radius = 20% of the shorter side (100) = 20.
         assert_eq!(
-            build_filter_complex(&[rounded], &[], &[]),
+            build_filter_complex(&[rounded], None, &[], &[]),
             "color=c=0x000000:s=200x100,format=yuva420p[shc0];\
              color=c=black:s=200x100:d=1,format=gray,geq=lum='255*lte(pow(max(max(20-X-0.5,X+0.5-180),0),2)+pow(max(max(20-Y-0.5,Y+0.5-80),0),2),400)',loop=loop=-1:size=1[shk0];\
              [shc0][shk0]alphamerge[shf0];\
@@ -2052,7 +2244,7 @@ mod region_filter_tests {
         let solid = resolve_region(&region(RegionShape::Rect, RegionFill::Solid("#ffffff".into()), 0.0, 0.0, 10.0, 10.0, 10), 1000, 500);
         let blur = resolve_region(&region(RegionShape::Rect, RegionFill::Blur, 50.0, 50.0, 20.0, 20.0, 10), 1000, 500);
         let overlay = ResolvedOverlay { width: 100, height: 100, x: 0, y: 0, start: 2.0, end: 3.0 };
-        let graph = build_filter_complex(&[solid, blur], &[overlay], &[]);
+        let graph = build_filter_complex(&[solid, blur], None, &[overlay], &[]);
         assert_eq!(
             graph,
             "[1:v]scale=100:100[scaled0];\
@@ -2083,6 +2275,156 @@ mod region_filter_tests {
         let args = lesson_cut_args("/in.mp4", 5.0, 12.5, "/out.mp4", &[], &[], &[blur], (1000, 500), &CutExtras::default(), &[]);
         let filter_at = args.iter().position(|arg| arg == "-filter_complex").unwrap();
         assert!(args[filter_at + 1].starts_with("[0:v]split[shm0][shc0]"));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "[outv]"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:a?"]));
+        assert!(args.windows(2).any(|pair| pair == ["-t", "7.5"]));
+        assert!(!args.iter().any(|arg| arg == "-loop"));
+    }
+}
+
+#[cfg(test)]
+mod crop_filter_tests {
+    use super::*;
+
+    fn crop(x: f64, y: f64, w: f64, h: f64, shadow: Option<CropShadow>) -> SegmentCrop {
+        SegmentCrop {
+            x_percent: x,
+            y_percent: y,
+            w_percent: w,
+            h_percent: h,
+            bg_color: "#0B1F3A".into(),
+            padding_percent: 6.0,
+            shadow,
+            sar: None,
+        }
+    }
+
+    fn default_shadow() -> Option<CropShadow> {
+        Some(CropShadow { blur: 24, opacity: 0.5, offset_y: 8 })
+    }
+
+    /// 1280x720, crop 512x360 at 128,144. Padding 6% of 720 = 43 px, so the
+    /// box is 1194x634; height binds (634/360 < 1194/512): 902x634, centred
+    /// at (189, 43) rounded down to even. Run against the bundled ffmpeg
+    /// (90 frames at 30 fps out of 3 s of a 30 fps source).
+    #[test]
+    fn crop_only_is_one_chain_padded_with_the_background() {
+        let resolved = resolve_crop(&crop(10.0, 20.0, 40.0, 50.0, None), 1280, 720);
+        assert_eq!(
+            build_filter_complex(&[], Some(&resolved), &[], &[]),
+            "[0:v]crop=512:360:128:144,scale=902:634,setsar=0,pad=1280:720:188:42:color=0x0B1F3A[outv]"
+        );
+    }
+
+    /// Shadow: blur 24 -> sigma 12, margin 48, so the 902x634 shadow rect
+    /// sits in a 998x730 canvas at (188 - 48, 42 - 48 + 8).
+    #[test]
+    fn shadow_goes_between_the_background_and_the_picture() {
+        let resolved = resolve_crop(&crop(10.0, 20.0, 40.0, 50.0, default_shadow()), 1280, 720);
+        assert_eq!(
+            build_filter_complex(&[], Some(&resolved), &[], &[]),
+            "[0:v]crop=512:360:128:144,scale=902:634,setsar=0,split[cpf][cpp];\
+             [cpp]pad=1280:720:188:42:color=0x0B1F3A[cpb];\
+             color=c=black@0.5:s=902x634:d=1,format=yuva444p,pad=998:730:48:48:color=black@0,gblur=sigma=12,loop=loop=-1:size=1[cps];\
+             [cpb][cps]overlay=140:2[cpbs];\
+             [cpbs][cpf]overlay=188:42[outv]"
+        );
+        // A zero blur is a hard-edged shadow: no margin, no gblur.
+        let sharp = resolve_crop(
+            &crop(10.0, 20.0, 40.0, 50.0, Some(CropShadow { blur: 0, opacity: 1.0, offset_y: -4 })),
+            1280,
+            720,
+        );
+        let graph = build_filter_complex(&[], Some(&sharp), &[], &[]);
+        assert!(graph.contains("color=c=black@1:s=902x634:d=1,format=yuva444p,pad=902:634:0:0:color=black@0,loop="));
+        assert!(graph.contains("[cpb][cps]overlay=188:38[cpbs]"));
+    }
+
+    /// Shapes act on the source frame first, then the crop, then image
+    /// overlays and slides on the composed frame.
+    #[test]
+    fn chain_order_is_shapes_then_crop_then_overlays_and_slides() {
+        let shape = resolve_region(
+            &SegmentRegion {
+                shape: RegionShape::Rect,
+                fill: RegionFill::Solid("#ffffff".into()),
+                start: 1.0,
+                end: 2.0,
+                x_percent: 0.0,
+                y_percent: 0.0,
+                w_percent: 10.0,
+                h_percent: 10.0,
+                blur_strength: 10,
+            },
+            1280,
+            720,
+        );
+        let resolved = resolve_crop(&crop(10.0, 20.0, 40.0, 50.0, default_shadow()), 1280, 720);
+        let overlay = ResolvedOverlay { width: 100, height: 100, x: 0, y: 0, start: 2.0, end: 3.0 };
+        let slide = ResolvedSlide { width: 1280, height: 720, x: 0, y: 0, main_w: 1280, main_h: 720, start: 0.0, end: 1.0 };
+        let graph = build_filter_complex(&[shape], Some(&resolved), &[overlay], &[slide]);
+        let at = |needle: &str| graph.find(needle).unwrap_or_else(|| panic!("{needle} not in {graph}"));
+        assert!(at("[0:v][shf0]overlay=0:0:enable='gte(t,1)*lt(t,2)'[sh0]") < at("[sh0]crop=512:360:128:144"));
+        assert!(at("[cpbs][cpf]overlay=188:42[cp0]") < at("[cp0][scaled0]overlay=x=0:y=0"));
+        assert!(at("[cp0][scaled0]overlay=x=0:y=0:enable='between(t,2,3)'[ov0]") < at("[ov0][slide0]overlay=0:0"));
+        assert!(graph.ends_with("[ov0][slide0]overlay=0:0:enable='gte(t,0)*lt(t,1)'[outv]"));
+    }
+
+    /// A tall crop of a 1920x1080 frame (192x1080): padding 65 px, so height
+    /// binds at 950 and the width follows the crop's aspect; centred.
+    #[test]
+    fn non_16_9_crop_keeps_its_aspect_and_is_centred_with_even_sizes() {
+        let tall = resolve_crop(&crop(40.0, 0.0, 10.0, 100.0, None), 1920, 1080);
+        assert_eq!((tall.crop_w, tall.crop_h, tall.crop_x, tall.crop_y), (192, 1080, 768, 0));
+        assert_eq!((tall.fit_w, tall.fit_h), (168, 950));
+        assert_eq!((tall.x, tall.y), (876, 64));
+
+        // Odd source dims and awkward percentages: everything even, inside
+        // the padded box, centred within a pixel, aspect within rounding.
+        for (main_w, main_h) in [(1441u32, 775u32), (1080, 1920), (720, 720)] {
+            for rect in [(3.3, 7.7, 91.1, 12.9), (0.0, 0.0, 100.0, 100.0), (50.0, 50.0, 5.0, 50.0)] {
+                let resolved = resolve_crop(&crop(rect.0, rect.1, rect.2, rect.3, None), main_w, main_h);
+                for value in [
+                    resolved.crop_w,
+                    resolved.crop_h,
+                    resolved.crop_x,
+                    resolved.crop_y,
+                    resolved.fit_w,
+                    resolved.fit_h,
+                    resolved.x,
+                    resolved.y,
+                ] {
+                    assert_eq!(value % 2, 0, "{resolved:?}");
+                }
+                let (w, h) = (main_w as i64, main_h as i64);
+                assert!(resolved.crop_x + resolved.crop_w <= w && resolved.crop_y + resolved.crop_h <= h);
+                let padding = (w.min(h) as f64 * 0.06).round() as i64;
+                assert!(resolved.fit_w <= w - 2 * padding && resolved.fit_h <= h - 2 * padding, "{resolved:?}");
+                assert!((resolved.x * 2 + resolved.fit_w - w).abs() <= 3, "{resolved:?}");
+                assert!((resolved.y * 2 + resolved.fit_h - h).abs() <= 3, "{resolved:?}");
+                let aspect = |a: i64, b: i64| a as f64 / b as f64;
+                let drift = aspect(resolved.fit_w, resolved.fit_h) / aspect(resolved.crop_w, resolved.crop_h);
+                assert!((drift - 1.0).abs() < 0.03, "{resolved:?}");
+            }
+        }
+    }
+
+    /// The fitted picture carries the source's SAR, as slide pieces do.
+    #[test]
+    fn crop_is_tagged_with_the_source_sar() {
+        let resolved = resolve_crop(&SegmentCrop { sar: Some("4/3".into()), ..crop(10.0, 20.0, 40.0, 50.0, None) }, 1280, 720);
+        assert!(build_filter_complex(&[], Some(&resolved), &[], &[]).contains(",scale=902:634,setsar=4/3,pad="));
+    }
+
+    #[test]
+    fn crop_alone_switches_to_the_filter_path() {
+        let extras = CutExtras { crop: Some(crop(10.0, 20.0, 40.0, 50.0, None)), ..CutExtras::default() };
+        let args = lesson_cut_args("/in.mp4", 5.0, 12.5, "/out.mp4", &[], &[], &[], (1280, 720), &extras, &[]);
+        let filter_at = args.iter().position(|arg| arg == "-filter_complex").unwrap();
+        assert_eq!(
+            args[filter_at + 1],
+            "[0:v]crop=512:360:128:144,scale=902:634,setsar=0,pad=1280:720:188:42:color=0x0B1F3A[outv]"
+        );
         assert!(args.windows(2).any(|pair| pair == ["-map", "[outv]"]));
         assert!(args.windows(2).any(|pair| pair == ["-map", "0:a?"]));
         assert!(args.windows(2).any(|pair| pair == ["-t", "7.5"]));
