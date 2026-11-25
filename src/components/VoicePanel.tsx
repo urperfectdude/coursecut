@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, Check, Loader2, Mic, Sparkles, X } from "lucide-react";
+import { AlertTriangle, Check, Loader2, Mic, Pencil, Sparkles, X } from "lucide-react";
 import {
   AI_VOICES,
   generateLessonVoice,
@@ -12,8 +12,27 @@ import {
   type VoiceTrack,
 } from "../db";
 import type { VoiceLine } from "../lib/voice-script";
+import {
+  DEFAULT_IMPROVE_PROMPT,
+  DEFAULT_TARGET_LANGUAGE,
+  loadImprovePrompt,
+  loadTargetLanguage,
+  MAX_IMPROVE_PROMPT_CHARS,
+  resolveImprovePrompt,
+  storeImprovePrompt,
+  storeTargetLanguage,
+} from "../lib/improve-prompt";
+import { Input } from "@/components/ui/input";
 import { formatTimestamp } from "../lib/timestamp";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
@@ -26,6 +45,9 @@ export interface LessonVoiceState {
   /** Exports use this voice instead of the recording. */
   useInExport: boolean;
 }
+
+/** AI Improve all: lines rewritten at once. */
+const IMPROVE_CONCURRENCY = 4;
 
 export function voiceSignature(lines: readonly VoiceLine[], settings: VoiceSettings | null): string {
   return JSON.stringify([
@@ -130,8 +152,9 @@ interface VoicePanelProps {
   listening: boolean;
   onListeningChange: (listening: boolean) => void;
   onSeek: (sourceTime: number) => void;
-  /** Replaces a line's text (a Script tab text edit over its words). */
-  onEditLine: (wordIdxs: number[], text: string) => void;
+  /** Replaces lines' text (Script tab text edits over their words), as
+   * one undo step. */
+  onEditLines: (edits: { idxs: number[]; text: string }[]) => void;
 }
 
 /**
@@ -151,7 +174,7 @@ export default function VoicePanel({
   listening,
   onListeningChange,
   onSeek,
-  onEditLine,
+  onEditLines,
 }: VoicePanelProps) {
   const { settings, error: settingsError, save } = useVoiceSettings();
   const [busy, setBusy] = useState(false);
@@ -191,14 +214,32 @@ export default function VoicePanel({
     return next;
   };
 
-  async function improve(i: number) {
+  // Direct edits: the line being edited and its draft text.
+  const [editing, setEditing] = useState<{ key: string; text: string } | null>(null);
+  const [improvingAll, setImprovingAll] = useState<{ done: number; total: number } | null>(null);
+
+  // Improve all's popup, and the optional prompt typed in it (kept for
+  // the next run).
+  const [improveAllOpen, setImproveAllOpen] = useState(false);
+  const [improvePrompt, setImprovePrompt] = useState("");
+  // Improve all's system prompt (editable, remembered on this device).
+  const [systemPrompt, setSystemPrompt] = useState(loadImprovePrompt);
+  const [targetLanguage, setTargetLanguage] = useState(loadTargetLanguage);
+
+  async function improve(i: number, instructions: string | null = null, system: string | null = null) {
     const line = lines[i];
     const key = lineKey(line);
     if (improving.has(key)) return;
     setImproving((prev) => new Set(prev).add(key));
     setImproveErrors((prev) => without(prev, key));
     try {
-      const text = await improveVoiceLine(line.text, lines[i - 1]?.text ?? null, lines[i + 1]?.text ?? null);
+      const text = await improveVoiceLine(
+        line.text,
+        lines[i - 1]?.text ?? null,
+        lines[i + 1]?.text ?? null,
+        instructions,
+        system,
+      );
       if (text === line.text) setImproveErrors((prev) => new Map(prev).set(key, "Already reads well; no change."));
       else setSuggestions((prev) => new Map(prev).set(key, text));
     } catch (err) {
@@ -210,6 +251,48 @@ export default function VoicePanel({
         return next;
       });
     }
+  }
+
+  /** Improve every line that has no suggestion yet, a few at a time,
+   * following the user's optional prompt. */
+  async function improveAll(instructions: string | null) {
+    if (improvingAll) return;
+    storeImprovePrompt(systemPrompt);
+    storeTargetLanguage(targetLanguage);
+    const system = resolveImprovePrompt(systemPrompt, targetLanguage) || null;
+    const todo = lines
+      .map((line, i) => ({ key: lineKey(line), i }))
+      .filter(({ key }) => !suggestions.has(key) && !improving.has(key))
+      .map(({ i }) => i);
+    if (todo.length === 0) return;
+    let done = 0;
+    setImprovingAll({ done, total: todo.length });
+    const queue = [...todo];
+    const worker = async () => {
+      for (let i = queue.shift(); i !== undefined; i = queue.shift()) {
+        await improve(i, instructions, system);
+        done += 1;
+        setImprovingAll({ done, total: todo.length });
+      }
+    };
+    try {
+      await Promise.all(Array.from({ length: Math.min(IMPROVE_CONCURRENCY, todo.length) }, worker));
+    } finally {
+      setImprovingAll(null);
+    }
+  }
+
+  /** Suggestions for the lines shown now (older ones belong to old text). */
+  const pending = lines.flatMap((line) => {
+    const text = suggestions.get(lineKey(line));
+    return text?.trim() ? [{ idxs: line.wordIdxs, text }] : [];
+  });
+
+  function saveEdit(line: VoiceLine) {
+    if (!editing) return;
+    const text = editing.text.trim();
+    setEditing(null);
+    if (text && text !== line.text) onEditLines([{ idxs: line.wordIdxs, text }]);
   }
 
   const totalChars = useMemo(() => lines.reduce((sum, line) => sum + line.text.length, 0), [lines]);
@@ -308,6 +391,126 @@ export default function VoicePanel({
               Use the AI voice in exports
             </label>
           )}
+          <div className="flex w-full flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setImproveAllOpen(true)}
+              disabled={improvingAll !== null || lines.length === 0}
+              title="Rewrite every line more clearly with AI (sends the script's text to OpenAI)"
+            >
+              {improvingAll ? <Loader2 className="animate-spin" aria-hidden="true" /> : <Sparkles aria-hidden="true" />}
+              {improvingAll ? `Improving ${improvingAll.done}/${improvingAll.total}…` : "Improve all lines"}
+            </Button>
+            {pending.length > 0 && (
+              <>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => {
+                    onEditLines(pending);
+                    setSuggestions(new Map());
+                  }}
+                >
+                  <Check aria-hidden="true" />
+                  Use all {pending.length} suggestions
+                </Button>
+                <Button type="button" variant="ghost" size="sm" onClick={() => setSuggestions(new Map())}>
+                  <X aria-hidden="true" />
+                  Dismiss all
+                </Button>
+              </>
+            )}
+          </div>
+          <Dialog open={improveAllOpen} onOpenChange={setImproveAllOpen}>
+            <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>Improve all lines</DialogTitle>
+                <DialogDescription>
+                  AI rewrites each line for clearer delivery, never longer than it is now. You review the suggestions
+                  before any are used. Sends the script's text to OpenAI.
+                </DialogDescription>
+              </DialogHeader>
+              <details className="rounded-md border px-3 py-2 text-sm">
+                <summary className="cursor-pointer">
+                  System prompt
+                  <span className="text-muted-foreground">
+                    {systemPrompt === DEFAULT_IMPROVE_PROMPT ? " · default" : " · edited"}
+                  </span>
+                </summary>
+                <div className="flex flex-col gap-2 pt-2">
+                  <Textarea
+                    aria-label="System prompt"
+                    rows={12}
+                    maxLength={MAX_IMPROVE_PROMPT_CHARS}
+                    className="font-mono text-xs"
+                    value={systemPrompt}
+                    onChange={(event) => setSystemPrompt(event.target.value)}
+                  />
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Label htmlFor="improve-all-language">Target language</Label>
+                    <Input
+                      id="improve-all-language"
+                      className="h-8 w-40"
+                      maxLength={60}
+                      value={targetLanguage}
+                      onChange={(event) => setTargetLanguage(event.target.value)}
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="ml-auto"
+                      disabled={systemPrompt === DEFAULT_IMPROVE_PROMPT && targetLanguage === DEFAULT_TARGET_LANGUAGE}
+                      onClick={() => {
+                        setSystemPrompt(DEFAULT_IMPROVE_PROMPT);
+                        setTargetLanguage(DEFAULT_TARGET_LANGUAGE);
+                      }}
+                    >
+                      Reset to default
+                    </Button>
+                  </div>
+                  <p className="m-0 text-xs text-muted-foreground">
+                    Fills in {"{{TARGET_LANGUAGE}}"}. Each line is still rewritten on its own and never made longer, so
+                    timing stays in sync; any output format asked for here is ignored.
+                  </p>
+                </div>
+              </details>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="improve-all-prompt">Extra instructions (optional)</Label>
+                <Textarea
+                  id="improve-all-prompt"
+                  rows={3}
+                  maxLength={1000}
+                  placeholder="For example: use a friendly, informal tone; say “click” instead of “select”."
+                  value={improvePrompt}
+                  onChange={(event) => setImprovePrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                      setImproveAllOpen(false);
+                      void improveAll(improvePrompt.trim() || null);
+                    }
+                  }}
+                />
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="ghost" onClick={() => setImproveAllOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  onClick={() => {
+                    setImproveAllOpen(false);
+                    void improveAll(improvePrompt.trim() || null);
+                  }}
+                >
+                  <Sparkles aria-hidden="true" />
+                  Improve lines
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
           <span className="w-full text-xs text-muted-foreground">
             {lines.length} lines, {totalChars.toLocaleString()} characters. Only new or changed lines are sent;
             unchanged ones are reused.
@@ -339,61 +542,106 @@ export default function VoicePanel({
           const improveError = improveErrors.get(key);
           return (
             <li key={`${i}:${line.sourceStart}`}>
-              <div className="group flex items-start gap-1">
-                <button
-                  type="button"
-                  onClick={() => onSeek(line.sourceStart + 0.001)}
-                  className={cn(
-                    "flex min-w-0 flex-1 cursor-pointer gap-3 rounded-md px-2 py-1.5 text-left text-[15px] hover:bg-muted",
-                    late && "bg-amber-950/30",
-                  )}
-                  title="Play from here"
-                >
-                  <span className="mt-0.5 shrink-0 text-xs tabular-nums text-muted-foreground">
-                    {formatTimestamp(line.start)}
-                  </span>
-                  <span className="min-w-0 flex-1">{line.text}</span>
-                  {placement && placement.rate > 1 && (
-                    <span
-                      className={cn("shrink-0 text-xs tabular-nums", late ? "text-amber-400" : "text-muted-foreground")}
-                      title={late ? `Starts ${placement.late_by.toFixed(1)}s late` : "Sped up to fit"}
+              {editing?.key === key ? (
+                <div className="flex flex-col gap-2 rounded-md border px-2 py-2">
+                  <Textarea
+                    autoFocus
+                    rows={Math.min(6, Math.max(2, Math.ceil(editing.text.length / 70)))}
+                    value={editing.text}
+                    aria-label="Line text"
+                    onChange={(event) => setEditing({ key, text: event.target.value })}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) saveEdit(line);
+                      if (event.key === "Escape") setEditing(null);
+                    }}
+                  />
+                  <div className="flex items-center gap-2">
+                    <Button type="button" size="sm" onClick={() => saveEdit(line)} disabled={!editing.text.trim()}>
+                      <Check aria-hidden="true" />
+                      Save
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" onClick={() => setEditing(null)}>
+                      Cancel
+                    </Button>
+                    <span className="text-xs text-muted-foreground">
+                      {editing.text.trim().length} characters (was {line.text.length})
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="group flex items-start gap-1">
+                  <button
+                    type="button"
+                    onClick={() => onSeek(line.sourceStart + 0.001)}
+                    className={cn(
+                      "flex min-w-0 flex-1 cursor-pointer gap-3 rounded-md px-2 py-1.5 text-left text-[15px] hover:bg-muted",
+                      late && "bg-amber-950/30",
+                    )}
+                    title="Play from here"
+                  >
+                    <span className="mt-0.5 shrink-0 text-xs tabular-nums text-muted-foreground">
+                      {formatTimestamp(line.start)}
+                    </span>
+                    <span className="min-w-0 flex-1">{line.text}</span>
+                    {placement && placement.rate > 1 && (
+                      <span
+                        className={cn("shrink-0 text-xs tabular-nums", late ? "text-amber-400" : "text-muted-foreground")}
+                        title={late ? `Starts ${placement.late_by.toFixed(1)}s late` : "Sped up to fit"}
+                      >
+                        {placement.rate.toFixed(2)}×{late && ` · ${placement.late_by.toFixed(1)}s late`}
+                      </span>
+                    )}
+                    {placement && placement.rate <= 1 && late && (
+                      <span className="shrink-0 text-xs tabular-nums text-amber-400">
+                        {placement.late_by.toFixed(1)}s late
+                      </span>
+                    )}
+                  </button>
+                  {settings.enabled && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className={cn(
+                        "mt-0.5 shrink-0 text-muted-foreground",
+                        !improving.has(key) && !suggestion && !late && "opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
+                      )}
+                      onClick={() => void improve(i)}
+                      disabled={improving.has(key)}
+                      title="Rewrite this line more clearly with AI (sends its text to OpenAI)"
                     >
-                      {placement.rate.toFixed(2)}×{late && ` · ${placement.late_by.toFixed(1)}s late`}
-                    </span>
+                      {improving.has(key) ? (
+                        <Loader2 className="animate-spin" aria-hidden="true" />
+                      ) : (
+                        <Sparkles aria-hidden="true" />
+                      )}
+                      Improve
+                    </Button>
                   )}
-                  {placement && placement.rate <= 1 && late && (
-                    <span className="shrink-0 text-xs tabular-nums text-amber-400">
-                      {placement.late_by.toFixed(1)}s late
-                    </span>
-                  )}
-                </button>
-                {settings.enabled && (
                   <Button
                     type="button"
                     variant="ghost"
                     size="sm"
-                    className={cn(
-                      "mt-0.5 shrink-0 text-muted-foreground",
-                      !improving.has(key) && !suggestion && !late && "opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
-                    )}
-                    onClick={() => void improve(i)}
-                    disabled={improving.has(key)}
-                    title="Rewrite this line more clearly with AI (sends its text to OpenAI)"
+                    className="mt-0.5 shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+                    onClick={() => setEditing({ key, text: line.text })}
+                    title="Edit this line's text"
                   >
-                    {improving.has(key) ? (
-                      <Loader2 className="animate-spin" aria-hidden="true" />
-                    ) : (
-                      <Sparkles aria-hidden="true" />
-                    )}
-                    Improve
+                    <Pencil aria-hidden="true" />
+                    Edit
                   </Button>
-                )}
-              </div>
+                </div>
+              )}
               {suggestion && (
                 <div className="ml-14 mt-1 flex items-start gap-2 rounded-md border border-violet-500/40 bg-violet-950/20 px-3 py-2 text-[15px]">
                   <Sparkles className="mt-1 size-3.5 shrink-0 text-violet-400" aria-hidden="true" />
                   <span className="min-w-0 flex-1">
-                    {suggestion}
+                    <Textarea
+                      rows={Math.min(6, Math.max(1, Math.ceil(suggestion.length / 70)))}
+                      value={suggestion}
+                      aria-label="Suggested text"
+                      className="min-h-0 border-none bg-transparent p-0 text-[15px] shadow-none focus-visible:ring-0"
+                      onChange={(event) => setSuggestions((prev) => new Map(prev).set(key, event.target.value))}
+                    />
                     <span className="block text-xs text-muted-foreground">
                       {suggestion.length} characters (was {line.text.length})
                     </span>
@@ -401,8 +649,9 @@ export default function VoicePanel({
                   <Button
                     type="button"
                     size="sm"
+                    disabled={!suggestion.trim()}
                     onClick={() => {
-                      onEditLine(line.wordIdxs, suggestion);
+                      onEditLines([{ idxs: line.wordIdxs, text: suggestion }]);
                       setSuggestions((prev) => without(prev, key));
                     }}
                   >

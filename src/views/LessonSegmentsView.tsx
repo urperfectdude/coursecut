@@ -871,13 +871,21 @@ export default function LessonSegmentsView({
     }
   }, [fetchingWords, videoId, clearProgress]);
 
-  /** Script tab "Edit": corrects the selected words' text, spread over
-   * them in order so each keeps its timing. One undo step. Words whose
-   * shown text doesn't change are left alone, so they don't read as edited. */
-  const handleEditWords = useCallback(
-    (idxs: number[], text: string) => {
-      const selected = idxs.map((idx) => words[idx]).filter((word): word is TranscriptWord => word !== undefined);
-      if (selected.length === 0 || !text.trim()) return;
+  /** Script tab "Edit" and AI voice line edits: corrects each group of
+   * words' text, spread over them in order so each keeps its timing. One
+   * undo step for all groups. Words whose shown text doesn't change are
+   * left alone, so they don't read as edited. */
+  const handleEditLines = useCallback(
+    (edits: readonly { idxs: number[]; text: string }[]) => {
+      const groups = edits
+        .filter((edit) => edit.text.trim())
+        .map((edit) => ({
+          text: edit.text,
+          words: edit.idxs.map((idx) => words[idx]).filter((word): word is TranscriptWord => word !== undefined),
+        }))
+        .filter((group) => group.words.length > 0);
+      if (groups.length === 0) return;
+      const selected = groups.flatMap((group) => group.words);
       // What each selected word shows now (punctuated by its sentence).
       const shown = new Map<number, string>();
       for (const segment of transcriptSegments) {
@@ -888,15 +896,17 @@ export default function LessonSegmentsView({
           if (!shown.has(word.idx)) shown.set(word.idx, texts[i]);
         });
       }
-      const parts = spreadEditedText(selected.length, text);
       const after: { id: string; text: string | null }[] = [];
       const before: { id: string; text: string | null }[] = [];
-      selected.forEach((word, i) => {
-        if (parts[i] === (shown.get(word.idx) ?? word.text)) return;
-        after.push({ id: word.id, text: parts[i] });
-        // An unedited word goes back to Whisper's text (not edited).
-        before.push({ id: word.id, text: word.original_text === null ? null : word.text });
-      });
+      for (const group of groups) {
+        const parts = spreadEditedText(group.words.length, group.text);
+        group.words.forEach((word, i) => {
+          if (parts[i] === (shown.get(word.idx) ?? word.text)) return;
+          after.push({ id: word.id, text: parts[i] });
+          // An unedited word goes back to Whisper's text (not edited).
+          before.push({ id: word.id, text: word.original_text === null ? null : word.text });
+        });
+      }
       if (after.length === 0) return;
       const merge = (rows: TranscriptWord[]) => {
         const byId = new Map(rows.map((row) => [row.id, row]));
@@ -911,6 +921,10 @@ export default function LessonSegmentsView({
       }).catch((err) => setSegmentsError(err instanceof Error ? err.message : String(err)));
     },
     [words, transcriptSegments, videoId, runExclusive, pushUndo],
+  );
+  const handleEditWords = useCallback(
+    (idxs: number[], text: string) => handleEditLines([{ idxs, text }]),
+    [handleEditLines],
   );
 
   // Length now, and before Script cuts: the cut gaps inside each script
@@ -2272,7 +2286,7 @@ export default function LessonSegmentsView({
                   listening={listenToVoice}
                   onListeningChange={setListenToVoice}
                   onSeek={handleScriptSeek}
-                  onEditLine={handleEditWords}
+                  onEditLines={handleEditLines}
                 />
               </div>
             </div>

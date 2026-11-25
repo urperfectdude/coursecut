@@ -199,6 +199,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|err| format!("could not update schema version: {err}"))?;
     }
 
+    if version < 16 {
+        conn.execute_batch(include_str!("../migrations/0016_words_retext_pending.sql"))
+            .map_err(|err| format!("migration 0016_words_retext_pending failed: {err}"))?;
+        conn.pragma_update(None, "user_version", 16)
+            .map_err(|err| format!("could not update schema version: {err}"))?;
+    }
+
     Ok(())
 }
 
@@ -661,8 +668,13 @@ pub fn import_vtt_transcript(
             params![video_id],
         )
         .map_err(|err| err.to_string())?;
+        // Their text is still the old transcript's (with the user's fixes
+        // to it). They take the imported text when the user next clicks
+        // Analyze (`words::apply_pending_retext`), not now, so the lesson
+        // editor's Script and AI voice tabs don't change before then.
         tx.execute(
-            "UPDATE videos SET transcript_status = 'transcribed', transcript_source = 'vtt', updated_at = ?1 WHERE id = ?2",
+            "UPDATE videos SET transcript_status = 'transcribed', transcript_source = 'vtt',
+                 words_retext_pending = 1, updated_at = ?1 WHERE id = ?2",
             params![now, video_id],
         )
         .map_err(|err| err.to_string())?;

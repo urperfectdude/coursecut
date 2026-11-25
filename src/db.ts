@@ -281,9 +281,16 @@ export async function getLessonVoice(lessonId: string): Promise<SavedLessonVoice
 }
 
 /** GPT-5.5's clearer wording for one script line (sends that line and its
- * neighbours' text; needs the AI voice opt-in). Nothing is saved. */
-export async function improveVoiceLine(text: string, previous: string | null, next: string | null): Promise<string> {
-  return invoke<string>("improve_voice_line", { text, previous, next });
+ * neighbours' text, plus the user's optional `instructions`; needs the AI
+ * voice opt-in). Nothing is saved. */
+export async function improveVoiceLine(
+  text: string,
+  previous: string | null,
+  next: string | null,
+  instructions: string | null = null,
+  systemPrompt: string | null = null,
+): Promise<string> {
+  return invoke<string>("improve_voice_line", { text, previous, next, instructions, systemPrompt });
 }
 
 /** Whether exports of the lesson use its AI voice instead of the recording. */
